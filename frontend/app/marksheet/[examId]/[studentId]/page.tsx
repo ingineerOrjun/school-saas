@@ -1,0 +1,501 @@
+"use client";
+
+import * as React from "react";
+import { useParams, useRouter } from "next/navigation";
+import Link from "next/link";
+import {
+  Printer,
+  Download,
+  ArrowLeft,
+  AlertTriangle,
+  Loader2,
+  GraduationCap,
+} from "lucide-react";
+import { cn } from "@/lib/utils";
+import { ApiError } from "@/lib/api";
+import { getToken } from "@/lib/auth";
+import { marksheetApi, type Marksheet } from "@/lib/exams";
+
+export default function MarksheetPage() {
+  const params = useParams<{ examId: string; studentId: string }>();
+  const router = useRouter();
+  const [data, setData] = React.useState<Marksheet | null>(null);
+  const [loading, setLoading] = React.useState(true);
+  const [error, setError] = React.useState<string | null>(null);
+
+  React.useEffect(() => {
+    if (!getToken()) {
+      router.replace("/login");
+      return;
+    }
+    if (!params?.examId || !params?.studentId) return;
+    let cancelled = false;
+    (async () => {
+      try {
+        const m = await marksheetApi.get(params.examId, params.studentId);
+        if (!cancelled) setData(m);
+      } catch (err) {
+        if (err instanceof ApiError && err.status === 401) {
+          router.replace("/login");
+          return;
+        }
+        if (!cancelled) {
+          setError(
+            err instanceof ApiError
+              ? err.message
+              : "Failed to load marksheet.",
+          );
+        }
+      } finally {
+        if (!cancelled) setLoading(false);
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [params?.examId, params?.studentId, router]);
+
+  if (loading) {
+    return (
+      <div className="flex min-h-screen items-center justify-center bg-muted/30">
+        <div className="flex items-center gap-2 text-muted-foreground">
+          <Loader2 className="h-5 w-5 animate-spin" />
+          <span className="text-sm font-medium">Preparing marksheet…</span>
+        </div>
+      </div>
+    );
+  }
+
+  if (error || !data) {
+    return (
+      <div className="flex min-h-screen items-center justify-center bg-muted/30 p-6">
+        <div className="max-w-md rounded-xl border border-destructive/30 bg-destructive/5 p-6 text-center">
+          <AlertTriangle className="mx-auto h-8 w-8 text-destructive" />
+          <h1 className="mt-3 text-lg font-semibold text-foreground">
+            Couldn&apos;t load marksheet
+          </h1>
+          <p className="mt-1 text-sm text-muted-foreground">
+            {error ?? "Unknown error"}
+          </p>
+          <button
+            type="button"
+            onClick={() => router.back()}
+            className="mt-4 text-sm font-medium text-primary hover:underline"
+          >
+            Go back
+          </button>
+        </div>
+      </div>
+    );
+  }
+
+  return (
+    <>
+      {/* Print-specific CSS — hides chrome, tightens the sheet */}
+      <style jsx global>{`
+        @media print {
+          .no-print { display: none !important; }
+          body { background: white !important; }
+          .marksheet { box-shadow: none !important; margin: 0 !important; border: 1px solid #111 !important; }
+          tr, td { page-break-inside: avoid; break-inside: avoid; }
+          @page { size: A4; margin: 12mm; }
+        }
+      `}</style>
+
+      <div className="min-h-screen bg-muted/40 py-8">
+        {/* Toolbar — only on screen */}
+        <div className="no-print mx-auto mb-4 flex max-w-[820px] items-center justify-between px-6">
+          <Link
+            href="/exams"
+            className="inline-flex items-center gap-1.5 text-sm font-medium text-muted-foreground hover:text-foreground transition-colors"
+          >
+            <ArrowLeft className="h-4 w-4" />
+            Back to exams
+          </Link>
+          <div className="flex items-center gap-2">
+            <button
+              type="button"
+              onClick={() => window.print()}
+              title="Opens your browser's print dialog — choose 'Save as PDF' as the destination"
+              className="inline-flex items-center gap-1.5 rounded-md bg-foreground px-3.5 py-2 text-sm font-medium text-background shadow-sm hover:bg-foreground/90 active:scale-[0.98] transition-all"
+            >
+              <Download className="h-4 w-4" />
+              Download PDF
+            </button>
+            <button
+              type="button"
+              onClick={() => window.print()}
+              className="inline-flex items-center gap-1.5 rounded-md border border-border bg-surface px-3.5 py-2 text-sm font-medium text-foreground shadow-xs hover:border-primary/40 hover:text-primary active:scale-[0.98] transition-all"
+            >
+              <Printer className="h-4 w-4" />
+              Print
+            </button>
+          </div>
+        </div>
+
+        {/* The sheet */}
+        <article className="marksheet mx-auto max-w-[820px] bg-white shadow-sm print:shadow-none border border-slate-300 text-slate-900">
+          <Header data={data} />
+          <Body data={data} />
+          <Footer data={data} />
+        </article>
+      </div>
+    </>
+  );
+}
+
+// ---------------------------------------------------------------------------
+
+function Header({ data }: { data: Marksheet }) {
+  const examDate = formatDate(data.examCreatedAt);
+  // Use the server-issued timestamp — that's the authoritative "issued"
+  // moment, not the client's local clock at print time.
+  const issuedDate = formatDate(data.generatedAt);
+
+  return (
+    <header className="border-b-2 border-slate-900 px-10 py-6">
+      {/* Top band: logo on the left, central title block, issued date
+          on the right. Three-column grid keeps everything visually
+          balanced and prints predictably on A4. */}
+      <div className="grid grid-cols-[auto_1fr_auto] items-center gap-6">
+        {/* Logo placeholder — schools can replace this with their own
+            <img/> by swapping the inner content. The dashed border keeps
+            the slot visible until that's done. */}
+        <div
+          aria-hidden
+          className="flex h-16 w-16 shrink-0 items-center justify-center rounded-md border-2 border-dashed border-slate-400 bg-slate-50 text-slate-500 print:border-solid print:border-slate-700"
+          title="School logo"
+        >
+          <GraduationCap className="h-8 w-8" strokeWidth={1.5} />
+        </div>
+
+        <div className="text-center">
+          <p className="text-[11px] font-semibold uppercase tracking-[0.25em] text-slate-500">
+            Official Marksheet
+          </p>
+          <h1 className="mt-1 text-2xl font-bold tracking-tight text-slate-900 uppercase">
+            {data.school.name}
+          </h1>
+          <p className="mt-0.5 text-xs text-slate-500">Grade Ledger</p>
+        </div>
+
+        <div className="text-right">
+          <p className="text-[10px] font-semibold uppercase tracking-wider text-slate-500">
+            Issued
+          </p>
+          <p className="mt-0.5 font-mono text-sm text-slate-900">
+            {issuedDate}
+          </p>
+        </div>
+      </div>
+
+      <div className="mt-5 grid grid-cols-1 gap-3 text-left sm:grid-cols-4">
+        <InfoField label="Student">
+          {data.studentFirstName} {data.studentLastName}
+        </InfoField>
+        <InfoField label="Symbol No.">
+          {data.studentSymbolNumber ? (
+            <span className="rounded border border-slate-400 bg-slate-50 px-2 py-0.5 font-mono text-sm tracking-wider text-slate-900">
+              {data.studentSymbolNumber}
+            </span>
+          ) : (
+            <span className="text-slate-400">—</span>
+          )}
+        </InfoField>
+        <InfoField label="Class / Section">
+          {data.studentSection
+            ? `${data.studentSection.className} · ${data.studentSection.name}`
+            : "—"}
+        </InfoField>
+        <InfoField label="Exam">
+          <span className="block">{data.examName}</span>
+          <span className="mt-0.5 block text-[11px] text-slate-500">
+            {examDate}
+          </span>
+        </InfoField>
+      </div>
+    </header>
+  );
+}
+
+function InfoField({
+  label,
+  children,
+}: {
+  label: string;
+  children: React.ReactNode;
+}) {
+  return (
+    <div>
+      <p className="text-[10px] font-semibold uppercase tracking-wider text-slate-500">
+        {label}
+      </p>
+      <p className="mt-0.5 text-sm font-medium text-slate-900">{children}</p>
+    </div>
+  );
+}
+
+// ---------------------------------------------------------------------------
+
+function Body({ data }: { data: Marksheet }) {
+  return (
+    <section className="px-10 py-6">
+      <table className="w-full border-collapse text-sm">
+        <thead>
+          {/* Numeric columns right-align so figures column up neatly
+              under the digits — standard for any marks/grade ledger. */}
+          <tr className="border-y-2 border-slate-900">
+            <Th align="left">Subject</Th>
+            <Th align="right">Full Marks</Th>
+            <Th align="right">Marks Obtained</Th>
+            <Th align="right">Percentage</Th>
+            <Th>Grade</Th>
+            <Th align="right">Grade Point</Th>
+          </tr>
+        </thead>
+        <tbody>
+          {data.results.length === 0 ? (
+            <tr>
+              <td
+                colSpan={6}
+                className="border-b border-slate-200 py-6 text-center text-sm italic text-slate-500"
+              >
+                No marks recorded for this exam.
+              </td>
+            </tr>
+          ) : (
+            data.results.map((r) => (
+              <tr key={r.id} className="border-b border-slate-200">
+                <Td align="left" className="font-medium">
+                  {r.subjectName}
+                </Td>
+                <Td align="right" className="tabular-nums text-slate-600">
+                  {r.fullMarks}
+                </Td>
+                <Td align="right" className="tabular-nums font-medium">
+                  {r.marks}
+                </Td>
+                <Td align="right" className="tabular-nums">
+                  {r.percentage.toFixed(2)}%
+                </Td>
+                <Td
+                  className={cn(
+                    "font-semibold",
+                    r.letterGradeLabel === "NG" && "text-red-600",
+                  )}
+                >
+                  {r.letterGradeLabel}
+                </Td>
+                <Td align="right" className="tabular-nums">
+                  {r.gradePoint.toFixed(1)}
+                </Td>
+              </tr>
+            ))
+          )}
+        </tbody>
+      </table>
+    </section>
+  );
+}
+
+function Th({
+  children,
+  align = "center",
+}: {
+  children: React.ReactNode;
+  align?: "left" | "center" | "right";
+}) {
+  return (
+    <th
+      className={cn(
+        "px-3 py-2.5 text-[11px] font-bold uppercase tracking-wider text-slate-700",
+        align === "left" && "text-left",
+        align === "center" && "text-center",
+        align === "right" && "text-right",
+      )}
+    >
+      {children}
+    </th>
+  );
+}
+
+function Td({
+  children,
+  align = "center",
+  className,
+}: {
+  children: React.ReactNode;
+  align?: "left" | "center" | "right";
+  className?: string;
+}) {
+  return (
+    <td
+      className={cn(
+        "px-3 py-2.5 text-sm text-slate-900",
+        align === "left" && "text-left",
+        align === "center" && "text-center",
+        align === "right" && "text-right",
+        className,
+      )}
+    >
+      {children}
+    </td>
+  );
+}
+
+// ---------------------------------------------------------------------------
+
+function Footer({ data }: { data: Marksheet }) {
+  const failing = data.hasFailingSubject;
+  const remark = failing
+    ? "Student has not passed all subjects."
+    : data.overallLetterGradeLabel === "A+"
+      ? "Outstanding performance."
+      : data.overallLetterGradeLabel === "A"
+        ? "Excellent performance."
+        : data.overallLetterGradeLabel === "NG"
+          ? "Result not graded."
+          : "Qualified.";
+
+  return (
+    <section className="px-10 py-6 border-t border-slate-300">
+      <div className="grid grid-cols-1 gap-6 sm:grid-cols-2">
+        <div className="space-y-3">
+          <SummaryRow
+            label="Grade Point Average (GPA)"
+            value={
+              <span
+                className={cn(
+                  "tabular-nums font-semibold",
+                  failing && "line-through text-slate-500",
+                )}
+              >
+                {data.gpa.toFixed(2)}
+              </span>
+            }
+          />
+          <SummaryRow
+            label="Final Result"
+            value={
+              <span
+                className={cn(
+                  "text-lg font-bold tracking-wide",
+                  failing
+                    ? "text-red-600"
+                    : data.overallLetterGradeLabel === "NG"
+                      ? "text-red-600"
+                      : "text-slate-900",
+                )}
+              >
+                {data.overallLetterGradeLabel}
+              </span>
+            }
+          />
+          <SummaryRow
+            label="Remarks"
+            value={<span className="italic text-slate-700">{remark}</span>}
+          />
+        </div>
+
+        <div className="flex flex-col justify-end">
+          <div className="mt-auto grid grid-cols-2 gap-6 pt-8">
+            <SignatureLine label="Class Teacher" />
+            <SignatureLine label="Principal" />
+          </div>
+        </div>
+      </div>
+
+      {failing && (
+        <div className="mt-6 rounded-sm border border-red-300 bg-red-50 px-4 py-2.5 text-xs text-red-800">
+          <strong className="font-semibold">Result not graded:</strong>{" "}
+          Under Nepal NEB rules, the final result is <strong>NG</strong> when
+          any subject is graded NG, regardless of GPA.
+        </div>
+      )}
+
+      <GradeLegend />
+
+      <p className="mt-4 text-center text-[10px] uppercase tracking-widest text-slate-400">
+        {data.school.name} &middot; Computer-generated document
+      </p>
+    </section>
+  );
+}
+
+/** Compact NEB reference band — mirrors backend GradingService. */
+function GradeLegend() {
+  const bands: Array<{ label: string; gp: string }> = [
+    { label: "A+", gp: "4.0" },
+    { label: "A", gp: "3.6" },
+    { label: "B+", gp: "3.2" },
+    { label: "B", gp: "2.8" },
+    { label: "C+", gp: "2.4" },
+    { label: "C", gp: "2.0" },
+    { label: "D", gp: "1.6" },
+    { label: "NG", gp: "0.0" },
+  ];
+  return (
+    <div className="mt-6 rounded-sm border border-slate-300 bg-slate-50/80 px-4 py-2.5">
+      <p className="text-[10px] font-semibold uppercase tracking-widest text-slate-500">
+        Grading scale (NEB)
+      </p>
+      <div className="mt-1 flex flex-wrap items-center gap-x-3 gap-y-1 text-[11px] text-slate-700 tabular-nums">
+        {bands.map((b, i) => (
+          <React.Fragment key={b.label}>
+            <span>
+              <span
+                className={cn(
+                  "font-semibold",
+                  b.label === "NG" ? "text-red-600" : "text-slate-900",
+                )}
+              >
+                {b.label}
+              </span>{" "}
+              = {b.gp}
+            </span>
+            {i < bands.length - 1 && <span className="text-slate-300">·</span>}
+          </React.Fragment>
+        ))}
+      </div>
+    </div>
+  );
+}
+
+function SummaryRow({
+  label,
+  value,
+}: {
+  label: string;
+  value: React.ReactNode;
+}) {
+  return (
+    <div className="flex items-center justify-between border-b border-dashed border-slate-200 pb-1.5">
+      <span className="text-[11px] font-semibold uppercase tracking-wider text-slate-500">
+        {label}
+      </span>
+      <span>{value}</span>
+    </div>
+  );
+}
+
+function SignatureLine({ label }: { label: string }) {
+  return (
+    <div className="text-center">
+      <div className="h-12 border-b border-slate-400" />
+      <p className="mt-1 text-[10px] font-semibold uppercase tracking-wider text-slate-500">
+        {label}
+      </p>
+    </div>
+  );
+}
+
+// ---------------------------------------------------------------------------
+
+function formatDate(iso: string): string {
+  const d = new Date(iso);
+  return d.toLocaleDateString(undefined, {
+    year: "numeric",
+    month: "short",
+    day: "numeric",
+  });
+}

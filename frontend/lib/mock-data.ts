@@ -1,0 +1,62 @@
+import type { DashboardData } from "./types";
+
+export const SAMPLE_DASHBOARD: DashboardData = {
+  stats: {
+    totalStudents: 1284,
+    totalTeachers: 86,
+    attendanceTodayPct: 94.3,
+    feesCollected: 48230,
+    totalCredit: 2150,
+    studentsDelta: 0.042,
+    teachersDelta: 0.011,
+    attendanceDelta: -0.006,
+    feesDelta: 0.128,
+  },
+  recentStudents: [
+    {
+      id: "stu_01",
+      firstName: "Aarav",
+      lastName: "Sharma",
+      grade: "Grade 8",
+      section: "B",
+      status: "Active",
+      fees: "Paid",
+    },
+    {
+      id: "stu_02",
+      firstName: "Emily",
+      lastName: "Zhang",
+      grade: "Grade 11",
+      section: "A",
+      status: "Active",
+      fees: "Pending",
+    },
+    {
+      id: "stu_03",
+      firstName: "Mohamed",
+      lastName: "Ali",
+      grade: "Grade 5",
+      section: "C",
+      status: "On Leave",
+      fees: "Paid",
+    },
+    {
+      id: "stu_04",
+      firstName: "Sofia",
+      lastName: "Rodríguez",
+      grade: "Grade 9",
+      section: "A",
+      status: "Active",
+      fees: "Overdue",
+    },
+    {
+      id: "stu_05",
+      firstName: "Kenji",
+      lastName: "Tanaka",
+      grade: "Grade 12",
+      section: "B",
+      status: "Active",
+      fees: "Paid",
+    },
+  ],
+};

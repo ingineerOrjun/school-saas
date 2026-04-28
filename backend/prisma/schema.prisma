@@ -1,0 +1,412 @@
+// -----------------------------------------------------------------------------
+// Scholaris — Multi-Tenant School Management Schema
+// -----------------------------------------------------------------------------
+// Every domain entity belongs to a School (the tenant).
+// Every tenant-scoped table has an index on schoolId for fast filtering.
+// -----------------------------------------------------------------------------
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+// -----------------------------------------------------------------------------
+// Enums
+// -----------------------------------------------------------------------------
+
+enum Role {
+  ADMIN
+  TEACHER
+  STUDENT
+  PARENT
+}
+
+enum AttendanceStatus {
+  PRESENT
+  ABSENT
+}
+
+/// NEB-style letter grades. Stored codes map to A+, A, B+, B, C+, C, D, NG.
+enum LetterGrade {
+  A_PLUS
+  A
+  B_PLUS
+  B
+  C_PLUS
+  C
+  D
+  NG
+}
+
+enum FeeFrequency {
+  MONTHLY
+  ONE_TIME
+}
+
+enum PaymentMethod {
+  CASH
+  BANK
+  ESEWA
+  OTHER
+}
+
+// -----------------------------------------------------------------------------
+// Tenant
+// -----------------------------------------------------------------------------
+
+model School {
+  id        String   @id @default(uuid()) @db.Uuid
+  name      String
+  slug      String   @unique
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  users          User[]
+  students       Student[]
+  teachers       Teacher[]
+  classes        Class[]
+  attendance     Attendance[]
+  exams          Exam[]
+  feeStructures  FeeStructure[]
+  feeAssignments FeeAssignment[]
+  payments       Payment[]
+
+  @@map("schools")
+}
+
+// -----------------------------------------------------------------------------
+// Auth / Identity
+// -----------------------------------------------------------------------------
+
+model User {
+  id       String @id @default(uuid()) @db.Uuid
+  email    String @unique
+  password String
+  role     Role   @default(ADMIN)
+
+  schoolId String @db.Uuid
+  school   School @relation(fields: [schoolId], references: [id], onDelete: Cascade)
+
+  // 1:1 profile rows (a user is either a teacher or a student, never both)
+  student Student?
+  teacher Teacher?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([schoolId])
+  @@index([schoolId, role])
+  @@map("users")
+}
+
+// -----------------------------------------------------------------------------
+// Domain profiles
+// -----------------------------------------------------------------------------
+
+model Student {
+  id        String @id @default(uuid()) @db.Uuid
+  firstName String
+  lastName  String
+
+  /// Nepal-style Symbol / Roll number. Unique within a school when present;
+  /// NULL is allowed so legacy rows stay valid until one is assigned.
+  symbolNumber String? @db.VarChar(40)
+
+  schoolId String @db.Uuid
+  school   School @relation(fields: [schoolId], references: [id], onDelete: Cascade)
+
+  // Optional — young students may not yet have login accounts.
+  userId String? @unique @db.Uuid
+  user   User?   @relation(fields: [userId], references: [id], onDelete: SetNull)
+
+  // Optional — students live "in" the school before being assigned to a class.
+  // A student can be linked to a class directly when that class has no
+  // sections (small schools often skip sections entirely). When a section
+  // is set, its classId must equal this student's classId — the service
+  // enforces that invariant on create/update.
+  classId String? @db.Uuid
+  class   Class?  @relation(fields: [classId], references: [id], onDelete: SetNull)
+
+  sectionId String?  @db.Uuid
+  section   Section? @relation(fields: [sectionId], references: [id], onDelete: SetNull)
+
+  attendance     Attendance[]
+  results        Result[]
+  feeAssignments FeeAssignment[]
+  payments       Payment[]
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@unique([schoolId, symbolNumber])
+  @@index([schoolId])
+  @@index([classId])
+  @@index([sectionId])
+  @@map("students")
+}
+
+// -----------------------------------------------------------------------------
+// Academic hierarchy
+// -----------------------------------------------------------------------------
+
+model Class {
+  id   String @id @default(uuid()) @db.Uuid
+  name String
+
+  schoolId String @db.Uuid
+  school   School @relation(fields: [schoolId], references: [id], onDelete: Cascade)
+
+  sections       Section[]
+  students       Student[]
+  feeStructures  FeeStructure[]
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@unique([schoolId, name])
+  @@index([schoolId])
+  @@map("classes")
+}
+
+model Section {
+  id   String @id @default(uuid()) @db.Uuid
+  name String
+
+  classId String @db.Uuid
+  class   Class  @relation(fields: [classId], references: [id], onDelete: Cascade)
+
+  students Student[]
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@unique([classId, name])
+  @@index([classId])
+  @@map("sections")
+}
+
+// -----------------------------------------------------------------------------
+// Attendance
+// -----------------------------------------------------------------------------
+
+model Attendance {
+  id     String           @id @default(uuid()) @db.Uuid
+  date   DateTime         @db.Date
+  status AttendanceStatus
+
+  studentId String  @db.Uuid
+  student   Student @relation(fields: [studentId], references: [id], onDelete: Cascade)
+
+  // Denormalized for fast tenant-scoped queries; kept in sync by the service.
+  schoolId String @db.Uuid
+  school   School @relation(fields: [schoolId], references: [id], onDelete: Cascade)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@unique([studentId, date])
+  @@index([schoolId, date])
+  @@map("attendance")
+}
+
+// -----------------------------------------------------------------------------
+// Exams + Results (NEB grading system)
+// -----------------------------------------------------------------------------
+
+model Exam {
+  id   String @id @default(uuid()) @db.Uuid
+  name String
+
+  schoolId String @db.Uuid
+  school   School @relation(fields: [schoolId], references: [id], onDelete: Cascade)
+
+  subjects ExamSubject[]
+  results  Result[]
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@unique([schoolId, name])
+  @@index([schoolId])
+  @@map("exams")
+}
+
+model ExamSubject {
+  id   String @id @default(uuid()) @db.Uuid
+  name String
+  /// Theory component full marks. Required; defaults to 100 for backward compat.
+  theoryFullMarks Int @default(100)
+  /// Practical component full marks. 0 means this subject has no practical
+  /// (theory-only) and the pass rule auto-passes practical.
+  practicalFullMarks Int @default(0)
+
+  examId String @db.Uuid
+  exam   Exam   @relation(fields: [examId], references: [id], onDelete: Cascade)
+
+  results Result[]
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@unique([examId, name])
+  @@index([examId])
+  @@map("exam_subjects")
+}
+
+/// One record per (student, subject). Grade data is derived from `marks`
+/// server-side via GradingService and stored denormalized for fast reads.
+model Result {
+  id String @id @default(uuid()) @db.Uuid
+
+  examId String @db.Uuid
+  exam   Exam   @relation(fields: [examId], references: [id], onDelete: Cascade)
+
+  studentId String  @db.Uuid
+  student   Student @relation(fields: [studentId], references: [id], onDelete: Cascade)
+
+  subjectId String      @db.Uuid
+  subject   ExamSubject @relation(fields: [subjectId], references: [id], onDelete: Cascade)
+
+  theoryMarks    Float @default(0)
+  practicalMarks Float @default(0)
+  percentage     Float
+  letterGrade    LetterGrade
+  gradePoint     Float
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@unique([studentId, subjectId])
+  @@index([examId])
+  @@index([studentId])
+  @@map("results")
+}
+
+model Teacher {
+  id   String @id @default(uuid()) @db.Uuid
+  name String
+
+  schoolId String @db.Uuid
+  school   School @relation(fields: [schoolId], references: [id], onDelete: Cascade)
+
+  // Optional — a teacher may exist as a roster entry before their login is set up.
+  userId String? @unique @db.Uuid
+  user   User?   @relation(fields: [userId], references: [id], onDelete: SetNull)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([schoolId])
+  @@map("teachers")
+}
+
+// -----------------------------------------------------------------------------
+// Fees
+// -----------------------------------------------------------------------------
+
+model FeeStructure {
+  id        String       @id @default(uuid()) @db.Uuid
+  name      String
+  amount    Float
+  frequency FeeFrequency
+
+  schoolId String @db.Uuid
+  school   School @relation(fields: [schoolId], references: [id], onDelete: Cascade)
+
+  /// Optional class scope. When set, this fee only applies to students
+  /// assigned to that class — assigning to any other student is rejected
+  /// in the service layer. Null means "applies to any class" (a general
+  /// school-wide fee).
+  classId String? @db.Uuid
+  class   Class?  @relation(fields: [classId], references: [id], onDelete: SetNull)
+
+  assignments FeeAssignment[]
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@unique([schoolId, name])
+  @@index([schoolId])
+  @@index([classId])
+  @@map("fee_structures")
+}
+
+model FeeAssignment {
+  id String @id @default(uuid()) @db.Uuid
+  /// Amount snapshot captured at assignment time. Changes to the parent
+  /// FeeStructure do NOT retroactively affect already-assigned fees.
+  /// This is the BASE amount — the final amount owed after any discount
+  /// is computed as `amount - (PERCENT? amount*value/100 : value)`.
+  amount  Float
+  dueDate DateTime @db.Date
+
+  /// Scholarship / discount for this specific assignment. Null = no
+  /// discount. `discountValue` is a percentage (0–100) when type is
+  /// PERCENT, or a currency amount when type is FIXED. The final due
+  /// amount is clamped to 0 at the service layer so negative dues are
+  /// impossible.
+  discountType  DiscountType?
+  discountValue Float?
+
+  studentId String  @db.Uuid
+  student   Student @relation(fields: [studentId], references: [id], onDelete: Cascade)
+
+  feeStructureId String       @db.Uuid
+  feeStructure   FeeStructure @relation(fields: [feeStructureId], references: [id], onDelete: Cascade)
+
+  schoolId String @db.Uuid
+  school   School @relation(fields: [schoolId], references: [id], onDelete: Cascade)
+
+  payments Payment[]
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([schoolId])
+  @@index([studentId])
+  @@index([dueDate])
+  @@map("fee_assignments")
+}
+
+enum DiscountType {
+  PERCENT
+  FIXED
+}
+
+model Payment {
+  id     String   @id @default(uuid()) @db.Uuid
+  amount Float
+  date   DateTime @db.Date
+
+  studentId String  @db.Uuid
+  student   Student @relation(fields: [studentId], references: [id], onDelete: Cascade)
+
+  /// Optional link to a specific assignment. Unlinked payments count as a
+  /// general credit against the student's total due.
+  feeAssignmentId String?        @db.Uuid
+  feeAssignment   FeeAssignment? @relation(fields: [feeAssignmentId], references: [id], onDelete: SetNull)
+
+  /// Auto-generated RCPT-YYYY-NNNN. Nullable for pre-receipt-system payments;
+  /// unique within a school.
+  receiptNumber String? @db.VarChar(40)
+  /// Free-form note attached to the receipt (e.g. "Paid in cash by parent").
+  notes  String?
+  /// How the payment was made. Optional — not every record carries this detail.
+  method PaymentMethod?
+
+  schoolId String @db.Uuid
+  school   School @relation(fields: [schoolId], references: [id], onDelete: Cascade)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@unique([schoolId, receiptNumber])
+  @@index([schoolId])
+  @@index([studentId])
+  @@index([feeAssignmentId])
+  @@map("payments")
+}
