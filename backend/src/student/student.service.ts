@@ -6,8 +6,24 @@ import {
 } from '@nestjs/common';
 import { Prisma } from '@prisma/client';
 import { PrismaService } from '../database/prisma.service';
+import {
+  BulkCreateStudentsDto,
+  type BulkStudentInput,
+} from './dto/bulk-create-students.dto';
+import { Gender } from '@prisma/client';
 import { CreateStudentDto } from './dto/create-student.dto';
 import { UpdateStudentDto } from './dto/update-student.dto';
+
+/** One failure entry in the bulk-import response. */
+export interface BulkFailure {
+  rowIndex: number;
+  reason: string;
+}
+
+export interface BulkCreateResult {
+  successCount: number;
+  failed: BulkFailure[];
+}
 
 const studentInclude = {
   class: true,
@@ -70,6 +86,279 @@ export class StudentService {
       });
     } catch (e) {
       throw this.translateUniqueViolation(e);
+    }
+  }
+
+  /**
+   * Bulk-import students from a parsed spreadsheet.
+   *
+   * Strategy — partial success by design:
+   *   1. Validate every row in JS, collecting `errors[]`.
+   *   2. Detect intra-payload symbolNumber duplicates (case-insensitive)
+   *      and mark all but the first occurrence as failed.
+   *   3. Pre-check existing symbolNumbers in DB so duplicates surface
+   *      without hitting a P2002 mid-transaction.
+   *   4. Resolve `className` → `classId` from a single `class.findMany`
+   *      keyed by lower-cased name.
+   *   5. Run the surviving valid rows in a single
+   *      `prisma.$transaction([create, create, ...])`. Any DB-level
+   *      error rolls the whole batch back, so the caller knows nothing
+   *      partial landed; pre-validated errors are still returned.
+   *
+   * Returns `{ successCount, failed: [{ rowIndex, reason }] }`.
+   */
+  async bulkCreate(
+    dto: BulkCreateStudentsDto,
+    schoolId: string,
+  ): Promise<BulkCreateResult> {
+    const failed: BulkFailure[] = [];
+
+    // ---- 1. Per-row validation. The DTO only checked the OUTER shape
+    //          so a single malformed row doesn't kill the whole batch.
+    //          All semantic rules — required fields, enum values, phone
+    //          format, date validity — run here, and per-row failures
+    //          go into `failed[]` while survivors move forward.
+    type Norm = {
+      idx: number;
+      firstName: string;
+      lastName: string;
+      symbolNumber: string | null;
+      gender: Gender;
+      dateOfBirth: Date;
+      parentName: string;
+      contactNumber: string;
+      address: string | null;
+      admissionDate: Date | null;
+      className: string | null;
+    };
+    const PHONE_RE = /^[0-9]{10}$/;
+    const VALID_GENDERS = new Set<string>([
+      Gender.MALE,
+      Gender.FEMALE,
+      Gender.OTHER,
+    ]);
+    const normalized: Norm[] = [];
+
+    (dto.students as unknown[]).forEach((rawRow, idx) => {
+      const fail = (reason: string) => failed.push({ rowIndex: idx, reason });
+      if (!rawRow || typeof rawRow !== 'object') {
+        fail('Row must be an object.');
+        return;
+      }
+      const row = rawRow as Partial<BulkStudentInput>;
+
+      // ---- Normalize FIRST, validate AFTER. ----------------------
+      // Cleaning before checking prevents hidden duplicates ("  1001 "
+      // vs "1001") and avoids false-negative enum/regex failures from
+      // trailing whitespace or casing. The three spec'd rules:
+      //   • trim every string
+      //   • uppercase gender
+      //   • normalize symbolNumber (trim, treat empty as null)
+      const trim = (v: unknown): string =>
+        typeof v === 'string' ? v.trim() : '';
+
+      const firstName = trim(row.firstName);
+      const lastName = trim(row.lastName);
+      const parentName = trim(row.parentName);
+      const contactNumber = trim(row.contactNumber);
+      const address = trim(row.address);
+      const className = trim(row.className) || null;
+      const symbolNumber = trim(row.symbolNumber) || null;
+      const genderStr =
+        typeof row.gender === 'string' ? row.gender.trim().toUpperCase() : '';
+
+      // ---- Validate ------------------------------------------------
+      if (!firstName || !lastName) {
+        fail('firstName and lastName are required.');
+        return;
+      }
+      if (!VALID_GENDERS.has(genderStr)) {
+        fail('gender must be MALE, FEMALE, or OTHER.');
+        return;
+      }
+      const gender = genderStr as Gender;
+
+      if (!row.dateOfBirth) {
+        fail('dateOfBirth is required.');
+        return;
+      }
+      const dob = new Date(row.dateOfBirth as string);
+      if (Number.isNaN(dob.getTime())) {
+        fail('dateOfBirth is not a valid date.');
+        return;
+      }
+
+      if (!parentName) {
+        fail('parentName is required.');
+        return;
+      }
+      if (parentName.length > 120) {
+        fail('parentName must be 120 characters or fewer.');
+        return;
+      }
+
+      if (!PHONE_RE.test(contactNumber)) {
+        fail('contactNumber must be exactly 10 digits (numbers only).');
+        return;
+      }
+
+      let admissionDate: Date | null = null;
+      if (row.admissionDate) {
+        const d = new Date(row.admissionDate as string);
+        if (Number.isNaN(d.getTime())) {
+          fail('admissionDate is not a valid date.');
+          return;
+        }
+        admissionDate = d;
+      }
+
+      if (symbolNumber && symbolNumber.length > 40) {
+        fail('symbolNumber must be 40 characters or fewer.');
+        return;
+      }
+
+      normalized.push({
+        idx,
+        firstName,
+        lastName,
+        symbolNumber,
+        gender,
+        dateOfBirth: dob,
+        parentName,
+        contactNumber,
+        address: address || null,
+        admissionDate,
+        className,
+      });
+    });
+
+    // ---- 2. Intra-payload symbolNumber duplicates (case-insensitive).
+    //          First occurrence wins; the rest are marked failed.
+    const seenSym = new Map<string, number>();
+    const intraDupIdx = new Set<number>();
+    for (const r of normalized) {
+      if (!r.symbolNumber) continue;
+      const key = r.symbolNumber.toLowerCase();
+      const firstAt = seenSym.get(key);
+      if (firstAt === undefined) {
+        seenSym.set(key, r.idx);
+      } else {
+        intraDupIdx.add(r.idx);
+        failed.push({
+          rowIndex: r.idx,
+          reason: `Duplicate symbol number "${r.symbolNumber}" in upload (also at row ${firstAt + 1}).`,
+        });
+      }
+    }
+    let candidates = normalized.filter((r) => !intraDupIdx.has(r.idx));
+
+    // ---- 3. DB-side symbolNumber collisions. One query for all
+    //          candidate symbol numbers in this school.
+    const candidateSymbols = candidates
+      .map((r) => r.symbolNumber)
+      .filter((s): s is string => !!s);
+    if (candidateSymbols.length > 0) {
+      const existing = await this.prisma.student.findMany({
+        where: { schoolId, symbolNumber: { in: candidateSymbols } },
+        select: { symbolNumber: true },
+      });
+      const taken = new Set(
+        existing
+          .map((e) => e.symbolNumber?.toLowerCase())
+          .filter((s): s is string => !!s),
+      );
+      const survivors: Norm[] = [];
+      for (const r of candidates) {
+        if (r.symbolNumber && taken.has(r.symbolNumber.toLowerCase())) {
+          failed.push({
+            rowIndex: r.idx,
+            reason: `Symbol number "${r.symbolNumber}" already exists in this school.`,
+          });
+        } else {
+          survivors.push(r);
+        }
+      }
+      candidates = survivors;
+    }
+
+    // ---- 4. Class name → classId. Single round-trip indexed by
+    //          lower-cased class name.
+    const classNamesNeeded = [
+      ...new Set(
+        candidates
+          .map((r) => r.className?.toLowerCase())
+          .filter((s): s is string => !!s),
+      ),
+    ];
+    const classByName = new Map<string, string>();
+    if (classNamesNeeded.length > 0) {
+      const rows = await this.prisma.class.findMany({
+        where: { schoolId },
+        select: { id: true, name: true },
+      });
+      for (const c of rows) {
+        if (classNamesNeeded.includes(c.name.toLowerCase())) {
+          classByName.set(c.name.toLowerCase(), c.id);
+        }
+      }
+      // Anything unresolved → fail those rows.
+      const survivors: Norm[] = [];
+      for (const r of candidates) {
+        if (r.className && !classByName.has(r.className.toLowerCase())) {
+          failed.push({
+            rowIndex: r.idx,
+            reason: `Class "${r.className}" not found in this school.`,
+          });
+        } else {
+          survivors.push(r);
+        }
+      }
+      candidates = survivors;
+    }
+
+    // ---- 5. Insert survivors inside a single transaction so a
+    //          mid-batch DB failure rolls everything back cleanly.
+    if (candidates.length === 0) {
+      return { successCount: 0, failed: sortFailures(failed) };
+    }
+
+    try {
+      await this.prisma.$transaction(
+        candidates.map((r) =>
+          this.prisma.student.create({
+            data: {
+              firstName: r.firstName,
+              lastName: r.lastName,
+              symbolNumber: r.symbolNumber,
+              schoolId,
+              classId: r.className
+                ? (classByName.get(r.className.toLowerCase()) ?? null)
+                : null,
+              gender: r.gender,
+              dateOfBirth: r.dateOfBirth,
+              parentName: r.parentName,
+              contactNumber: r.contactNumber,
+              address: r.address,
+              admissionDate: r.admissionDate,
+            },
+            select: { id: true },
+          }),
+        ),
+      );
+      return { successCount: candidates.length, failed: sortFailures(failed) };
+    } catch (e) {
+      // A race condition could still produce a P2002 (some other request
+      // grabbed a symbolNumber between our pre-check and the insert).
+      // Roll the whole batch back and report all surviving candidates as
+      // failed so the user can retry without partial data.
+      const reason =
+        e instanceof Prisma.PrismaClientKnownRequestError && e.code === 'P2002'
+          ? 'A symbol number collided during commit. Please retry.'
+          : 'Database transaction failed; no rows were imported.';
+      for (const r of candidates) {
+        failed.push({ rowIndex: r.idx, reason });
+      }
+      return { successCount: 0, failed: sortFailures(failed) };
     }
   }
 
@@ -280,4 +569,12 @@ export class StudentService {
 
     return { classId: section.classId, sectionId: section.id };
   }
+}
+
+/**
+ * Sort failures by their original row index so the response is stable
+ * and the UI can highlight rows in upload order.
+ */
+function sortFailures(items: BulkFailure[]): BulkFailure[] {
+  return [...items].sort((a, b) => a.rowIndex - b.rowIndex);
 }

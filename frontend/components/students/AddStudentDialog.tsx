@@ -77,10 +77,17 @@ export function AddStudentDialog({
     onClose();
   };
 
+  // Edits clear any visible error so the banner doesn't linger after the
+  // user starts fixing the offending field. The button stays enabled the
+  // whole time (we only `setSubmitting` inside the try/finally below),
+  // so retry is always possible.
   const update = <K extends keyof typeof form>(
     key: K,
     value: (typeof form)[K],
-  ) => setForm((prev) => ({ ...prev, [key]: value }));
+  ) => {
+    setForm((prev) => ({ ...prev, [key]: value }));
+    if (error) setError(null);
+  };
 
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();

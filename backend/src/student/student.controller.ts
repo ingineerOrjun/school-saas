@@ -16,6 +16,7 @@ import {
 import { CurrentUser } from '../common/decorators/current-user.decorator';
 import { JwtAuthGuard } from '../auth/guards/jwt-auth.guard';
 import type { AuthenticatedUser } from '../auth/jwt.strategy';
+import { BulkCreateStudentsDto } from './dto/bulk-create-students.dto';
 import { CreateStudentDto } from './dto/create-student.dto';
 import { UpdateStudentDto } from './dto/update-student.dto';
 import { StudentService } from './student.service';
@@ -36,6 +37,20 @@ export class StudentController {
     @CurrentUser() user: AuthenticatedUser,
   ) {
     return this.students.create(dto, user.schoolId);
+  }
+
+  /**
+   * Bulk import. Returns a `{ successCount, failed[] }` summary so the
+   * UI can show partial-success outcomes without rolling everything
+   * back when only some rows are invalid.
+   */
+  @Post('bulk')
+  @HttpCode(HttpStatus.OK)
+  bulkCreate(
+    @Body() dto: BulkCreateStudentsDto,
+    @CurrentUser() user: AuthenticatedUser,
+  ) {
+    return this.students.bulkCreate(dto, user.schoolId);
   }
 
   @Get()

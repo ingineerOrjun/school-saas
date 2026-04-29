@@ -89,6 +89,30 @@ function buildListQuery(filter?: ListStudentsFilter): string {
   return qs ? `?${qs}` : "";
 }
 
+/** One row in a bulk-import payload — mirrors backend BulkStudentInput. */
+export interface BulkStudentInput {
+  firstName: string;
+  lastName: string;
+  symbolNumber?: string | null;
+  gender: Gender;
+  dateOfBirth: string;
+  parentName: string;
+  contactNumber: string;
+  address?: string | null;
+  admissionDate?: string | null;
+  className?: string | null;
+}
+
+export interface BulkFailure {
+  rowIndex: number;
+  reason: string;
+}
+
+export interface BulkCreateResult {
+  successCount: number;
+  failed: BulkFailure[];
+}
+
 export const studentsApi = {
   list: (filter?: ListStudentsFilter) =>
     api<StudentDto[]>(`/students${buildListQuery(filter)}`),
@@ -97,6 +121,11 @@ export const studentsApi = {
     api<StudentDto>("/students", {
       method: "POST",
       body: JSON.stringify(input),
+    }),
+  bulkCreate: (students: BulkStudentInput[]) =>
+    api<BulkCreateResult>("/students/bulk", {
+      method: "POST",
+      body: JSON.stringify({ students }),
     }),
   update: (id: string, input: UpdateStudentInput) =>
     api<StudentDto>(`/students/${id}`, {

@@ -2,7 +2,7 @@
 
 import * as React from "react";
 import { useRouter } from "next/navigation";
-import { Plus, Search, UserPlus, RotateCw, AlertCircle, Filter } from "lucide-react";
+import { Plus, Search, UserPlus, RotateCw, AlertCircle, Filter, Upload } from "lucide-react";
 import { toast } from "sonner";
 import { ApiError } from "@/lib/api";
 import { studentsApi, type StudentDto } from "@/lib/students";
@@ -15,6 +15,7 @@ import { AddStudentDialog } from "@/components/students/AddStudentDialog";
 import { EditStudentDialog } from "@/components/students/EditStudentDialog";
 import { DeleteStudentDialog } from "@/components/students/DeleteStudentDialog";
 import { QuickAddStudent } from "@/components/students/QuickAddStudent";
+import { ImportStudentsDialog } from "@/components/students/ImportStudentsDialog";
 import {
   formatStudentAssignment,
   type Assignment,
@@ -49,6 +50,7 @@ export default function StudentsPage() {
   const [query, setQuery] = React.useState("");
   const [classFilter, setClassFilter] = React.useState<string>(CLASS_FILTER_ALL);
   const [addOpen, setAddOpen] = React.useState(false);
+  const [importOpen, setImportOpen] = React.useState(false);
   const [editTarget, setEditTarget] = React.useState<StudentDto | null>(null);
   const [deleteTarget, setDeleteTarget] = React.useState<StudentDto | null>(null);
   const [highlightIds, setHighlightIds] = React.useState<Set<string>>(
@@ -469,6 +471,7 @@ export default function StudentsPage() {
         count={list?.length ?? 0}
         loading={loading}
         onAdd={() => setAddOpen(true)}
+        onImport={() => setImportOpen(true)}
         onRefresh={refresh}
       />
 
@@ -596,6 +599,16 @@ export default function StudentsPage() {
         onClose={() => setDeleteTarget(null)}
         onConfirm={scheduleDelete}
       />
+      <ImportStudentsDialog
+        open={importOpen}
+        onClose={() => setImportOpen(false)}
+        onImported={(r) => {
+          // Refresh the roster after even one row lands. Leave the
+          // dialog open so the user can review the per-row outcome
+          // before closing manually.
+          if (r.success > 0) refresh();
+        }}
+      />
     </div>
   );
 }
@@ -606,11 +619,13 @@ function Header({
   count,
   loading,
   onAdd,
+  onImport,
   onRefresh,
 }: {
   count: number;
   loading: boolean;
   onAdd: () => void;
+  onImport: () => void;
   onRefresh: () => void;
 }) {
   return (
@@ -643,6 +658,13 @@ function Header({
           leftIcon={<RotateCw className="h-3.5 w-3.5" />}
         >
           Refresh
+        </Button>
+        <Button
+          variant="outline"
+          onClick={onImport}
+          leftIcon={<Upload className="h-4 w-4" />}
+        >
+          Import students
         </Button>
         <Button
           onClick={onAdd}

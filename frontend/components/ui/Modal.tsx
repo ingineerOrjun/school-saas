@@ -12,7 +12,7 @@ export interface ModalProps {
   description?: string;
   children?: React.ReactNode;
   footer?: React.ReactNode;
-  size?: "sm" | "md" | "lg";
+  size?: "sm" | "md" | "lg" | "xl";
   className?: string;
 }
 
@@ -20,6 +20,8 @@ const sizeClasses = {
   sm: "max-w-sm",
   md: "max-w-md",
   lg: "max-w-2xl",
+  // xl is for wide preview surfaces (e.g., bulk-import preview table).
+  xl: "max-w-5xl",
 };
 
 // Must match `animate-fade-out` / `animate-scale-out` in tailwind config.
