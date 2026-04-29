@@ -20,9 +20,16 @@ export class UserService {
   constructor(private readonly prisma: PrismaService) {}
 
   /**
-   * List every user in the caller's school. Sorted with admins first
-   * so the most-privileged accounts surface immediately, then by
-   * creation order (oldest first) for stable rendering.
+   * List every user in the caller's school.
+   *
+   * Sort order: `role ASC, createdAt ASC`.
+   *
+   * Postgres sorts native enums by DECLARATION order, not alphabetically.
+   * `Role` is declared `ADMIN → TEACHER → STUDENT → PARENT`, so ASC puts
+   * the most-privileged roles first — admins surface immediately, which
+   * matches how the Settings UI is consumed (admins are who you usually
+   * want to act on first). Within each role, oldest-first keeps the
+   * order stable across reloads.
    */
   async list(schoolId: string): Promise<UserListRow[]> {
     const rows = await this.prisma.user.findMany({
@@ -46,16 +53,29 @@ export class UserService {
   }
 
   /**
-   * Promote / demote a user between ADMIN and TEACHER. Refuses to
-   * demote the last admin in a school — that would lock everyone out
-   * of admin functions. The caller's own demotion is allowed only when
-   * another admin already exists.
+   * Promote / demote a user between ADMIN and TEACHER.
+   *
+   * Two layered safety guards:
+   *   1. Self-demotion guard — an admin can never demote themselves
+   *      to TEACHER through this endpoint. Even if other admins exist,
+   *      we require a *different* admin to perform the demotion. This
+   *      prevents accidental lockout from a misclick on your own row.
+   *   2. Last-admin guard — refuses any demotion that would leave the
+   *      school with zero admins.
    */
   async updateRole(
     targetUserId: string,
     dto: UpdateUserRoleDto,
     schoolId: string,
+    actorUserId: string,
   ): Promise<UserListRow> {
+    // Self-demotion guard runs first so the actor gets the clearer
+    // message ("you cannot change your own role") instead of falling
+    // through to the more general last-admin error.
+    if (targetUserId === actorUserId && dto.role === Role.TEACHER) {
+      throw new BadRequestException('You cannot change your own role');
+    }
+
     const target = await this.prisma.user.findFirst({
       where: { id: targetUserId, schoolId },
       select: { id: true, email: true, role: true },

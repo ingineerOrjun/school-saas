@@ -47,6 +47,40 @@ export interface StudentReport {
   hasFailingSubject: boolean;
 }
 
+/** One subject column in the class ledger header. */
+export interface LedgerSubject {
+  id: string;
+  name: string;
+}
+
+/** Per-subject cell on a student's ledger row. */
+export interface LedgerCell {
+  subjectId: string;
+  /** Letter grade label (A+, A, B+, ..., NG) — null if no result recorded. */
+  grade: string | null;
+  gradePoint: number | null;
+}
+
+/** One student's row in the class ledger. */
+export interface LedgerStudentRow {
+  id: string;
+  name: string;
+  symbolNumber: string | null;
+  results: LedgerCell[];
+  gpa: number;
+  /** Final letter grade after NEB rules (NG-if-fail). Null when no results. */
+  finalGrade: string | null;
+}
+
+export interface ClassLedger {
+  exam: { id: string; name: string };
+  class: { id: string; name: string };
+  subjects: LedgerSubject[];
+  students: LedgerStudentRow[];
+  /** ISO timestamp when this ledger was generated. */
+  generatedAt: string;
+}
+
 /** Richer report for printable marksheets — includes school & roster info. */
 export interface Marksheet extends StudentReport {
   school: {
@@ -293,6 +327,143 @@ export class ResultService {
       studentSymbolNumber: student?.symbolNumber ?? null,
       studentSection,
       examCreatedAt: exam.createdAt.toISOString(),
+      generatedAt: new Date().toISOString(),
+    };
+  }
+
+  /**
+   * Class-wide grade ledger — one row per student in the class, one
+   * column per subject in the exam. Used by `/results/ledger` to print
+   * an official class result sheet.
+   *
+   * "Students in the class" includes BOTH:
+   *   • students linked directly to the class (no section), and
+   *   • students placed into a section of that class.
+   * That matches how Nepal-style result sheets are typically printed —
+   * one ledger per class, regardless of how the school subdivides.
+   */
+  async getClassLedger(
+    examId: string,
+    classId: string,
+    schoolId: string,
+  ): Promise<ClassLedger> {
+    // Tenant guards. Run in parallel — both must succeed.
+    const [exam, klass] = await Promise.all([
+      this.exams.assertInSchool(examId, schoolId),
+      this.prisma.class.findFirst({
+        where: { id: classId, schoolId },
+        select: { id: true, name: true },
+      }),
+    ]);
+    if (!klass) {
+      throw new NotFoundException('Class not found.');
+    }
+
+    // Pull subjects (ledger column order) and roster (row order) in
+    // parallel to keep total latency close to the slowest single query.
+    const [subjects, students] = await Promise.all([
+      this.prisma.examSubject.findMany({
+        where: { examId },
+        select: { id: true, name: true },
+        orderBy: { name: 'asc' },
+      }),
+      this.prisma.student.findMany({
+        where: {
+          schoolId,
+          OR: [
+            // Students linked directly to the class with no section.
+            { classId, sectionId: null },
+            // Students placed into any section of this class.
+            { section: { classId } },
+          ],
+        },
+        select: {
+          id: true,
+          firstName: true,
+          lastName: true,
+          symbolNumber: true,
+        },
+        orderBy: [
+          // Symbol-number-first when present matches how official Nepal
+          // result sheets are organized; fall through to name for
+          // students without a symbol number.
+          { symbolNumber: 'asc' },
+          { firstName: 'asc' },
+          { lastName: 'asc' },
+        ],
+      }),
+    ]);
+
+    if (students.length === 0) {
+      return {
+        exam: { id: exam.id, name: exam.name },
+        class: { id: klass.id, name: klass.name },
+        subjects,
+        students: [],
+        generatedAt: new Date().toISOString(),
+      };
+    }
+
+    // One round-trip for ALL results across the entire class. Index by
+    // (studentId, subjectId) so building each row is O(1).
+    const allResults = await this.prisma.result.findMany({
+      where: {
+        examId,
+        studentId: { in: students.map((s) => s.id) },
+      },
+      select: {
+        studentId: true,
+        subjectId: true,
+        letterGrade: true,
+        gradePoint: true,
+      },
+    });
+    const resultByKey = new Map<string, (typeof allResults)[number]>();
+    for (const r of allResults) {
+      resultByKey.set(`${r.studentId}:${r.subjectId}`, r);
+    }
+
+    const studentRows: LedgerStudentRow[] = students.map((student) => {
+      const cells: LedgerCell[] = subjects.map((subj) => {
+        const r = resultByKey.get(`${student.id}:${subj.id}`);
+        return {
+          subjectId: subj.id,
+          grade: r ? labelOf(r.letterGrade) : null,
+          gradePoint: r ? r.gradePoint : null,
+        };
+      });
+
+      // Compute GPA + final grade ONLY from cells that have results.
+      // A student with no recorded results gets gpa=0, finalGrade=null
+      // — rendered as a blank in the UI rather than a misleading "NG".
+      const recordedCells = cells.filter((c) => c.grade !== null);
+      let gpa = 0;
+      let finalGrade: string | null = null;
+      if (recordedCells.length > 0) {
+        const points = recordedCells.map((c) => c.gradePoint ?? 0);
+        gpa = this.grading.gpa(points);
+        // NEB rule: any NG forces overall to NG, regardless of GPA.
+        const hasNg = recordedCells.some((c) => c.grade === 'NG');
+        finalGrade = hasNg
+          ? 'NG'
+          : this.grading.grade(gpa * 25).letterGradeLabel;
+      }
+
+      return {
+        id: student.id,
+        name: `${student.firstName} ${student.lastName}`,
+        symbolNumber: student.symbolNumber,
+        results: cells,
+        gpa: round(gpa, 2),
+        finalGrade,
+      };
+    });
+
+    return {
+      exam: { id: exam.id, name: exam.name },
+      class: { id: klass.id, name: klass.name },
+      subjects,
+      students: studentRows,
       generatedAt: new Date().toISOString(),
     };
   }

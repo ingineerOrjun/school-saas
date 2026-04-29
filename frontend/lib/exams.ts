@@ -127,3 +127,44 @@ export const marksheetApi = {
       `/reports/marksheet/${encodeURIComponent(examId)}/${encodeURIComponent(studentId)}`,
     ),
 };
+
+// ---------------------------------------------------------------------------
+// Class-wide grade ledger
+// ---------------------------------------------------------------------------
+
+export interface LedgerSubject {
+  id: string;
+  name: string;
+}
+
+export interface LedgerCell {
+  subjectId: string;
+  /** Letter grade label (A+, A, B+, ..., NG). Null if no result. */
+  grade: string | null;
+  gradePoint: number | null;
+}
+
+export interface LedgerStudentRow {
+  id: string;
+  name: string;
+  symbolNumber: string | null;
+  results: LedgerCell[];
+  gpa: number;
+  /** Final overall letter grade (NG-if-fail). Null when no results recorded. */
+  finalGrade: string | null;
+}
+
+export interface ClassLedger {
+  exam: { id: string; name: string };
+  class: { id: string; name: string };
+  subjects: LedgerSubject[];
+  students: LedgerStudentRow[];
+  generatedAt: string;
+}
+
+export const ledgerApi = {
+  get: (examId: string, classId: string) =>
+    api<ClassLedger>(
+      `/results/ledger?examId=${encodeURIComponent(examId)}&classId=${encodeURIComponent(classId)}`,
+    ),
+};

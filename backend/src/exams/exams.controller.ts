@@ -17,6 +17,7 @@ import { JwtAuthGuard } from '../auth/guards/jwt-auth.guard';
 import type { AuthenticatedUser } from '../auth/jwt.strategy';
 import { CreateExamDto } from './dto/create-exam.dto';
 import { CreateSubjectDto } from './dto/create-subject.dto';
+import { QueryLedgerDto } from './dto/query-ledger.dto';
 import { QueryResultsDto } from './dto/query-results.dto';
 import { SaveResultsDto } from './dto/save-results.dto';
 import { UpdateExamDto } from './dto/update-exam.dto';
@@ -107,6 +108,23 @@ export class ExamsController {
     return this.results.getStudentReport(
       query.examId,
       query.studentId,
+      user.schoolId,
+    );
+  }
+
+  /**
+   * Class-wide grade ledger — one row per student in the class, one
+   * column per subject in the exam. Drives the printable result sheet
+   * at `/results/ledger`.
+   */
+  @Get('results/ledger')
+  getClassLedger(
+    @Query() query: QueryLedgerDto,
+    @CurrentUser() user: AuthenticatedUser,
+  ) {
+    return this.results.getClassLedger(
+      query.examId,
+      query.classId,
       user.schoolId,
     );
   }

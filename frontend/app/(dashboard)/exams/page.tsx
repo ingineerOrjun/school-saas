@@ -447,6 +447,18 @@ function Header({ onRefresh }: { onRefresh: () => void }) {
         </p>
       </div>
       <div className="flex items-center gap-2">
+        {/* Class result sheet — printable A4 landscape ledger of every
+            student in a class for a given exam. Opens in a new tab so
+            unsaved marks on this page aren't lost. */}
+        <Link
+          href="/results/ledger"
+          target="_blank"
+          rel="noopener noreferrer"
+          className="inline-flex h-9 items-center gap-1.5 rounded-md border border-border bg-surface px-3 text-sm font-medium text-foreground shadow-xs hover:border-primary/40 hover:text-primary transition-colors focus-ring"
+        >
+          <FileText className="h-3.5 w-3.5" />
+          Result Sheet
+        </Link>
         <Button
           variant="ghost"
           size="sm"

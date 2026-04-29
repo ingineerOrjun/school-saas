@@ -37,6 +37,8 @@ export class UserController {
     @Body() dto: UpdateUserRoleDto,
     @CurrentUser() user: AuthenticatedUser,
   ) {
-    return this.users.updateRole(id, dto, user.schoolId);
+    // Pass the actor's id so the service can enforce the self-role
+    // guard ("you cannot change your own role").
+    return this.users.updateRole(id, dto, user.schoolId, user.id);
   }
 }

@@ -379,13 +379,17 @@ function UsersSection({ currentUserId }: { currentUserId: string | null }) {
               >
                 <UserAvatar email={u.email} role={u.role} />
                 <div className="min-w-0 flex-1">
-                  <div className="flex items-center gap-2 flex-wrap">
+                  <div className="flex items-baseline gap-1.5 flex-wrap">
                     <span className="font-medium text-foreground truncate">
                       {u.email}
                     </span>
+                    {/* "(You)" tag — plain literal text per spec, so it
+                        survives copy/paste and screen-readers without
+                        needing extra CSS context. Muted color keeps the
+                        email itself as the primary read. */}
                     {isMe && (
-                      <span className="inline-flex items-center rounded-full bg-primary/10 px-1.5 py-0.5 text-[10px] font-semibold uppercase tracking-wider text-primary">
-                        You
+                      <span className="text-sm font-medium text-primary">
+                        (You)
                       </span>
                     )}
                   </div>
