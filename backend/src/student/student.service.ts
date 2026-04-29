@@ -52,6 +52,19 @@ export class StudentService {
           userId: dto.userId,
           classId,
           sectionId,
+          // Required demographic + contact fields. ISO date strings
+          // from the DTO get parsed into Date objects here so Prisma's
+          // @db.Date columns get clean values.
+          gender: dto.gender,
+          dateOfBirth: new Date(dto.dateOfBirth),
+          parentName: dto.parentName,
+          contactNumber: dto.contactNumber,
+          // Optional fields — `?? null` so an explicit empty string from
+          // the form isn't persisted as a meaningless empty value.
+          address: dto.address?.trim() ? dto.address.trim() : null,
+          admissionDate: dto.admissionDate
+            ? new Date(dto.admissionDate)
+            : null,
         },
         include: studentInclude,
       });
@@ -122,6 +135,29 @@ export class StudentService {
           lastName: dto.lastName,
           symbolNumber: dto.symbolNumber,
           userId: dto.userId,
+          // Apply demographic / contact fields ONLY when present in the
+          // payload — undefined leaves the column alone, while explicit
+          // values overwrite it.
+          ...(dto.gender !== undefined ? { gender: dto.gender } : {}),
+          ...(dto.dateOfBirth !== undefined
+            ? { dateOfBirth: new Date(dto.dateOfBirth) }
+            : {}),
+          ...(dto.parentName !== undefined
+            ? { parentName: dto.parentName }
+            : {}),
+          ...(dto.contactNumber !== undefined
+            ? { contactNumber: dto.contactNumber }
+            : {}),
+          ...(dto.address !== undefined
+            ? { address: dto.address?.trim() ? dto.address.trim() : null }
+            : {}),
+          ...(dto.admissionDate !== undefined
+            ? {
+                admissionDate: dto.admissionDate
+                  ? new Date(dto.admissionDate)
+                  : null,
+              }
+            : {}),
           ...(assignmentPatch ?? {}),
         },
         include: studentInclude,
@@ -131,7 +167,16 @@ export class StudentService {
     }
   }
 
-  /** Map Prisma P2002 errors onto field-specific, friendly 409 messages. */
+  /**
+   * Map Prisma P2002 unique-constraint errors onto friendly responses.
+   *
+   * 409 Conflict (not 400 BadRequest) — the payload itself is shaped
+   * correctly; it just collides with an existing row. 400 is reserved
+   * for genuinely malformed input. Clients can rely on this distinction
+   * to retry with a different value vs. fix their payload.
+   *
+   * Constraint enforced: `@@unique([schoolId, symbolNumber])` on Student.
+   */
   private translateUniqueViolation(e: unknown): unknown {
     if (!(e instanceof Prisma.PrismaClientKnownRequestError) || e.code !== 'P2002') {
       return e;

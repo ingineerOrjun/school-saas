@@ -68,8 +68,11 @@ export interface LedgerStudentRow {
   symbolNumber: string | null;
   results: LedgerCell[];
   gpa: number;
-  /** Final letter grade after NEB rules (NG-if-fail). Null when no results. */
-  finalGrade: string | null;
+  /**
+   * Final overall letter grade after NEB rules. "NG" when ANY subject is
+   * NG, regardless of computed GPA. Null when no results recorded yet.
+   */
+  finalResult: string | null;
 }
 
 export interface ClassLedger {
@@ -433,18 +436,18 @@ export class ResultService {
         };
       });
 
-      // Compute GPA + final grade ONLY from cells that have results.
-      // A student with no recorded results gets gpa=0, finalGrade=null
+      // Compute GPA + final result ONLY from cells that have results.
+      // A student with no recorded results gets gpa=0, finalResult=null
       // — rendered as a blank in the UI rather than a misleading "NG".
       const recordedCells = cells.filter((c) => c.grade !== null);
       let gpa = 0;
-      let finalGrade: string | null = null;
+      let finalResult: string | null = null;
       if (recordedCells.length > 0) {
         const points = recordedCells.map((c) => c.gradePoint ?? 0);
         gpa = this.grading.gpa(points);
         // NEB rule: any NG forces overall to NG, regardless of GPA.
         const hasNg = recordedCells.some((c) => c.grade === 'NG');
-        finalGrade = hasNg
+        finalResult = hasNg
           ? 'NG'
           : this.grading.grade(gpa * 25).letterGradeLabel;
       }
@@ -455,7 +458,7 @@ export class ResultService {
         symbolNumber: student.symbolNumber,
         results: cells,
         gpa: round(gpa, 2),
-        finalGrade,
+        finalResult,
       };
     });
 

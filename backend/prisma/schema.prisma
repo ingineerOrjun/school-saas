@@ -30,6 +30,14 @@ enum AttendanceStatus {
   ABSENT
 }
 
+/// Demographic gender for student records. OTHER is a deliberate
+/// catch-all so the DB never blocks enrollment over identity edge cases.
+enum Gender {
+  MALE
+  FEMALE
+  OTHER
+}
+
 /// NEB-style letter grades. Stored codes map to A+, A, B+, B, C+, C, D, NG.
 enum LetterGrade {
   A_PLUS
@@ -133,6 +141,21 @@ model Student {
 
   sectionId String?  @db.Uuid
   section   Section? @relation(fields: [sectionId], references: [id], onDelete: SetNull)
+
+  // Demographic + contact essentials required by every real school.
+  // gender / dateOfBirth / parentName / contactNumber are NOT NULL and
+  // enforced by the DTO layer; the migration backfills sensible
+  // placeholders for any rows that pre-date this change.
+  gender         Gender
+  dateOfBirth    DateTime  @db.Date
+  parentName     String    @db.VarChar(120)
+  contactNumber  String    @db.VarChar(40)
+  /// Optional postal / street address — free-form so it accommodates
+  /// any country's format.
+  address        String?
+  /// Optional admission date — defaults to row createdAt for legacy
+  /// rows, but the form lets admins set the real value when known.
+  admissionDate  DateTime? @db.Date
 
   attendance     Attendance[]
   results        Result[]

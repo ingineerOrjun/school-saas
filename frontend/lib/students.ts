@@ -1,6 +1,8 @@
 import { api } from "./api";
 import type { ClassDto } from "./classes";
 
+export type Gender = "MALE" | "FEMALE" | "OTHER";
+
 export interface StudentSectionDto {
   id: string;
   name: string;
@@ -18,6 +20,14 @@ export interface StudentDto {
   symbolNumber: string | null;
   schoolId: string;
   userId: string | null;
+  /** Required demographic + contact fields. */
+  gender: Gender;
+  dateOfBirth: string;
+  parentName: string;
+  contactNumber: string;
+  /** Optional. */
+  address: string | null;
+  admissionDate: string | null;
   /**
    * Direct class link. Populated for every student who has been assigned to
    * either a class or a section (the backend derives classId from the
@@ -35,6 +45,14 @@ export interface CreateStudentInput {
   firstName: string;
   lastName: string;
   symbolNumber?: string | null;
+  /** Required by the backend. */
+  gender: Gender;
+  dateOfBirth: string;
+  parentName: string;
+  contactNumber: string;
+  /** Optional. */
+  address?: string | null;
+  admissionDate?: string | null;
   userId?: string;
   classId?: string | null;
   sectionId?: string | null;
@@ -44,6 +62,12 @@ export interface UpdateStudentInput {
   firstName?: string;
   lastName?: string;
   symbolNumber?: string | null;
+  gender?: Gender;
+  dateOfBirth?: string;
+  parentName?: string;
+  contactNumber?: string;
+  address?: string | null;
+  admissionDate?: string | null;
   userId?: string;
   classId?: string | null;
   sectionId?: string | null;

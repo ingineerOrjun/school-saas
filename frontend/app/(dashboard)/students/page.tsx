@@ -384,9 +384,25 @@ export default function StudentsPage() {
     [list, resolveAssignment, router],
   );
 
-  // Optimistic quick-add: insert a placeholder row immediately, then swap it
-  // for the real server record (or roll back on error).
+  // Quick-add now ROUTES into the full Add Student dialog with the
+  // typed name pre-filled. We can't optimistic-create anymore because
+  // the schema requires gender / DOB / parent name / contact, which we
+  // can only collect through the full form. The dialog still feels fast
+  // because the names are already typed.
+  const [quickAddPrefill, setQuickAddPrefill] = React.useState<{
+    firstName: string;
+    lastName: string;
+  } | null>(null);
   const handleQuickAdd = async (firstName: string, lastName: string) => {
+    setQuickAddPrefill({ firstName, lastName });
+    setAddOpen(true);
+  };
+
+  // Legacy optimistic-create implementation, kept as a no-op so the rest
+  // of the file compiles unchanged. The block below is intentionally
+  // unreachable — it documents what the previous flow did.
+  // eslint-disable-next-line @typescript-eslint/no-unused-vars
+  const _legacyQuickAdd = async (firstName: string, lastName: string) => {
     const tempId = `temp_${makeTempSuffix()}`;
     const now = new Date().toISOString();
     const optimistic: StudentDto = {
@@ -400,6 +416,12 @@ export default function StudentsPage() {
       class: null,
       sectionId: null,
       section: null,
+      gender: "OTHER",
+      dateOfBirth: now,
+      parentName: "",
+      contactNumber: "",
+      address: null,
+      admissionDate: null,
       createdAt: now,
       updatedAt: now,
     };
@@ -407,7 +429,16 @@ export default function StudentsPage() {
     setList((prev) => (prev ? [optimistic, ...prev] : [optimistic]));
 
     try {
-      const real = await studentsApi.create({ firstName, lastName });
+      // This call would now fail — required fields missing. Kept here
+      // only so the larger function remains structurally untouched.
+      const real = await studentsApi.create({
+        firstName,
+        lastName,
+        gender: "OTHER",
+        dateOfBirth: now,
+        parentName: "",
+        contactNumber: "",
+      });
       setList((prev) =>
         prev ? prev.map((s) => (s.id === tempId ? real : s)) : [real],
       );
@@ -543,8 +574,16 @@ export default function StudentsPage() {
       <AddStudentDialog
         open={addOpen}
         classes={classes}
-        onClose={() => setAddOpen(false)}
-        onCreated={handleCreated}
+        initialFirstName={quickAddPrefill?.firstName}
+        initialLastName={quickAddPrefill?.lastName}
+        onClose={() => {
+          setAddOpen(false);
+          setQuickAddPrefill(null);
+        }}
+        onCreated={(s) => {
+          setQuickAddPrefill(null);
+          handleCreated(s);
+        }}
       />
       <EditStudentDialog
         student={editTarget}

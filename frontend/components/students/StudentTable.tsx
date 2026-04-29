@@ -39,9 +39,10 @@ export function StudentTable({
         <table className="w-full border-separate border-spacing-0 text-sm">
           <thead>
             <tr className="bg-muted/30">
-              <Th className="rounded-tl-xl">Student</Th>
-              <Th>Class / Section</Th>
-              <Th>Added</Th>
+              <Th className="rounded-tl-xl">Name</Th>
+              <Th>Class</Th>
+              <Th>Gender</Th>
+              <Th>Contact</Th>
               <Th className="rounded-tr-xl text-right">Actions</Th>
             </tr>
           </thead>
@@ -100,7 +101,7 @@ export function StudentTable({
                     </div>
                   </Td>
                   <Td className="border-t border-border/50">
-                    <div className="min-w-[240px] space-y-2">
+                    <div className="min-w-[220px] space-y-2">
                       <span className="inline-flex items-center gap-1.5 rounded-full bg-muted/70 px-2 py-0.5 text-xs font-medium text-muted-foreground">
                         {isAssigning && <Loader2 className="h-3 w-3 animate-spin" />}
                         {formatStudentAssignment(student)}
@@ -115,7 +116,10 @@ export function StudentTable({
                     </div>
                   </Td>
                   <Td className="border-t border-border/50 text-muted-foreground">
-                    {isPending ? "--" : formatRelative(student.createdAt)}
+                    {isPending ? "—" : <GenderPill gender={student.gender} />}
+                  </Td>
+                  <Td className="border-t border-border/50 text-muted-foreground tabular-nums">
+                    {isPending ? "—" : (student.contactNumber || "—")}
                   </Td>
                   <Td
                     className={cn(
@@ -180,6 +184,30 @@ function Td({
   children: React.ReactNode;
 }) {
   return <td className={cn("px-4 py-3 align-middle", className)}>{children}</td>;
+}
+
+/** Compact gender chip — colored to scan quickly in a long list. */
+function GenderPill({ gender }: { gender: StudentDto["gender"] }) {
+  const tones: Record<StudentDto["gender"], string> = {
+    MALE: "bg-sky-500/10 text-sky-700",
+    FEMALE: "bg-pink-500/10 text-pink-700",
+    OTHER: "bg-muted text-muted-foreground",
+  };
+  const labels: Record<StudentDto["gender"], string> = {
+    MALE: "Male",
+    FEMALE: "Female",
+    OTHER: "Other",
+  };
+  return (
+    <span
+      className={cn(
+        "inline-flex items-center rounded-full px-2 py-0.5 text-xs font-medium",
+        tones[gender],
+      )}
+    >
+      {labels[gender]}
+    </span>
+  );
 }
 
 function IconButton({

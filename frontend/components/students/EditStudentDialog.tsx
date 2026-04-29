@@ -3,7 +3,11 @@
 import * as React from "react";
 import { toast } from "sonner";
 import { ApiError } from "@/lib/api";
-import { studentsApi, type StudentDto } from "@/lib/students";
+import {
+  studentsApi,
+  type Gender,
+  type StudentDto,
+} from "@/lib/students";
 import type { ClassWithSections } from "@/lib/classes";
 import { Button } from "@/components/ui/Button";
 import { Input } from "@/components/ui/Input";
@@ -32,15 +36,30 @@ export function EditStudentDialog({
   const [firstName, setFirstName] = React.useState("");
   const [lastName, setLastName] = React.useState("");
   const [symbolNumber, setSymbolNumber] = React.useState("");
+  const [gender, setGender] = React.useState<Gender | "">("");
+  const [dateOfBirth, setDateOfBirth] = React.useState("");
+  const [parentName, setParentName] = React.useState("");
+  const [contactNumber, setContactNumber] = React.useState("");
+  const [address, setAddress] = React.useState("");
+  const [admissionDate, setAdmissionDate] = React.useState("");
   const [assignment, setAssignment] = React.useState<Assignment>(UNASSIGNED);
   const [submitting, setSubmitting] = React.useState(false);
   const [error, setError] = React.useState<string | null>(null);
 
+  // Hydrate form when a student is opened. ISO timestamps from the API
+  // get sliced to YYYY-MM-DD because <input type="date"> only accepts
+  // that shape.
   React.useEffect(() => {
     if (student) {
       setFirstName(student.firstName);
       setLastName(student.lastName);
       setSymbolNumber(student.symbolNumber ?? "");
+      setGender(student.gender);
+      setDateOfBirth(toDateInput(student.dateOfBirth));
+      setParentName(student.parentName);
+      setContactNumber(student.contactNumber);
+      setAddress(student.address ?? "");
+      setAdmissionDate(toDateInput(student.admissionDate));
       setAssignment(assignmentFromStudent(student));
       setError(null);
     }
@@ -55,12 +74,36 @@ export function EditStudentDialog({
     e.preventDefault();
     if (!student) return;
     setError(null);
+
+    if (!gender) {
+      setError("Gender is required.");
+      return;
+    }
+    if (!dateOfBirth) {
+      setError("Date of birth is required.");
+      return;
+    }
+    if (!parentName.trim()) {
+      setError("Parent name is required.");
+      return;
+    }
+    if (!contactNumber.trim()) {
+      setError("Contact number is required.");
+      return;
+    }
+
     setSubmitting(true);
     try {
       const updated = await studentsApi.update(student.id, {
         firstName: firstName.trim(),
         lastName: lastName.trim(),
         symbolNumber: symbolNumber.trim() || null,
+        gender: gender as Gender,
+        dateOfBirth,
+        parentName: parentName.trim(),
+        contactNumber: contactNumber.trim(),
+        address: address.trim() || null,
+        admissionDate: admissionDate || null,
         classId: assignment.classId,
         sectionId: assignment.sectionId,
       });
@@ -89,6 +132,7 @@ export function EditStudentDialog({
       onClose={handleClose}
       title="Edit student"
       description="Update the student's record."
+      size="lg"
       footer={
         <>
           <Button
@@ -109,7 +153,10 @@ export function EditStudentDialog({
         </>
       }
     >
-      <form onSubmit={handleSubmit} className="grid grid-cols-1 gap-4 sm:grid-cols-2">
+      <form
+        onSubmit={handleSubmit}
+        className="grid grid-cols-1 gap-4 sm:grid-cols-2"
+      >
         <Input
           label="First name"
           value={firstName}
@@ -125,17 +172,94 @@ export function EditStudentDialog({
           required
           disabled={submitting}
         />
-        <div className="sm:col-span-2">
-          <Input
-            label="Symbol / Roll no."
-            placeholder="e.g. 1001"
-            value={symbolNumber}
-            onChange={(e) => setSymbolNumber(e.target.value)}
-            hint="Optional. Must be unique within your school."
+
+        <div className="flex flex-col gap-1.5">
+          <label className="text-sm font-medium text-foreground">
+            Gender <span className="text-destructive">*</span>
+          </label>
+          <select
+            value={gender}
+            onChange={(e) => setGender(e.target.value as Gender | "")}
             disabled={submitting}
-            maxLength={40}
+            required
+            className="h-10 rounded-md border border-border bg-surface px-3 text-sm focus:outline-none focus:ring-2 focus:ring-primary/25 focus:border-primary disabled:bg-muted disabled:cursor-not-allowed"
+          >
+            <option value="" disabled>
+              Select gender…
+            </option>
+            <option value="MALE">Male</option>
+            <option value="FEMALE">Female</option>
+            <option value="OTHER">Other</option>
+          </select>
+        </div>
+
+        <div className="flex flex-col gap-1.5">
+          <label className="text-sm font-medium text-foreground">
+            Date of birth <span className="text-destructive">*</span>
+          </label>
+          <input
+            type="date"
+            value={dateOfBirth}
+            max={todayISO()}
+            onChange={(e) => setDateOfBirth(e.target.value)}
+            disabled={submitting}
+            required
+            className="h-10 rounded-md border border-border bg-surface px-3 text-sm focus:outline-none focus:ring-2 focus:ring-primary/25 focus:border-primary disabled:bg-muted disabled:cursor-not-allowed"
           />
         </div>
+
+        <Input
+          label="Parent / Guardian name"
+          value={parentName}
+          onChange={(e) => setParentName(e.target.value)}
+          required
+          disabled={submitting}
+          maxLength={120}
+        />
+        <Input
+          label="Contact number"
+          inputMode="tel"
+          value={contactNumber}
+          onChange={(e) => setContactNumber(e.target.value)}
+          required
+          disabled={submitting}
+          maxLength={40}
+        />
+
+        <div className="sm:col-span-2">
+          <Input
+            label="Address (optional)"
+            value={address}
+            onChange={(e) => setAddress(e.target.value)}
+            disabled={submitting}
+            maxLength={500}
+          />
+        </div>
+
+        <div className="flex flex-col gap-1.5">
+          <label className="text-sm font-medium text-foreground">
+            Admission date (optional)
+          </label>
+          <input
+            type="date"
+            value={admissionDate}
+            max={todayISO()}
+            onChange={(e) => setAdmissionDate(e.target.value)}
+            disabled={submitting}
+            className="h-10 rounded-md border border-border bg-surface px-3 text-sm focus:outline-none focus:ring-2 focus:ring-primary/25 focus:border-primary disabled:bg-muted disabled:cursor-not-allowed"
+          />
+        </div>
+
+        <Input
+          label="Symbol / Roll no. (optional)"
+          placeholder="e.g. 1001"
+          value={symbolNumber}
+          onChange={(e) => setSymbolNumber(e.target.value)}
+          hint="Must be unique within your school."
+          disabled={submitting}
+          maxLength={40}
+        />
+
         <div className="sm:col-span-2">
           <SectionSelect
             label="Class / Section"
@@ -146,6 +270,7 @@ export function EditStudentDialog({
             hint="Move the student between classes and sections, or leave them unassigned."
           />
         </div>
+
         {error && (
           <div className="sm:col-span-2 rounded-md border border-destructive/30 bg-destructive/5 px-3 py-2 text-xs text-destructive">
             {error}
@@ -155,4 +280,17 @@ export function EditStudentDialog({
       </form>
     </Modal>
   );
+}
+
+/** ISO timestamp or `YYYY-MM-DD` → `YYYY-MM-DD` for `<input type="date">`. */
+function toDateInput(iso: string | null | undefined): string {
+  if (!iso) return "";
+  // Already shaped — accept short form too in case the API ever returns it.
+  if (/^\d{4}-\d{2}-\d{2}$/.test(iso)) return iso;
+  return iso.slice(0, 10);
+}
+
+function todayISO(): string {
+  const d = new Date();
+  return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}`;
 }

@@ -337,6 +337,7 @@ function Sheet({
     <article className="ledger mx-auto bg-white shadow-sm print:shadow-none border border-slate-300 text-slate-900">
       <SheetHeader ledger={ledger} schoolName={schoolName} />
       <LedgerTable ledger={ledger} />
+      <LedgerSummary ledger={ledger} />
       <SheetFooter ledger={ledger} schoolName={schoolName} />
     </article>
   );
@@ -362,7 +363,7 @@ function SheetHeader({
         </div>
         <div className="text-center">
           <p className="text-[11px] font-semibold uppercase tracking-[0.25em] text-slate-500">
-            Class Result Sheet
+            CLASS LEDGER
           </p>
           <h1 className="mt-1 text-xl font-bold tracking-tight text-slate-900 uppercase">
             {schoolName}
@@ -389,9 +390,13 @@ function LedgerTable({ ledger }: { ledger: ClassLedger }) {
     <div className="overflow-x-auto px-6 py-4">
       {/* Compact table — small font + tight padding so even ~10 subject
           columns fit cleanly on A4 landscape. */}
-      <table className="w-full border-collapse text-[11.5px]">
+      <table className="w-full border-collapse text-[12px]">
         <thead>
           <tr className="bg-slate-100 border-y-2 border-slate-900">
+            {/* SN column matches the real-world school ledger format —
+                serial numbering from 1, derived from row position after
+                the backend's symbolNumber-ASC sort. */}
+            <Th className="text-center">SN</Th>
             <Th className="text-left">Symbol</Th>
             <Th className="text-left">Name</Th>
             {ledger.subjects.map((s) => (
@@ -412,6 +417,9 @@ function LedgerTable({ ledger }: { ledger: ClassLedger }) {
                 idx % 2 === 1 && "bg-slate-50/60",
               )}
             >
+              <Td className="text-center tabular-nums text-slate-600">
+                {idx + 1}
+              </Td>
               <Td className="text-left font-mono text-slate-700">
                 {s.symbolNumber ?? "—"}
               </Td>
@@ -422,16 +430,16 @@ function LedgerTable({ ledger }: { ledger: ClassLedger }) {
                 </Td>
               ))}
               <Td className="text-right tabular-nums font-medium">
-                {s.finalGrade ? s.gpa.toFixed(2) : "—"}
+                {s.finalResult ? s.gpa.toFixed(2) : "—"}
               </Td>
               <Td
                 className={cn(
                   "text-center font-bold tracking-wide",
-                  s.finalGrade === "NG" && "text-red-600",
-                  s.finalGrade === null && "text-slate-400",
+                  s.finalResult === "NG" && "text-red-600",
+                  s.finalResult === null && "text-slate-400",
                 )}
               >
-                {s.finalGrade ?? "—"}
+                {s.finalResult ?? "—"}
               </Td>
             </tr>
           ))}
@@ -488,6 +496,79 @@ function Td({
   );
 }
 
+/**
+ * Quick-glance pass/fail tally rendered between the table and the
+ * signature footer. Counts:
+ *   • Total Students = every row in the ledger
+ *   • Passed         = finalResult set AND not "NG"
+ *   • Failed (NG)    = finalResult === "NG"
+ * Students with `finalResult === null` (no results recorded) are tallied
+ * separately as "Ungraded" so the three primary numbers always reconcile
+ * with the row count when present.
+ */
+function LedgerSummary({ ledger }: { ledger: ClassLedger }) {
+  const total = ledger.students.length;
+  const failed = ledger.students.filter((s) => s.finalResult === "NG").length;
+  const passed = ledger.students.filter(
+    (s) => s.finalResult !== null && s.finalResult !== "NG",
+  ).length;
+  const ungraded = total - passed - failed;
+  const passRate = total > 0 ? Math.round((passed / total) * 100) : 0;
+
+  return (
+    <section className="px-6 py-3 border-t-2 border-slate-900 bg-slate-50">
+      <div className="flex flex-wrap items-center justify-between gap-3">
+        <div className="flex flex-wrap items-center gap-2 text-[12px]">
+          <SummaryPill label="Total Students" value={total} tone="slate" />
+          <SummaryPill label="Passed" value={passed} tone="success" />
+          <SummaryPill label="Failed (NG)" value={failed} tone="danger" />
+          {ungraded > 0 && (
+            <SummaryPill label="Ungraded" value={ungraded} tone="muted" />
+          )}
+        </div>
+        {total > 0 && (
+          <span className="text-[11px] font-semibold uppercase tracking-wider text-slate-600">
+            Pass rate{" "}
+            <span className="font-bold text-slate-900 tabular-nums">
+              {passRate}%
+            </span>
+          </span>
+        )}
+      </div>
+    </section>
+  );
+}
+
+function SummaryPill({
+  label,
+  value,
+  tone,
+}: {
+  label: string;
+  value: number;
+  tone: "slate" | "success" | "danger" | "muted";
+}) {
+  const tones = {
+    slate: "bg-slate-200 text-slate-800",
+    success: "bg-emerald-100 text-emerald-800",
+    danger: "bg-red-100 text-red-700",
+    muted: "bg-slate-100 text-slate-500",
+  } as const;
+  return (
+    <span
+      className={cn(
+        "inline-flex items-baseline gap-1.5 rounded-md px-2.5 py-1 font-medium",
+        tones[tone],
+      )}
+    >
+      <span className="text-[10px] uppercase tracking-wider opacity-80">
+        {label}
+      </span>
+      <span className="text-sm font-bold tabular-nums">{value}</span>
+    </span>
+  );
+}
+
 function SheetFooter({
   ledger,
   schoolName,
@@ -495,13 +576,15 @@ function SheetFooter({
   ledger: ClassLedger;
   schoolName: string;
 }) {
-  const ngCount = ledger.students.filter((s) => s.finalGrade === "NG").length;
+  const ngCount = ledger.students.filter((s) => s.finalResult === "NG").length;
   return (
     <footer className="px-8 py-4 border-t border-slate-300">
-      <div className="grid grid-cols-3 gap-6">
-        <SignatureLine label="Class Teacher" />
-        <SignatureLine label="Examination Officer" />
-        <SignatureLine label="Principal" />
+      {/* Two signature blocks — Class Teacher (left) and Principal
+          (right) — with generous space between so the actual ink
+          signatures don't overlap when the sheet is signed by hand. */}
+      <div className="mt-6 grid grid-cols-2 gap-x-24 gap-y-2 print:mt-10">
+        <SignatureLine label="Class Teacher" align="left" />
+        <SignatureLine label="Principal" align="right" />
       </div>
       <div className="mt-4 flex items-center justify-between text-[10px] uppercase tracking-widest text-slate-400">
         <span>{schoolName} &middot; Computer-generated</span>
@@ -516,11 +599,25 @@ function SheetFooter({
   );
 }
 
-function SignatureLine({ label }: { label: string }) {
+function SignatureLine({
+  label,
+  align = "center",
+}: {
+  label: string;
+  align?: "left" | "center" | "right";
+}) {
+  // Taller line (h-14) leaves comfortable room for an ink signature when
+  // the ledger is printed and signed by hand.
   return (
-    <div className="text-center">
-      <div className="h-10 border-b border-slate-400" />
-      <p className="mt-1 text-[10px] font-semibold uppercase tracking-wider text-slate-500">
+    <div
+      className={cn(
+        align === "left" && "text-left",
+        align === "center" && "text-center",
+        align === "right" && "text-right",
+      )}
+    >
+      <div className="h-14 border-b border-slate-500" />
+      <p className="mt-1.5 text-[11px] font-semibold uppercase tracking-wider text-slate-700">
         {label}
       </p>
     </div>

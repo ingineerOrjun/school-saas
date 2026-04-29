@@ -151,7 +151,7 @@ export interface LedgerStudentRow {
   results: LedgerCell[];
   gpa: number;
   /** Final overall letter grade (NG-if-fail). Null when no results recorded. */
-  finalGrade: string | null;
+  finalResult: string | null;
 }
 
 export interface ClassLedger {
