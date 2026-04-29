@@ -13,26 +13,46 @@ school management system/
 
 ## Getting started
 
+### Prerequisites
+
+- Node.js 20+
+- PostgreSQL 14+ running on `localhost:5432`
+
 ### Backend
 
 ```bash
 cd backend
+cp .env.example .env             # then edit DATABASE_URL + JWT_SECRET
 npm install
-npx prisma migrate dev        # requires Postgres on localhost:5432
-npm run start:dev             # http://localhost:3000
+npx prisma migrate deploy        # apply existing migrations
+npm run start:dev                # listens on PORT from .env (default 3001)
 ```
 
 ### Frontend
 
 ```bash
 cd frontend
+cp .env.example .env.local       # default points NEXT_PUBLIC_API_URL → :3001
 npm install
-npm run dev                   # http://localhost:3100
+npm run dev                      # http://localhost:3100
 ```
 
 Each workspace has its own `package.json`, `node_modules`, and config. Run them
 in two terminals or use the `.claude/launch.json` profiles (`frontend`,
 `backend`) from Claude Code.
+
+### Environment variables
+
+| Var | Where | Purpose |
+| --- | --- | --- |
+| `PORT` | `backend/.env` | Nest listen port (default `3001`) |
+| `DATABASE_URL` | `backend/.env` | Prisma Postgres connection string |
+| `JWT_SECRET` | `backend/.env` | HS256 signing secret — **change in production** |
+| `JWT_EXPIRES_IN` | `backend/.env` | Token lifetime (e.g. `7d`) |
+| `NEXT_PUBLIC_API_URL` | `frontend/.env.local` | Backend base URL for the browser |
+
+`.env` and `.env.local` are gitignored. Use the matching `.env.example`
+files as templates.
 
 ## Architecture
 
