@@ -7,24 +7,46 @@ import { cn } from "@/lib/utils";
 type Variant = "primary" | "secondary" | "ghost" | "outline" | "destructive";
 type Size = "sm" | "md" | "lg" | "icon";
 
+/**
+ * Button variants — locked to the spec:
+ *   primary    : bg-indigo-600 → hover indigo-700 (filled CTA)
+ *   secondary  : white surface + slate-300 border (passive action)
+ *   destructive: bg-red-600 (delete / clear actions)
+ *   outline    : same surface as secondary (kept for back-compat)
+ *   ghost      : no surface, used inside dense rows / toolbars
+ *
+ * Use AT MOST one `primary` per logical section so the user always
+ * knows what to click. `secondary` / `outline` carry every other action.
+ */
 const variantStyles: Record<Variant, string> = {
+  // Primary: indigo brand color stays consistent across both themes —
+  // it's the visual hook users learn to find. Hover step still
+  // darkens (works in both themes since it's the same indigo).
   primary:
-    "bg-primary text-primary-foreground hover:bg-primary/90 active:bg-primary/95 shadow-xs",
+    "bg-primary-600 text-white hover:bg-primary-700 active:bg-primary-700 shadow-xs",
+  // Secondary / outline: token-based so the surface flips with the
+  // theme. In dark mode this becomes a slate-900 button on a slate
+  // page — separated by the border, not a fill contrast.
   secondary:
-    "bg-muted text-foreground hover:bg-muted/70 active:bg-muted border border-border/60",
-  ghost:
-    "bg-transparent text-foreground hover:bg-muted active:bg-muted/80",
+    "bg-surface text-foreground border border-border hover:bg-muted active:bg-muted shadow-xs",
   outline:
-    "bg-surface text-foreground border border-border hover:bg-muted active:bg-muted/80 shadow-xs",
+    "bg-surface text-foreground border border-border hover:bg-muted active:bg-muted shadow-xs",
+  ghost:
+    "bg-transparent text-muted-foreground hover:bg-muted hover:text-foreground active:bg-muted",
   destructive:
-    "bg-destructive text-destructive-foreground hover:bg-destructive/90 shadow-xs",
+    "bg-destructive text-destructive-foreground hover:bg-destructive/90 active:bg-destructive/90 shadow-xs",
 };
 
+/**
+ * Sizes match the spec: primary action is `md` = h-10 px-4 (~py-2.5 of
+ * a 14px line). `sm` is for inline toolbars, `lg` for hero CTAs, `icon`
+ * for square icon-only buttons.
+ */
 const sizeStyles: Record<Size, string> = {
   sm: "h-8 px-3 text-sm rounded-md gap-1.5",
-  md: "h-9 px-3.5 text-sm rounded-md gap-2",
-  lg: "h-11 px-5 text-base rounded-lg gap-2",
-  icon: "h-9 w-9 rounded-md",
+  md: "h-10 px-4 text-sm rounded-md gap-2",
+  lg: "h-11 px-5 text-base rounded-md gap-2",
+  icon: "h-10 w-10 rounded-md",
 };
 
 export interface ButtonProps
@@ -59,7 +81,11 @@ export const Button = React.forwardRef<HTMLButtonElement, ButtonProps>(
           "inline-flex items-center justify-center whitespace-nowrap font-medium select-none",
           "transition-all duration-150 ease-out",
           "active:scale-[0.97] active:duration-75",
-          "focus-ring",
+          // Always-visible focus ring in the brand color so keyboard
+          // users (and accessibility audits) see exactly what's focused.
+          // Offset uses the page background token so the gap is visible
+          // in BOTH themes (was hardcoded white before).
+          "focus:outline-none focus-visible:ring-2 focus-visible:ring-primary focus-visible:ring-offset-2 focus-visible:ring-offset-background",
           "disabled:opacity-50 disabled:pointer-events-none disabled:active:scale-100",
           variantStyles[variant],
           sizeStyles[size],

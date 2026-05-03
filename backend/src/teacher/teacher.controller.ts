@@ -11,10 +11,14 @@ import {
   Post,
   UseGuards,
 } from '@nestjs/common';
+import { Role } from '@prisma/client';
 import { CurrentUser } from '../common/decorators/current-user.decorator';
+import { Roles } from '../common/decorators/roles.decorator';
 import { JwtAuthGuard } from '../auth/guards/jwt-auth.guard';
+import { RolesGuard } from '../auth/guards/roles.guard';
 import type { AuthenticatedUser } from '../auth/jwt.strategy';
 import { CreateTeacherDto } from './dto/create-teacher.dto';
+import { CreateTeacherWithUserDto } from './dto/create-teacher-with-user.dto';
 import { UpdateTeacherDto } from './dto/update-teacher.dto';
 import { TeacherService } from './teacher.service';
 
@@ -30,6 +34,23 @@ export class TeacherController {
     @CurrentUser() user: AuthenticatedUser,
   ) {
     return this.teachers.create(dto, user.schoolId);
+  }
+
+  /**
+   * One-step provisioning endpoint used by the Add Teacher dialog.
+   * Creates a User (role=TEACHER) and a Teacher row in the same
+   * transaction so the new teacher can log in immediately.
+   * Admin-only — non-admin tokens get a 403 from RolesGuard.
+   */
+  @Post('create-with-user')
+  @UseGuards(RolesGuard)
+  @Roles(Role.ADMIN)
+  @HttpCode(HttpStatus.CREATED)
+  createWithUser(
+    @Body() dto: CreateTeacherWithUserDto,
+    @CurrentUser() user: AuthenticatedUser,
+  ) {
+    return this.teachers.createWithUser(dto, user.schoolId);
   }
 
   @Get()

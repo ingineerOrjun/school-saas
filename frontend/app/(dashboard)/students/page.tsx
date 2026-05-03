@@ -5,6 +5,7 @@ import { useRouter } from "next/navigation";
 import { Plus, Search, UserPlus, RotateCw, AlertCircle, Filter, Upload } from "lucide-react";
 import { toast } from "sonner";
 import { ApiError } from "@/lib/api";
+import { getStoredUser, type Role } from "@/lib/auth";
 import { studentsApi, type StudentDto } from "@/lib/students";
 import { classesApi, type ClassWithSections } from "@/lib/classes";
 import { Button } from "@/components/ui/Button";
@@ -14,7 +15,6 @@ import { StudentTable } from "@/components/students/StudentTable";
 import { AddStudentDialog } from "@/components/students/AddStudentDialog";
 import { EditStudentDialog } from "@/components/students/EditStudentDialog";
 import { DeleteStudentDialog } from "@/components/students/DeleteStudentDialog";
-import { QuickAddStudent } from "@/components/students/QuickAddStudent";
 import { ImportStudentsDialog } from "@/components/students/ImportStudentsDialog";
 import {
   formatStudentAssignment,
@@ -53,6 +53,17 @@ export default function StudentsPage() {
   const [importOpen, setImportOpen] = React.useState(false);
   const [editTarget, setEditTarget] = React.useState<StudentDto | null>(null);
   const [deleteTarget, setDeleteTarget] = React.useState<StudentDto | null>(null);
+
+  // Role-based UI gating. Reading the cached user once on mount is the
+  // right tradeoff for static perms — the JWT role doesn't change at
+  // runtime, so re-reading on every render would just be noise. Holds
+  // `null` for one render until the effect resolves so admin chrome
+  // doesn't briefly flash for non-admin users.
+  const [role, setRole] = React.useState<Role | null>(null);
+  React.useEffect(() => {
+    setRole(getStoredUser()?.role ?? null);
+  }, []);
+  const isAdmin = role === "ADMIN";
   const [highlightIds, setHighlightIds] = React.useState<Set<string>>(
     () => new Set(),
   );
@@ -386,121 +397,43 @@ export default function StudentsPage() {
     [list, resolveAssignment, router],
   );
 
-  // Quick-add now ROUTES into the full Add Student dialog with the
-  // typed name pre-filled. We can't optimistic-create anymore because
-  // the schema requires gender / DOB / parent name / contact, which we
-  // can only collect through the full form. The dialog still feels fast
-  // because the names are already typed.
-  const [quickAddPrefill, setQuickAddPrefill] = React.useState<{
-    firstName: string;
-    lastName: string;
-  } | null>(null);
-  const handleQuickAdd = async (firstName: string, lastName: string) => {
-    setQuickAddPrefill({ firstName, lastName });
-    setAddOpen(true);
-  };
-
-  // Legacy optimistic-create implementation, kept as a no-op so the rest
-  // of the file compiles unchanged. The block below is intentionally
-  // unreachable — it documents what the previous flow did.
-  // eslint-disable-next-line @typescript-eslint/no-unused-vars
-  const _legacyQuickAdd = async (firstName: string, lastName: string) => {
-    const tempId = `temp_${makeTempSuffix()}`;
-    const now = new Date().toISOString();
-    const optimistic: StudentDto = {
-      id: tempId,
-      firstName,
-      lastName,
-      symbolNumber: null,
-      schoolId: "",
-      userId: null,
-      classId: null,
-      class: null,
-      sectionId: null,
-      section: null,
-      gender: "OTHER",
-      dateOfBirth: now,
-      parentName: "",
-      contactNumber: "",
-      address: null,
-      admissionDate: null,
-      createdAt: now,
-      updatedAt: now,
-    };
-
-    setList((prev) => (prev ? [optimistic, ...prev] : [optimistic]));
-
-    try {
-      // This call would now fail — required fields missing. Kept here
-      // only so the larger function remains structurally untouched.
-      const real = await studentsApi.create({
-        firstName,
-        lastName,
-        gender: "OTHER",
-        dateOfBirth: now,
-        parentName: "",
-        contactNumber: "",
-      });
-      setList((prev) =>
-        prev ? prev.map((s) => (s.id === tempId ? real : s)) : [real],
-      );
-      markAsNew(real.id);
-      toast.success(`${real.firstName} ${real.lastName} enrolled`, {
-        description: "Open the row to add class, parent email, and more.",
-      });
-    } catch (err) {
-      // Rollback the optimistic row
-      setList((prev) => (prev ? prev.filter((s) => s.id !== tempId) : prev));
-      if (err instanceof ApiError && err.status === 401) {
-        router.replace("/login");
-        return;
-      }
-      const msg =
-        err instanceof ApiError
-          ? err.message
-          : err instanceof Error
-            ? err.message
-            : "Failed to add student.";
-      toast.error(msg);
-    }
-  };
-
   return (
     <div className="space-y-6">
       <Header
         count={list?.length ?? 0}
         loading={loading}
+        isAdmin={isAdmin}
         onAdd={() => setAddOpen(true)}
         onImport={() => setImportOpen(true)}
         onRefresh={refresh}
       />
 
-      {/* Quick add + search + filter — only visible when we have students */}
+      {/* Search bar — own row, full width, below the header.
+          Class filter sits to the right so admins can scope quickly
+          without leaving the row. Visible only when we already have
+          students; the empty-state CTA covers first-time enrollment. */}
       {hasItems && (
-        <div className="grid grid-cols-1 gap-3 md:grid-cols-[1fr_320px]">
-          <QuickAddStudent onSubmit={handleQuickAdd} />
-          <div className="flex items-center gap-2 animate-fade-in">
-            <div className="relative flex-1">
-              <Search className="pointer-events-none absolute left-3 top-1/2 -translate-y-1/2 h-4 w-4 text-muted-foreground" />
-              <input
-                type="search"
-                placeholder="Search by name…"
-                value={query}
-                onChange={(e) => setQuery(e.target.value)}
-                className={cn(
-                  "h-11 w-full rounded-lg border border-border bg-surface/80 backdrop-blur-md pl-9 pr-3 text-sm",
-                  "placeholder:text-muted-foreground/80",
-                  "focus:outline-none focus:ring-2 focus:ring-primary/25 focus:border-primary",
-                  "transition-colors",
-                )}
-              />
-            </div>
-            <ClassFilter
-              classes={classes}
-              value={classFilter}
-              onChange={setClassFilter}
+        <div className="flex items-center gap-2 animate-fade-in">
+          <div className="relative flex-1">
+            <Search className="pointer-events-none absolute left-3 top-1/2 -translate-y-1/2 h-4 w-4 text-slate-500" />
+            <input
+              type="search"
+              placeholder="Search students by name…"
+              value={query}
+              onChange={(e) => setQuery(e.target.value)}
+              className={cn(
+                "h-10 w-full rounded-md border border-slate-300 bg-white pl-9 pr-3 text-sm text-slate-900",
+                "placeholder:text-slate-400",
+                "focus:outline-none focus:border-indigo-500 focus:ring-2 focus:ring-indigo-500/30",
+                "transition-shadow",
+              )}
             />
           </div>
+          <ClassFilter
+            classes={classes}
+            value={classFilter}
+            onChange={setClassFilter}
+          />
         </div>
       )}
 
@@ -529,13 +462,26 @@ export default function StudentsPage() {
           <div className="glass rounded-xl">
             <EmptyState
               icon={<UserPlus className="h-10 w-10" strokeWidth={1.5} />}
-              title="Add your first student"
-              description="Bring your roster online. Students appear here the moment you enroll them — you can update or remove them any time."
-              action={{
-                label: "Add your first student",
-                icon: <Plus className="h-4 w-4" />,
-                onClick: () => setAddOpen(true),
-              }}
+              title={
+                isAdmin
+                  ? "Add your first student"
+                  : "No students enrolled yet"
+              }
+              description={
+                isAdmin
+                  ? "Bring your roster online. Students appear here the moment you enroll them — you can update or remove them any time."
+                  : "Once your admin enrolls students, they'll show up here."
+              }
+              // Only admins get an action — teachers can't add students.
+              action={
+                isAdmin
+                  ? {
+                      label: "Add your first student",
+                      icon: <Plus className="h-4 w-4" />,
+                      onClick: () => setAddOpen(true),
+                    }
+                  : undefined
+              }
             />
           </div>
         )}
@@ -544,6 +490,11 @@ export default function StudentsPage() {
           <StudentTable
             students={filtered}
             classes={classes}
+            // canModify gates Edit/Delete row actions AND the inline
+            // section picker (assigning a section is a PATCH the
+            // backend rejects for non-admin users). Teachers see a
+            // read-only roster.
+            canModify={isAdmin}
             onEdit={setEditTarget}
             onDelete={setDeleteTarget}
             onAssignSection={handleAssignSection}
@@ -577,16 +528,8 @@ export default function StudentsPage() {
       <AddStudentDialog
         open={addOpen}
         classes={classes}
-        initialFirstName={quickAddPrefill?.firstName}
-        initialLastName={quickAddPrefill?.lastName}
-        onClose={() => {
-          setAddOpen(false);
-          setQuickAddPrefill(null);
-        }}
-        onCreated={(s) => {
-          setQuickAddPrefill(null);
-          handleCreated(s);
-        }}
+        onClose={() => setAddOpen(false)}
+        onCreated={handleCreated}
       />
       <EditStudentDialog
         student={editTarget}
@@ -618,12 +561,20 @@ export default function StudentsPage() {
 function Header({
   count,
   loading,
+  isAdmin,
   onAdd,
   onImport,
   onRefresh,
 }: {
   count: number;
   loading: boolean;
+  /**
+   * When false (TEACHER, future STUDENT/PARENT roles), the Add and
+   * Import buttons are hidden — only Refresh remains. Subtitle copy
+   * also softens from "Manage all N students" to "Viewing N students"
+   * since teachers can't act on the list.
+   */
+  isAdmin: boolean;
   onAdd: () => void;
   onImport: () => void;
   onRefresh: () => void;
@@ -640,39 +591,51 @@ function Header({
               <Skeleton className="inline-block h-3 w-28" />
             </span>
           ) : count === 0 ? (
-            "Your roster is empty — let's change that."
+            isAdmin
+              ? "Your roster is empty — let's change that."
+              : "No students enrolled yet."
           ) : (
             <>
-              Manage all{" "}
+              {isAdmin ? "Manage all" : "Viewing"}{" "}
               <span className="font-medium text-foreground">{count}</span>{" "}
               {count === 1 ? "student" : "students"} enrolled in your school.
             </>
           )}
         </p>
       </div>
-      <div className="flex items-center gap-2">
+      {/* Action cluster — Refresh always renders. Import + Add are
+          admin-only; the backend rejects them for teachers anyway, so
+          showing them would just produce 403 toasts. flex-wrap lets
+          the cluster fall onto a second line on narrow phones rather
+          than overflowing the row. */}
+      <div className="flex flex-wrap items-center gap-2">
         <Button
           variant="ghost"
           size="sm"
           onClick={onRefresh}
           leftIcon={<RotateCw className="h-3.5 w-3.5" />}
+          aria-label="Refresh student list"
         >
           Refresh
         </Button>
-        <Button
-          variant="outline"
-          onClick={onImport}
-          leftIcon={<Upload className="h-4 w-4" />}
-        >
-          Import students
-        </Button>
-        <Button
-          onClick={onAdd}
-          leftIcon={<Plus className="h-4 w-4" />}
-          className="shadow-md shadow-primary/20 hover:shadow-lg hover:shadow-primary/30 hover:-translate-y-px transition-all"
-        >
-          Add student
-        </Button>
+        {isAdmin && (
+          <>
+            <Button
+              variant="secondary"
+              onClick={onImport}
+              leftIcon={<Upload className="h-4 w-4" />}
+            >
+              Import
+            </Button>
+            <Button
+              variant="primary"
+              onClick={onAdd}
+              leftIcon={<Plus className="h-4 w-4" />}
+            >
+              Add Student
+            </Button>
+          </>
+        )}
       </div>
     </div>
   );
@@ -744,14 +707,6 @@ function describeNoResults(
     return `No students have been assigned to ${selectedClass} yet.`;
   }
   return "No students match the current filters.";
-}
-
-function makeTempSuffix(): string {
-  // `crypto.randomUUID` is stable in modern browsers and Node 19+.
-  if (typeof crypto !== "undefined" && "randomUUID" in crypto) {
-    return crypto.randomUUID();
-  }
-  return `${Date.now()}-${Math.random().toString(36).slice(2)}`;
 }
 
 function TableLoading() {

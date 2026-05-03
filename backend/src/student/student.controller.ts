@@ -13,8 +13,11 @@ import {
   Query,
   UseGuards,
 } from '@nestjs/common';
+import { Role } from '@prisma/client';
 import { CurrentUser } from '../common/decorators/current-user.decorator';
 import { JwtAuthGuard } from '../auth/guards/jwt-auth.guard';
+import { RolesGuard } from '../auth/guards/roles.guard';
+import { Roles } from '../common/decorators/roles.decorator';
 import type { AuthenticatedUser } from '../auth/jwt.strategy';
 import { BulkCreateStudentsDto } from './dto/bulk-create-students.dto';
 import { CreateStudentDto } from './dto/create-student.dto';
@@ -25,13 +28,19 @@ import { StudentService } from './student.service';
 const UUID_RE =
   /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
+/**
+ * Role rules:
+ *   • READS (GET) — any authenticated user (teachers need to see their roster).
+ *   • WRITES (POST/PATCH/DELETE) — ADMIN only via `@Roles(Role.ADMIN)`.
+ */
 @Controller('students')
-@UseGuards(JwtAuthGuard)
+@UseGuards(JwtAuthGuard, RolesGuard)
 export class StudentController {
   constructor(private readonly students: StudentService) {}
 
   @Post()
   @HttpCode(HttpStatus.CREATED)
+  @Roles(Role.ADMIN)
   create(
     @Body() dto: CreateStudentDto,
     @CurrentUser() user: AuthenticatedUser,
@@ -46,6 +55,7 @@ export class StudentController {
    */
   @Post('bulk')
   @HttpCode(HttpStatus.OK)
+  @Roles(Role.ADMIN)
   bulkCreate(
     @Body() dto: BulkCreateStudentsDto,
     @CurrentUser() user: AuthenticatedUser,
@@ -82,6 +92,7 @@ export class StudentController {
   }
 
   @Patch(':id')
+  @Roles(Role.ADMIN)
   update(
     @Param('id', ParseUUIDPipe) id: string,
     @Body() dto: UpdateStudentDto,
@@ -92,6 +103,7 @@ export class StudentController {
 
   @Delete(':id')
   @HttpCode(HttpStatus.NO_CONTENT)
+  @Roles(Role.ADMIN)
   remove(
     @Param('id', ParseUUIDPipe) id: string,
     @CurrentUser() user: AuthenticatedUser,

@@ -70,18 +70,24 @@ model School {
   id        String   @id @default(uuid()) @db.Uuid
   name      String
   slug      String   @unique
+  /// Public URL of the school's logo image (PNG/JPG/WebP). Null until
+  /// uploaded. Path is served by NestJS at `/uploads/logos/<file>`.
+  logoUrl   String?
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
 
-  users          User[]
-  students       Student[]
-  teachers       Teacher[]
-  classes        Class[]
-  attendance     Attendance[]
-  exams          Exam[]
-  feeStructures  FeeStructure[]
-  feeAssignments FeeAssignment[]
-  payments       Payment[]
+  users               User[]
+  students            Student[]
+  teachers            Teacher[]
+  classes             Class[]
+  attendance          Attendance[]
+  exams               Exam[]
+  subjects            Subject[]
+  teachingAssignments TeachingAssignment[]
+  feeStructures       FeeStructure[]
+  feeAssignments      FeeAssignment[]
+  payments            Payment[]
+  announcements       Announcement[]
 
   @@map("schools")
 }
@@ -183,9 +189,11 @@ model Class {
   schoolId String @db.Uuid
   school   School @relation(fields: [schoolId], references: [id], onDelete: Cascade)
 
-  sections       Section[]
-  students       Student[]
-  feeStructures  FeeStructure[]
+  sections            Section[]
+  students            Student[]
+  teachers            Teacher[]
+  teachingAssignments TeachingAssignment[]
+  feeStructures       FeeStructure[]
 
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
@@ -202,7 +210,9 @@ model Section {
   classId String @db.Uuid
   class   Class  @relation(fields: [classId], references: [id], onDelete: Cascade)
 
-  students Student[]
+  students            Student[]
+  teachers            Teacher[]
+  teachingAssignments TeachingAssignment[]
 
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
@@ -316,15 +326,125 @@ model Teacher {
   schoolId String @db.Uuid
   school   School @relation(fields: [schoolId], references: [id], onDelete: Cascade)
 
-  // Optional — a teacher may exist as a roster entry before their login is set up.
-  userId String? @unique @db.Uuid
-  user   User?   @relation(fields: [userId], references: [id], onDelete: SetNull)
+  /// REQUIRED — every Teacher must be linked to a User. The dashboard
+  /// resolves a teacher's assignments via Teacher.userId === user.id,
+  /// so a userId-less row is unreachable from the teacher's POV.
+  /// Enforced at the API layer (createWithUser is the only allowed
+  /// path) AND at the DB layer (NOT NULL + cascade on user delete).
+  userId String @unique @db.Uuid
+  user   User   @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  /// Assigned class. Drives role-based access: a TEACHER user is only
+  /// allowed to mark attendance / enter marks for students in this
+  /// class. Null when the admin hasn't assigned the teacher anywhere
+  /// yet — a teacher with no classId effectively has read-only access.
+  classId String? @db.Uuid
+  class   Class?  @relation(fields: [classId], references: [id], onDelete: SetNull)
+
+  /// Optional narrower scope. When set, the teacher can ONLY act on
+  /// students in this section (a subset of `class`). Useful when one
+  /// class has multiple sections taught by different teachers.
+  /// The service enforces section.classId === teacher.classId on writes.
+  ///
+  /// DEPRECATED: superseded by the `teachingAssignments` relation. Kept
+  /// on the row so the login flow can still surface a "primary" class
+  /// for routing decisions, and so old admin UIs keep working until
+  /// they migrate. New permission checks read from TeachingAssignment.
+  sectionId String?  @db.Uuid
+  section   Section? @relation(fields: [sectionId], references: [id], onDelete: SetNull)
+
+  /// Source of truth for what the teacher can act on. Each row pairs
+  /// the teacher with a (class, optional section, optional subject).
+  /// A teacher can have many — covering multiple classes and/or
+  /// multiple subjects.
+  assignments TeachingAssignment[]
 
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
 
   @@index([schoolId])
+  @@index([classId])
+  @@index([sectionId])
   @@map("teachers")
+}
+
+// -----------------------------------------------------------------------------
+// Teaching assignments (multi-class / multi-subject)
+// -----------------------------------------------------------------------------
+
+/// School-owned subject catalog (Math, Science, English, ...). Subjects
+/// are referenced by `TeachingAssignment.subjectId` to express "this
+/// teacher teaches Math to Class 8" rather than "this teacher teaches
+/// Class 8" alone.
+///
+/// `ExamSubject` (per-exam subject row with full marks) does NOT yet
+/// link to this table — that's a separate migration. For now Subject is
+/// only used by TeachingAssignment.
+model Subject {
+  id   String @id @default(uuid()) @db.Uuid
+  name String
+
+  schoolId String @db.Uuid
+  school   School @relation(fields: [schoolId], references: [id], onDelete: Cascade)
+
+  teachingAssignments TeachingAssignment[]
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@unique([schoolId, name])
+  @@index([schoolId])
+  @@map("subjects")
+}
+
+/// One row per "this teacher can act on this (class, optional section,
+/// optional subject)". A teacher with multiple rows covers multiple
+/// classes/subjects — exactly the multi-class case the legacy single
+/// `Teacher.classId/sectionId` couldn't express.
+///
+/// Coverage rules used by TeacherScopeService:
+///   • sectionId set  → assignment covers ONLY that section
+///   • sectionId null → assignment covers the WHOLE class (every
+///     section under it + students linked directly to the class)
+///   • subjectId set  → required for exam writes (saveResults) on this
+///     class. Attendance writes ignore subjectId — they only check class.
+///   • subjectId null → "any subject" / "no subject" — used for class
+///     teachers, who own attendance but not necessarily a subject.
+model TeachingAssignment {
+  id String @id @default(uuid()) @db.Uuid
+
+  teacherId String  @db.Uuid
+  teacher   Teacher @relation(fields: [teacherId], references: [id], onDelete: Cascade)
+
+  classId String @db.Uuid
+  class   Class  @relation(fields: [classId], references: [id], onDelete: Cascade)
+
+  sectionId String?  @db.Uuid
+  section   Section? @relation(fields: [sectionId], references: [id], onDelete: SetNull)
+
+  subjectId String?  @db.Uuid
+  subject   Subject? @relation(fields: [subjectId], references: [id], onDelete: SetNull)
+
+  /// Denormalized for fast tenant-scoped queries + cross-tenant safety.
+  /// Always equal to the teacher's schoolId; the service writes both.
+  schoolId String @db.Uuid
+  school   School @relation(fields: [schoolId], references: [id], onDelete: Cascade)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  /// Postgres treats NULLs as DISTINCT in unique indexes, so duplicate
+  /// (teacher, class, NULL section, NULL subject) rows are technically
+  /// allowed by this constraint. The service-level guard rejects any
+  /// duplicate before insert; this index just protects against truly
+  /// identical non-null tuples.
+  @@unique([teacherId, classId, sectionId, subjectId])
+  @@index([schoolId])
+  @@index([teacherId])
+  @@index([classId])
+  @@index([sectionId])
+  @@index([subjectId])
+  @@map("teaching_assignments")
 }
 
 // -----------------------------------------------------------------------------
@@ -432,4 +552,31 @@ model Payment {
   @@index([studentId])
   @@index([feeAssignmentId])
   @@map("payments")
+}
+
+// -----------------------------------------------------------------------------
+// Announcements
+// -----------------------------------------------------------------------------
+
+/// School-wide announcement posted by an admin and visible to every
+/// authenticated user in that school. Intentionally minimal —
+/// title + body + timestamp — so the feature ships small and grows
+/// later (audience scoping, attachments, expiry, etc.).
+model Announcement {
+  id      String @id @default(uuid()) @db.Uuid
+  title   String @db.VarChar(160)
+  /// Body text. No length cap at the DB level; the DTO enforces a
+  /// reasonable max so the UI doesn't have to render walls of text.
+  message String
+
+  schoolId String @db.Uuid
+  school   School @relation(fields: [schoolId], references: [id], onDelete: Cascade)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  // Listed newest-first; the (schoolId, createdAt) pair makes the
+  // tenant-scoped feed query an index-only seek-and-scan.
+  @@index([schoolId, createdAt])
+  @@map("announcements")
 }

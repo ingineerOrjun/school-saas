@@ -18,6 +18,14 @@ export interface StudentTableProps {
   onEdit: (student: StudentDto) => void;
   onDelete: (student: StudentDto) => void;
   onAssignSection: (student: StudentDto, next: Assignment) => void;
+  /**
+   * When false, the table renders read-only:
+   *   • Actions column (Edit / Delete) is hidden entirely
+   *   • Inline class/section picker collapses to a static label
+   * Defaults to true so existing call sites that don't yet pass this
+   * prop keep their current admin-style behavior.
+   */
+  canModify?: boolean;
   highlightIds?: Set<string>;
   removingIds?: Set<string>;
   assigningIds?: Set<string>;
@@ -29,6 +37,7 @@ export function StudentTable({
   onEdit,
   onDelete,
   onAssignSection,
+  canModify = true,
   highlightIds,
   removingIds,
   assigningIds,
@@ -42,8 +51,19 @@ export function StudentTable({
               <Th className="rounded-tl-xl">Name</Th>
               <Th>Class</Th>
               <Th>Gender</Th>
-              <Th>Contact</Th>
-              <Th className="rounded-tr-xl text-right">Actions</Th>
+              <Th
+                className={cn(
+                  // When the Actions column is hidden, Contact becomes
+                  // the rightmost column and inherits the rounded
+                  // corner that would otherwise live on Actions.
+                  !canModify && "rounded-tr-xl",
+                )}
+              >
+                Contact
+              </Th>
+              {canModify && (
+                <Th className="rounded-tr-xl text-right">Actions</Th>
+              )}
             </tr>
           </thead>
           <tbody>
@@ -106,47 +126,61 @@ export function StudentTable({
                         {isAssigning && <Loader2 className="h-3 w-3 animate-spin" />}
                         {formatStudentAssignment(student)}
                       </span>
-                      <SectionSelect
-                        classes={classes}
-                        value={assignmentFromStudent(student)}
-                        onChange={(next) => onAssignSection(student, next)}
-                        disabled={isPending || isRemoving || isAssigning}
-                        compact
-                      />
+                      {/* Inline section picker is a write — admin only.
+                          Teachers see only the static assignment label
+                          above. */}
+                      {canModify && (
+                        <SectionSelect
+                          classes={classes}
+                          value={assignmentFromStudent(student)}
+                          onChange={(next) => onAssignSection(student, next)}
+                          disabled={isPending || isRemoving || isAssigning}
+                          compact
+                        />
+                      )}
                     </div>
                   </Td>
                   <Td className="border-t border-border/50 text-muted-foreground">
                     {isPending ? "—" : <GenderPill gender={student.gender} />}
                   </Td>
-                  <Td className="border-t border-border/50 text-muted-foreground tabular-nums">
-                    {isPending ? "—" : (student.contactNumber || "—")}
-                  </Td>
                   <Td
                     className={cn(
-                      "border-t border-border/50 text-right",
-                      isLast && "rounded-br-xl",
+                      "border-t border-border/50 text-muted-foreground tabular-nums",
+                      // When Actions column is hidden, Contact owns the
+                      // bottom-right rounded corner of the last row.
+                      !canModify && isLast && "rounded-br-xl",
                     )}
                   >
-                    {isPending || isAssigning ? (
-                      <span className="text-xs text-muted-foreground">--</span>
-                    ) : (
-                      <div className="inline-flex items-center gap-1">
-                        <IconButton
-                          label={`Edit ${student.firstName}`}
-                          onClick={() => onEdit(student)}
-                        >
-                          <Edit2 className="h-4 w-4" />
-                        </IconButton>
-                        <IconButton
-                          label={`Delete ${student.firstName}`}
-                          onClick={() => onDelete(student)}
-                          variant="danger"
-                        >
-                          <Trash2 className="h-4 w-4" />
-                        </IconButton>
-                      </div>
-                    )}
+                    {isPending ? "—" : (student.contactNumber || "—")}
                   </Td>
+                  {canModify && (
+                    <Td
+                      className={cn(
+                        "border-t border-border/50 text-right",
+                        isLast && "rounded-br-xl",
+                      )}
+                    >
+                      {isPending || isAssigning ? (
+                        <span className="text-xs text-muted-foreground">--</span>
+                      ) : (
+                        <div className="inline-flex items-center gap-1">
+                          <IconButton
+                            label={`Edit ${student.firstName}`}
+                            onClick={() => onEdit(student)}
+                          >
+                            <Edit2 className="h-4 w-4" />
+                          </IconButton>
+                          <IconButton
+                            label={`Delete ${student.firstName}`}
+                            onClick={() => onDelete(student)}
+                            variant="danger"
+                          >
+                            <Trash2 className="h-4 w-4" />
+                          </IconButton>
+                        </div>
+                      )}
+                    </Td>
+                  )}
                 </tr>
               );
             })}

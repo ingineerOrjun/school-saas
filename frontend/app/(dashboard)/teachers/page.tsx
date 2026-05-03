@@ -12,6 +12,8 @@ import {
 import { toast } from "sonner";
 import { ApiError } from "@/lib/api";
 import { teachersApi, type TeacherDto } from "@/lib/teachers";
+import { classesApi, type ClassWithSections } from "@/lib/classes";
+import { subjectsApi, type SubjectDto } from "@/lib/subjects";
 import { Button } from "@/components/ui/Button";
 import { Skeleton } from "@/components/ui/Skeleton";
 import { EmptyState } from "@/components/ui/EmptyState";
@@ -19,7 +21,7 @@ import { TeacherTable } from "@/components/teachers/TeacherTable";
 import { AddTeacherDialog } from "@/components/teachers/AddTeacherDialog";
 import { EditTeacherDialog } from "@/components/teachers/EditTeacherDialog";
 import { DeleteTeacherDialog } from "@/components/teachers/DeleteTeacherDialog";
-import { QuickAddTeacher } from "@/components/teachers/QuickAddTeacher";
+import { AssignmentsDialog } from "@/components/teachers/AssignmentsDialog";
 import { cn } from "@/lib/utils";
 
 const HIGHLIGHT_MS = 1800;
@@ -35,11 +37,18 @@ interface PendingDeletion {
 export default function TeachersPage() {
   const router = useRouter();
   const [list, setList] = React.useState<TeacherDto[] | null>(null);
+  const [classes, setClasses] = React.useState<ClassWithSections[]>([]);
+  const [subjects, setSubjects] = React.useState<SubjectDto[]>([]);
   const [loading, setLoading] = React.useState(true);
   const [error, setError] = React.useState<string | null>(null);
   const [query, setQuery] = React.useState("");
   const [addOpen, setAddOpen] = React.useState(false);
   const [editTarget, setEditTarget] = React.useState<TeacherDto | null>(null);
+  // Separate "manage assignments" dialog target — opening this is the
+  // multi-row entry point; the Edit dialog still handles the legacy
+  // single-class field (used by the login routing flow).
+  const [assignmentsTarget, setAssignmentsTarget] =
+    React.useState<TeacherDto | null>(null);
   const [deleteTarget, setDeleteTarget] = React.useState<TeacherDto | null>(
     null,
   );
@@ -57,8 +66,17 @@ export default function TeachersPage() {
     setLoading(true);
     setError(null);
     try {
-      const data = await teachersApi.list();
+      // Pull teachers + the classes catalog + the subject catalog in
+      // parallel — all three feed the page (subjects is needed by the
+      // assignments dialog's "Subject" dropdown).
+      const [data, cls, subs] = await Promise.all([
+        teachersApi.list(),
+        classesApi.list(),
+        subjectsApi.list(),
+      ]);
       setList(data);
+      setClasses(cls);
+      setSubjects(subs);
     } catch (err) {
       if (err instanceof ApiError && err.status === 401) {
         router.replace("/login");
@@ -232,45 +250,10 @@ export default function TeachersPage() {
     markAsNew(t.id);
   };
 
-  // Optimistic quick-add: insert a placeholder row immediately, then swap.
-  const handleQuickAdd = async (name: string) => {
-    const tempId = `temp_${makeTempSuffix()}`;
-    const now = new Date().toISOString();
-    const optimistic: TeacherDto = {
-      id: tempId,
-      name,
-      schoolId: "",
-      userId: null,
-      createdAt: now,
-      updatedAt: now,
-    };
-
-    setList((prev) => (prev ? [optimistic, ...prev] : [optimistic]));
-
-    try {
-      const real = await teachersApi.create({ name });
-      setList((prev) =>
-        prev ? prev.map((t) => (t.id === tempId ? real : t)) : [real],
-      );
-      markAsNew(real.id);
-      toast.success(`${real.name} added`, {
-        description: "Open the row to link a login or edit details.",
-      });
-    } catch (err) {
-      setList((prev) => (prev ? prev.filter((t) => t.id !== tempId) : prev));
-      if (err instanceof ApiError && err.status === 401) {
-        router.replace("/login");
-        return;
-      }
-      const msg =
-        err instanceof ApiError
-          ? err.message
-          : err instanceof Error
-            ? err.message
-            : "Failed to add teacher.";
-      toast.error(msg);
-    }
-  };
+  // QuickAdd has been removed — every teacher must be created via the
+  // full Add Teacher dialog so they get a linked User account
+  // (createWithUser). Without that link the teacher's dashboard can't
+  // resolve their assignments and they're effectively unreachable.
 
   return (
     <div className="space-y-6">
@@ -282,9 +265,8 @@ export default function TeachersPage() {
       />
 
       {hasItems && (
-        <div className="grid grid-cols-1 gap-3 md:grid-cols-[1fr_320px]">
-          <QuickAddTeacher onSubmit={handleQuickAdd} />
-          <div className="relative animate-fade-in">
+        <div className="animate-fade-in">
+          <div className="relative">
             <Search className="pointer-events-none absolute left-3 top-1/2 -translate-y-1/2 h-4 w-4 text-muted-foreground" />
             <input
               type="search"
@@ -340,6 +322,7 @@ export default function TeachersPage() {
             teachers={filtered}
             onEdit={setEditTarget}
             onDelete={setDeleteTarget}
+            onManageAssignments={setAssignmentsTarget}
             highlightIds={highlightIds}
             removingIds={removingIds}
           />
@@ -362,11 +345,13 @@ export default function TeachersPage() {
 
       <AddTeacherDialog
         open={addOpen}
+        classes={classes}
         onClose={() => setAddOpen(false)}
         onCreated={handleCreated}
       />
       <EditTeacherDialog
         teacher={editTarget}
+        classes={classes}
         onClose={() => setEditTarget(null)}
         onUpdated={handleUpdated}
       />
@@ -374,6 +359,12 @@ export default function TeachersPage() {
         teacher={deleteTarget}
         onClose={() => setDeleteTarget(null)}
         onConfirm={scheduleDelete}
+      />
+      <AssignmentsDialog
+        teacher={assignmentsTarget}
+        classes={classes}
+        subjects={subjects}
+        onClose={() => setAssignmentsTarget(null)}
       />
     </div>
   );
@@ -412,7 +403,7 @@ function Header({
           )}
         </p>
       </div>
-      <div className="flex items-center gap-2">
+      <div className="flex flex-wrap items-center gap-2">
         <Button
           variant="ghost"
           size="sm"
@@ -431,13 +422,6 @@ function Header({
       </div>
     </div>
   );
-}
-
-function makeTempSuffix(): string {
-  if (typeof crypto !== "undefined" && "randomUUID" in crypto) {
-    return crypto.randomUUID();
-  }
-  return `${Date.now()}-${Math.random().toString(36).slice(2)}`;
 }
 
 function TableLoading() {

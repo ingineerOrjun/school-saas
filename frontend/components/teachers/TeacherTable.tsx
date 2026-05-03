@@ -1,7 +1,7 @@
 "use client";
 
 import * as React from "react";
-import { Edit2, Loader2, Trash2 } from "lucide-react";
+import { AlertTriangle, BookOpen, Edit2, Loader2, Trash2 } from "lucide-react";
 import { cn } from "@/lib/utils";
 import type { TeacherDto } from "@/lib/teachers";
 
@@ -9,6 +9,12 @@ export interface TeacherTableProps {
   teachers: TeacherDto[];
   onEdit: (teacher: TeacherDto) => void;
   onDelete: (teacher: TeacherDto) => void;
+  /**
+   * Open the multi-row assignment manager for this teacher. Optional
+   * so existing call sites that don't yet wire it through still
+   * compile — the column just won't render the button.
+   */
+  onManageAssignments?: (teacher: TeacherDto) => void;
   /** IDs that should flash a highlight background (new/just-added). */
   highlightIds?: Set<string>;
   /** IDs currently playing the exit animation before unmount. */
@@ -19,6 +25,7 @@ export function TeacherTable({
   teachers,
   onEdit,
   onDelete,
+  onManageAssignments,
   highlightIds,
   removingIds,
 }: TeacherTableProps) {
@@ -29,6 +36,7 @@ export function TeacherTable({
           <thead>
             <tr className="bg-muted/30">
               <Th className="rounded-tl-xl">Teacher</Th>
+              <Th>Assignment</Th>
               <Th>Login</Th>
               <Th>Added</Th>
               <Th className="text-right rounded-tr-xl">Actions</Th>
@@ -83,13 +91,26 @@ export function TeacherTable({
                     </div>
                   </Td>
                   <Td className="border-t border-border/50">
+                    <AssignmentPill teacher={t} />
+                  </Td>
+                  <Td className="border-t border-border/50">
                     {t.userId ? (
                       <span className="inline-flex items-center gap-1 rounded-full bg-success/10 px-2 py-0.5 text-xs font-medium text-success">
                         <span className="h-1.5 w-1.5 rounded-full bg-success" />
                         Active
                       </span>
                     ) : (
-                      <span className="inline-flex items-center rounded-full bg-muted/70 px-2 py-0.5 text-xs font-medium text-muted-foreground">
+                      // Amber instead of muted: a no-account row CAN'T
+                      // see assignments — that's a defect from the
+                      // teacher's POV, not a benign "not yet" state.
+                      // The tooltip + warning icon make the implication
+                      // explicit so admins don't add assignments to
+                      // orphan rows by accident.
+                      <span
+                        className="inline-flex items-center gap-1 rounded-full bg-amber-50 px-2 py-0.5 text-xs font-medium text-amber-800 ring-1 ring-inset ring-amber-200"
+                        title="Without a login account, this teacher can't see assignments on their dashboard. Use 'Add teacher' to recreate with an email + password."
+                      >
+                        <AlertTriangle className="h-3 w-3" />
                         No account
                       </span>
                     )}
@@ -107,6 +128,14 @@ export function TeacherTable({
                       <span className="text-xs text-muted-foreground">—</span>
                     ) : (
                       <div className="inline-flex items-center gap-1">
+                        {onManageAssignments && (
+                          <IconButton
+                            label={`Manage assignments for ${t.name}`}
+                            onClick={() => onManageAssignments(t)}
+                          >
+                            <BookOpen className="h-4 w-4" />
+                          </IconButton>
+                        )}
                         <IconButton
                           label={`Edit ${t.name}`}
                           onClick={() => onEdit(t)}
@@ -212,6 +241,38 @@ function paletteFor(id: string): string {
   let sum = 0;
   for (let i = 0; i < id.length; i++) sum += id.charCodeAt(i);
   return AVATAR_PALETTES[sum % AVATAR_PALETTES.length];
+}
+
+/**
+ * Compact assignment chip:
+ *   • Section set    → "Class 5 · A"   (indigo — the most specific)
+ *   • Class only     → "Class 5"        (sky — class-wide)
+ *   • Unassigned     → "Unassigned"     (muted — read-only teacher)
+ *
+ * The chip color tracks specificity so admins can scan a list of
+ * teachers and see who's narrowly scoped vs. who runs a whole class
+ * vs. who's not yet set up.
+ */
+function AssignmentPill({ teacher }: { teacher: TeacherDto }) {
+  if (teacher.section) {
+    return (
+      <span className="inline-flex items-center gap-1 rounded-full bg-indigo-50 px-2 py-0.5 text-xs font-medium text-indigo-700">
+        {teacher.section.class.name} · {teacher.section.name}
+      </span>
+    );
+  }
+  if (teacher.class) {
+    return (
+      <span className="inline-flex items-center gap-1 rounded-full bg-sky-50 px-2 py-0.5 text-xs font-medium text-sky-700">
+        {teacher.class.name}
+      </span>
+    );
+  }
+  return (
+    <span className="inline-flex items-center rounded-full bg-muted/70 px-2 py-0.5 text-xs font-medium text-muted-foreground">
+      Unassigned
+    </span>
+  );
 }
 
 function Avatar({ name, id }: { name: string; id: string }) {

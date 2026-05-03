@@ -13,6 +13,15 @@ export interface InputProps
   containerClassName?: string;
 }
 
+/**
+ * Form-input primitive.
+ *
+ * Locked to the spec:
+ *   • Label is ALWAYS rendered above the input (when present).
+ *   • Input height: h-10 (default). Fixed so labels align across rows.
+ *   • Focus ring: indigo-500 — visible on every theme.
+ *   • Error text: red-600, text-xs, immediately below the field.
+ */
 export const Input = React.forwardRef<HTMLInputElement, InputProps>(
   (
     {
@@ -53,15 +62,19 @@ export const Input = React.forwardRef<HTMLInputElement, InputProps>(
             type={type}
             aria-invalid={!!error}
             className={cn(
+              // Tokens: bg-surface + border-border give us white/slate-300
+              // in light, slate-900/slate-700 in dark — both with proper
+              // contrast against the form's background.
               "w-full h-10 rounded-md border bg-surface text-sm text-foreground",
-              "placeholder:text-muted-foreground/80",
-              "transition-all duration-150",
-              "focus:outline-none focus:ring-2 focus:ring-primary/30 focus:border-primary",
+              "placeholder:text-muted-foreground/60",
+              "transition-shadow duration-150",
+              // Primary focus ring — same color as the CTA button.
+              "focus:outline-none focus:border-primary focus:ring-2 focus:ring-primary/30",
               "disabled:opacity-50 disabled:cursor-not-allowed disabled:bg-muted",
               leftIcon ? "pl-9" : "pl-3",
               rightIcon ? "pr-9" : "pr-3",
               error
-                ? "border-destructive/70 focus:border-destructive focus:ring-destructive/20"
+                ? "border-destructive focus:border-destructive focus:ring-destructive/25"
                 : "border-border",
               className,
             )}
@@ -77,6 +90,7 @@ export const Input = React.forwardRef<HTMLInputElement, InputProps>(
           <p
             className={cn(
               "text-xs",
+              // Errors win over hints when both are passed.
               error ? "text-destructive" : "text-muted-foreground",
             )}
           >

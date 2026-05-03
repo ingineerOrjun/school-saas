@@ -1,6 +1,22 @@
 import * as React from "react";
 import { cn } from "@/lib/utils";
 
+/**
+ * Table primitive locked to the spec:
+ *   • Wrapper: rounded, slate-300 border, white surface.
+ *   • <THead>: slate-100 background, font-medium labels.
+ *   • <Tr>: hover slate-50, divider between rows.
+ *   • <Th>: tighter h-10, uppercase + tracking for scannability.
+ *   • <Td>: tighter py-2.5, slate-900 text.
+ *
+ * USAGE CONVENTIONS (not enforced by the primitive):
+ *   • "Actions" column should always be visible — never hide
+ *     edit/delete icons behind hover. The spec is "fast-scanning":
+ *     the user shouldn't have to mouseover a row to see what they can
+ *     do with it.
+ *   • Numeric columns right-align (`<Td className="text-right tabular-nums">`).
+ *   • Text columns stay left-aligned (the default).
+ */
 export const Table = React.forwardRef<
   HTMLTableElement,
   React.HTMLAttributes<HTMLTableElement>
@@ -21,7 +37,7 @@ export const THead = React.forwardRef<
 >(({ className, ...props }, ref) => (
   <thead
     ref={ref}
-    className={cn("bg-muted/50 border-b border-border", className)}
+    className={cn("bg-muted border-b border-border", className)}
     {...props}
   />
 ));
@@ -33,7 +49,7 @@ export const TBody = React.forwardRef<
 >(({ className, ...props }, ref) => (
   <tbody
     ref={ref}
-    className={cn("divide-y divide-border/70", className)}
+    className={cn("divide-y divide-border", className)}
     {...props}
   />
 ));
@@ -46,7 +62,7 @@ export const Tr = React.forwardRef<
   <tr
     ref={ref}
     className={cn(
-      "transition-colors hover:bg-muted/40 data-[state=selected]:bg-muted",
+      "transition-colors hover:bg-muted/60 data-[state=selected]:bg-muted",
       className,
     )}
     {...props}
@@ -61,7 +77,10 @@ export const Th = React.forwardRef<
   <th
     ref={ref}
     className={cn(
-      "h-11 px-4 text-left align-middle text-xs font-semibold uppercase tracking-wider text-muted-foreground",
+      // Tighter h-10 (was h-11) — part of the ~10–15% whitespace
+      // reduction. font-medium per spec; uppercase + tracking keep the
+      // header crisp without shouting.
+      "h-10 px-4 text-left align-middle text-xs font-medium uppercase tracking-wider text-muted-foreground",
       className,
     )}
     {...props}
@@ -75,7 +94,8 @@ export const Td = React.forwardRef<
 >(({ className, ...props }, ref) => (
   <td
     ref={ref}
-    className={cn("px-4 py-3 align-middle text-foreground", className)}
+    // Tighter py-2.5 (was py-3) so dense rosters stay scannable.
+    className={cn("px-4 py-2.5 align-middle text-foreground", className)}
     {...props}
   />
 ));

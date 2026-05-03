@@ -15,6 +15,7 @@ import { cn } from "@/lib/utils";
 import { ApiError } from "@/lib/api";
 import { getToken } from "@/lib/auth";
 import { feesApi, type Receipt, type PaymentMethod } from "@/lib/fees";
+import { DocumentLogo } from "@/components/documents/DocumentLogo";
 
 export default function ReceiptPage() {
   const params = useParams<{ paymentId: string }>();
@@ -145,12 +146,24 @@ export default function ReceiptPage() {
 function Header({ data }: { data: Receipt }) {
   return (
     <header className="relative border-b-2 border-slate-900 px-10 py-7">
-      <p className="text-[11px] font-semibold uppercase tracking-[0.3em] text-slate-500 text-center">
-        Payment Receipt
-      </p>
-      <h1 className="mt-1 text-2xl font-bold tracking-tight text-slate-900 uppercase text-center">
-        {data.school.name}
-      </h1>
+      {/* Stabilized 3-col grid identical to the marksheet/ledger
+          header: fixed 64px logo, centered title capped at 60% width
+          with line-clamp, fixed 64px spacer on the right to keep the
+          title optically centered. */}
+      <div className="grid grid-cols-[64px_1fr_64px] items-center gap-6">
+        <DocumentLogo logoUrl={data.school.logoUrl} />
+        <div className="min-w-0 mx-auto max-w-[60%] text-center">
+          <p className="text-[11px] font-semibold uppercase tracking-[0.3em] text-slate-500">
+            Payment Receipt
+          </p>
+          <h1 className="mt-1 text-2xl font-bold tracking-tight text-slate-900 uppercase line-clamp-2 text-balance break-words">
+            {data.school.name}
+          </h1>
+        </div>
+        {/* Spacer matches the logo's footprint so the title block stays
+            optically centered on the page. */}
+        <div className="h-16 w-16 shrink-0" aria-hidden />
+      </div>
 
       <div className="mt-5 flex flex-wrap items-end justify-between gap-4">
         <div>

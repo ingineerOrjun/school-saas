@@ -25,10 +25,35 @@ export interface SchoolSummary {
   updatedAt: string;
 }
 
+/**
+ * Optional context attached when the user is a TEACHER. Drives the
+ * post-login landing decision. Source of truth is `TeachingAssignment`
+ * on the backend — the legacy single `Teacher.classId/sectionId` is
+ * no longer consulted.
+ */
+export interface TeacherContext {
+  /**
+   * True iff the teacher has at least one TeachingAssignment row.
+   * Use this (NOT classId) to decide between /attendance and the
+   * "ask admin" landing.
+   */
+  hasAssignments: boolean;
+  /**
+   * "Primary" class ID — first assignment by createdAt. Useful for
+   * deep-linking the landing page to a specific roster. Null when the
+   * teacher has no assignments.
+   */
+  classId: string | null;
+  /** First assignment's sectionId, or null for class-bound. */
+  sectionId: string | null;
+}
+
 export interface AuthResult {
   accessToken: string;
   user: SafeUser;
   school: SchoolSummary;
+  /** Populated only for TEACHER users. */
+  teacher: TeacherContext | null;
 }
 
 export async function login(

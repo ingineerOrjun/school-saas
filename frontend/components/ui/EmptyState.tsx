@@ -39,7 +39,7 @@ export function EmptyState({
       <div className="relative mb-7 h-24 w-24">
         <div className="absolute inset-0 rounded-3xl bg-gradient-to-br from-primary-200/70 to-primary-100/40 rotate-[8deg] shadow-sm" />
         <div className="absolute inset-0 rounded-3xl bg-gradient-to-br from-purple-200/70 to-indigo-100/30 -rotate-[6deg] shadow-sm" />
-        <div className="absolute inset-0 flex items-center justify-center rounded-3xl bg-white/85 backdrop-blur-sm border border-white/60 shadow-md text-primary">
+        <div className="absolute inset-0 flex items-center justify-center rounded-3xl bg-surface/85 backdrop-blur-sm border border-border shadow-md text-primary">
           {icon}
         </div>
       </div>

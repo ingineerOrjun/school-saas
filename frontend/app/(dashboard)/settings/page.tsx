@@ -3,19 +3,25 @@
 import * as React from "react";
 import { useRouter } from "next/navigation";
 import {
+  BookOpen,
   Building2,
   GraduationCap,
   Image as ImageIcon,
   Loader2,
+  Plus,
   Save,
   ShieldAlert,
   ShieldCheck,
+  Trash2,
+  Upload,
   Users as UsersIcon,
+  X,
 } from "lucide-react";
 import { toast } from "sonner";
 import { ApiError } from "@/lib/api";
 import { getStoredUser, type Role } from "@/lib/auth";
-import { schoolApi, type SchoolDto } from "@/lib/school";
+import { schoolApi, resolveLogoUrl, type SchoolDto } from "@/lib/school";
+import { subjectsApi, type SubjectDto } from "@/lib/subjects";
 import { usersApi, type UserDto } from "@/lib/users";
 import { Button } from "@/components/ui/Button";
 import { Input } from "@/components/ui/Input";
@@ -62,6 +68,10 @@ export default function SettingsPage() {
     <div className="space-y-6">
       <Header />
       <SchoolProfileSection />
+      {/* Subjects catalog must exist before AssignmentsDialog can offer
+          subject-scoped TeachingAssignments. Putting it before Users
+          surfaces it during the natural admin onboarding flow. */}
+      <SubjectsSection />
       <UsersSection currentUserId={getStoredUser()?.id ?? null} />
     </div>
   );
@@ -151,7 +161,7 @@ function SchoolProfileSection() {
       const updated = await schoolApi.update({ name: trimmed });
       setSchool(updated);
       setName(updated.name);
-      toast.success("School profile updated.");
+      toast.success("Saved successfully");
       // Sidebar greeting reads from the cached user — bump the cached
       // school name in localStorage so other pages pick it up too.
       try {
@@ -203,21 +213,7 @@ function SchoolProfileSection() {
           onSubmit={handleSave}
           className="mt-5 grid grid-cols-1 gap-5 md:grid-cols-[auto_1fr]"
         >
-          {/* Logo placeholder — schools can replace this slot later */}
-          <div className="flex flex-col gap-2">
-            <label className="text-xs font-semibold uppercase tracking-wider text-muted-foreground">
-              Logo
-            </label>
-            <div
-              aria-label="School logo placeholder"
-              className="flex h-24 w-24 items-center justify-center rounded-lg border-2 border-dashed border-border bg-muted/40 text-muted-foreground"
-            >
-              <ImageIcon className="h-7 w-7" strokeWidth={1.5} />
-            </div>
-            <p className="text-[11px] text-muted-foreground italic max-w-[10rem]">
-              Logo upload coming soon.
-            </p>
-          </div>
+          <LogoEditor school={school} onChange={setSchool} />
 
           <div className="flex flex-col gap-3">
             <Input
@@ -234,10 +230,14 @@ function SchoolProfileSection() {
               }
             />
             <div className="flex items-center gap-2">
+              {/* Disabled only while a save is in flight — never stuck
+                  on a dirty/clean check. handleSave is itself a no-op
+                  when there's nothing to save (early return on !dirty),
+                  so an extra click is harmless. */}
               <Button
                 type="submit"
                 loading={saving}
-                disabled={!dirty || saving}
+                disabled={saving}
                 leftIcon={<Save className="h-4 w-4" />}
               >
                 Save changes
@@ -262,6 +262,344 @@ function SchoolProfileSection() {
 // ---------------------------------------------------------------------------
 // Users
 // ---------------------------------------------------------------------------
+
+/**
+ * Logo upload + preview block. Lives next to the school-name field.
+ *   • If a logo exists, render the image (with a Replace + Remove combo).
+ *   • Otherwise render the dashed placeholder + a single Upload button.
+ *
+ * Owns its own loading state so the Save-changes button on the parent
+ * form is independent — the user can change the name and the logo
+ * separately without one blocking the other.
+ */
+function LogoEditor({
+  school,
+  onChange,
+}: {
+  school: SchoolDto | null;
+  onChange: (next: SchoolDto) => void;
+}) {
+  const fileRef = React.useRef<HTMLInputElement | null>(null);
+  const [busy, setBusy] = React.useState<"upload" | "remove" | null>(null);
+  const previewUrl = resolveLogoUrl(school?.logoUrl);
+
+  const pick = () => fileRef.current?.click();
+
+  const handleFile = async (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0];
+    e.target.value = "";
+    if (!file) return;
+    if (!/^image\/(png|jpeg|jpg|webp)$/i.test(file.type)) {
+      toast.error("Logo must be a PNG, JPG, or WebP image.");
+      return;
+    }
+    if (file.size > 2 * 1024 * 1024) {
+      toast.error("Logo must be under 2 MB.");
+      return;
+    }
+    setBusy("upload");
+    try {
+      const updated = await schoolApi.uploadLogo(file);
+      onChange(updated);
+      toast.success("Logo updated");
+    } catch (err) {
+      toast.error(
+        err instanceof ApiError ? err.message : "Logo upload failed.",
+      );
+    } finally {
+      setBusy(null);
+    }
+  };
+
+  const handleRemove = async () => {
+    if (!school?.logoUrl) return;
+    if (!window.confirm("Remove the school logo?")) return;
+    setBusy("remove");
+    try {
+      const updated = await schoolApi.clearLogo();
+      onChange(updated);
+      toast.success("Logo removed");
+    } catch (err) {
+      toast.error(
+        err instanceof ApiError ? err.message : "Failed to remove logo.",
+      );
+    } finally {
+      setBusy(null);
+    }
+  };
+
+  return (
+    <div className="flex flex-col gap-2">
+      <label className="text-xs font-semibold uppercase tracking-wider text-muted-foreground">
+        Logo
+      </label>
+      <div
+        aria-label={previewUrl ? "School logo" : "School logo placeholder"}
+        className={cn(
+          "flex h-24 w-24 items-center justify-center rounded-lg overflow-hidden",
+          previewUrl
+            ? "border border-border bg-white"
+            : "border-2 border-dashed border-border bg-muted/40 text-muted-foreground",
+        )}
+      >
+        {previewUrl ? (
+          // eslint-disable-next-line @next/next/no-img-element
+          <img
+            src={previewUrl}
+            alt="School logo"
+            className="h-full w-full object-contain"
+          />
+        ) : (
+          <ImageIcon className="h-7 w-7" strokeWidth={1.5} />
+        )}
+      </div>
+      <input
+        ref={fileRef}
+        type="file"
+        accept="image/png,image/jpeg,image/webp"
+        onChange={handleFile}
+        className="hidden"
+      />
+      <div className="flex flex-wrap items-center gap-1.5 max-w-[10rem]">
+        <Button
+          type="button"
+          size="sm"
+          variant="outline"
+          onClick={pick}
+          loading={busy === "upload"}
+          disabled={busy !== null}
+          leftIcon={<Upload className="h-3.5 w-3.5" />}
+        >
+          {previewUrl ? "Replace" : "Upload"}
+        </Button>
+        {previewUrl && (
+          <Button
+            type="button"
+            size="sm"
+            variant="ghost"
+            onClick={handleRemove}
+            loading={busy === "remove"}
+            disabled={busy !== null}
+            leftIcon={<Trash2 className="h-3.5 w-3.5" />}
+          >
+            Remove
+          </Button>
+        )}
+      </div>
+      <p className="text-[11px] text-muted-foreground italic max-w-[10rem]">
+        PNG, JPG, or WebP — under 2 MB.
+      </p>
+    </div>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// Subjects catalog
+// ---------------------------------------------------------------------------
+
+/**
+ * School-owned subject catalog (Math, Science, English, …). Subjects
+ * here populate the Subject dropdown in the AssignmentsDialog on the
+ * Teachers page — without entries here, admins can only create
+ * "attendance only" teaching assignments.
+ *
+ * Backend route is admin-only (`@Roles(Role.ADMIN)` on POST/PATCH/DELETE);
+ * the parent SettingsPage already gates the whole page on role.
+ */
+function SubjectsSection() {
+  const [list, setList] = React.useState<SubjectDto[]>([]);
+  const [loading, setLoading] = React.useState(true);
+  const [draft, setDraft] = React.useState("");
+  const [adding, setAdding] = React.useState(false);
+  // Set instead of single id so multiple deletes can run in parallel
+  // without their spinners stomping each other.
+  const [removingIds, setRemovingIds] = React.useState<Set<string>>(
+    () => new Set(),
+  );
+
+  React.useEffect(() => {
+    let cancelled = false;
+    (async () => {
+      try {
+        const data = await subjectsApi.list();
+        if (!cancelled) setList(data);
+      } catch (err) {
+        toast.error(
+          err instanceof ApiError ? err.message : "Failed to load subjects.",
+        );
+      } finally {
+        if (!cancelled) setLoading(false);
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  const trimmedDraft = draft.trim();
+  // Inline duplicate detection — fire BEFORE the server returns 409 so
+  // the admin gets feedback the moment they finish typing. Comparison
+  // is case-insensitive (matches the backend's unique constraint).
+  const duplicate = React.useMemo(
+    () =>
+      trimmedDraft.length > 0 &&
+      list.some(
+        (s) => s.name.toLowerCase() === trimmedDraft.toLowerCase(),
+      ),
+    [list, trimmedDraft],
+  );
+  const canAdd = trimmedDraft.length > 0 && !duplicate && !adding;
+
+  const handleAdd = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!canAdd) return;
+    setAdding(true);
+    try {
+      const created = await subjectsApi.create({ name: trimmedDraft });
+      // Insert at the right alphabetical slot so the list stays sorted
+      // without a re-fetch round-trip.
+      setList((prev) =>
+        [...prev, created].sort((a, b) => a.name.localeCompare(b.name)),
+      );
+      setDraft("");
+      toast.success(`Added "${created.name}"`);
+    } catch (err) {
+      toast.error(
+        err instanceof ApiError ? err.message : "Failed to add subject.",
+      );
+    } finally {
+      setAdding(false);
+    }
+  };
+
+  const handleRemove = async (subject: SubjectDto) => {
+    setRemovingIds((prev) => new Set(prev).add(subject.id));
+    try {
+      await subjectsApi.remove(subject.id);
+      setList((prev) => prev.filter((s) => s.id !== subject.id));
+      toast.success(`Removed "${subject.name}"`, {
+        description:
+          "Existing teaching assignments using this subject keep working but are now subject-less.",
+      });
+    } catch (err) {
+      toast.error(
+        err instanceof ApiError ? err.message : "Failed to remove subject.",
+      );
+    } finally {
+      setRemovingIds((prev) => {
+        const next = new Set(prev);
+        next.delete(subject.id);
+        return next;
+      });
+    }
+  };
+
+  return (
+    <section className="glass rounded-xl p-6 animate-fade-in-up">
+      <div className="flex items-center gap-3">
+        <span className="flex h-9 w-9 items-center justify-center rounded-md bg-primary/10 text-primary">
+          <BookOpen className="h-5 w-5" />
+        </span>
+        <div className="flex-1">
+          <div className="flex items-center gap-2">
+            <h2 className="text-md font-semibold tracking-tight text-foreground">
+              Subjects
+            </h2>
+            {!loading && (
+              <span className="rounded-full bg-muted/60 px-2 py-0.5 text-[11px] font-medium text-muted-foreground tabular-nums">
+                {list.length}
+              </span>
+            )}
+          </div>
+          <p className="text-sm text-muted-foreground">
+            The catalog teachers can be assigned to teach. Add the subjects
+            taught in your school here, then use them when assigning
+            teachers from the Teachers page.
+          </p>
+        </div>
+      </div>
+
+      {/* Existing subjects — pill list with per-pill remove */}
+      <div className="mt-5">
+        {loading ? (
+          <div className="flex flex-wrap gap-2">
+            {Array.from({ length: 5 }).map((_, i) => (
+              <Skeleton key={i} className="h-7 w-24 rounded-full" />
+            ))}
+          </div>
+        ) : list.length === 0 ? (
+          <p className="text-sm text-muted-foreground italic">
+            No subjects yet — add the first one below.
+          </p>
+        ) : (
+          <ul className="flex flex-wrap gap-2">
+            {list.map((s) => {
+              const removing = removingIds.has(s.id);
+              return (
+                <li key={s.id}>
+                  <span
+                    className={cn(
+                      "group inline-flex items-center gap-1.5 rounded-full bg-emerald-50 px-2.5 py-1 text-xs font-medium text-emerald-700 ring-1 ring-inset ring-emerald-200/60",
+                      removing && "opacity-60",
+                    )}
+                  >
+                    {s.name}
+                    <button
+                      type="button"
+                      onClick={() => handleRemove(s)}
+                      disabled={removing}
+                      aria-label={`Remove ${s.name}`}
+                      className={cn(
+                        "ml-0.5 inline-flex h-4 w-4 items-center justify-center rounded-full",
+                        "text-emerald-700/60 hover:bg-emerald-100 hover:text-destructive",
+                        "transition-colors focus-ring",
+                        removing && "cursor-not-allowed",
+                      )}
+                    >
+                      {removing ? (
+                        <Loader2 className="h-3 w-3 animate-spin" />
+                      ) : (
+                        <X className="h-3 w-3" />
+                      )}
+                    </button>
+                  </span>
+                </li>
+              );
+            })}
+          </ul>
+        )}
+      </div>
+
+      {/* Add form — small input + button. Enter submits. */}
+      <form
+        onSubmit={handleAdd}
+        className="mt-5 rounded-lg border border-dashed border-border bg-muted/20 p-4"
+      >
+        <div className="flex items-end gap-2">
+          <div className="flex-1">
+            <Input
+              label="Add subject"
+              placeholder="e.g. Mathematics"
+              value={draft}
+              onChange={(e) => setDraft(e.target.value)}
+              disabled={adding}
+              maxLength={80}
+              error={duplicate ? "Subject already exists" : undefined}
+            />
+          </div>
+          <Button
+            type="submit"
+            disabled={!canAdd}
+            loading={adding}
+            leftIcon={!adding ? <Plus className="h-3.5 w-3.5" /> : undefined}
+          >
+            Add
+          </Button>
+        </div>
+      </form>
+    </section>
+  );
+}
 
 function UsersSection({ currentUserId }: { currentUserId: string | null }) {
   const [list, setList] = React.useState<UserDto[]>([]);

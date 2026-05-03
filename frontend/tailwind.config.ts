@@ -1,6 +1,10 @@
 import type { Config } from "tailwindcss";
 
 const config: Config = {
+  // Class-strategy dark mode: <html class="dark"> flips every
+  // dark-prefixed utility AND the CSS variable overrides in
+  // globals.css's `.dark` block. The ThemeProvider toggles the class.
+  darkMode: "class",
   content: [
     "./app/**/*.{ts,tsx}",
     "./components/**/*.{ts,tsx}",
@@ -8,7 +12,9 @@ const config: Config = {
   theme: {
     container: {
       center: true,
-      padding: "1.5rem",
+      // Slightly tighter container — part of the global ~10–15%
+      // vertical/horizontal whitespace reduction.
+      padding: "1.25rem",
     },
     extend: {
       colors: {
@@ -21,17 +27,20 @@ const config: Config = {
           DEFAULT: "hsl(var(--muted))",
           foreground: "hsl(var(--muted-foreground))",
         },
+        // True Tailwind `indigo` palette — primary-600 is now exactly
+        // indigo-600 (#4F46E5) and hover state primary-700 is indigo-700
+        // (#4338CA). Keeps utility shorthands and design tokens aligned.
         primary: {
-          50: "#EEF0FF",
-          100: "#E0E3FF",
-          200: "#C7CBFF",
-          300: "#A5AAFF",
-          400: "#8288FA",
+          50: "#EEF2FF",
+          100: "#E0E7FF",
+          200: "#C7D2FE",
+          300: "#A5B4FC",
+          400: "#818CF8",
           500: "#6366F1",
-          600: "#5B5FC7",
-          700: "#4E52B0",
-          800: "#3F4390",
-          900: "#2E3273",
+          600: "#4F46E5",
+          700: "#4338CA",
+          800: "#3730A3",
+          900: "#312E81",
           DEFAULT: "hsl(var(--primary))",
           foreground: "hsl(var(--primary-foreground))",
         },
@@ -64,13 +73,15 @@ const config: Config = {
         md: "0.5rem",
         sm: "0.375rem",
       },
+      // Quieter shadow scale. Cards rely on the slate-300 border for
+      // definition; shadows now only suggest a subtle lift on hover.
       boxShadow: {
-        xs: "0 1px 2px 0 rgb(16 24 40 / 0.04)",
-        sm: "0 1px 2px 0 rgb(16 24 40 / 0.05), 0 1px 3px 0 rgb(16 24 40 / 0.04)",
-        md: "0 2px 4px -1px rgb(16 24 40 / 0.06), 0 4px 8px -2px rgb(16 24 40 / 0.08)",
-        lg: "0 4px 8px -2px rgb(16 24 40 / 0.06), 0 12px 24px -4px rgb(16 24 40 / 0.10)",
-        xl: "0 8px 16px -4px rgb(16 24 40 / 0.06), 0 20px 32px -8px rgb(16 24 40 / 0.12)",
-        ring: "0 0 0 4px rgb(99 102 241 / 0.12)",
+        xs: "0 1px 1px 0 rgb(16 24 40 / 0.03)",
+        sm: "0 1px 2px 0 rgb(16 24 40 / 0.04)",
+        md: "0 1px 2px -1px rgb(16 24 40 / 0.04), 0 2px 4px -2px rgb(16 24 40 / 0.05)",
+        lg: "0 2px 4px -2px rgb(16 24 40 / 0.04), 0 6px 12px -4px rgb(16 24 40 / 0.06)",
+        xl: "0 4px 8px -3px rgb(16 24 40 / 0.04), 0 12px 20px -6px rgb(16 24 40 / 0.07)",
+        ring: "0 0 0 4px rgb(79 70 229 / 0.14)",
       },
       keyframes: {
         "fade-in": {

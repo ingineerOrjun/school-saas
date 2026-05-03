@@ -1,7 +1,7 @@
 "use client";
 
 import * as React from "react";
-import { useRouter } from "next/navigation";
+import { useRouter, useSearchParams } from "next/navigation";
 import Link from "next/link";
 import {
   CalendarCheck,
@@ -17,7 +17,12 @@ import {
 import { toast } from "sonner";
 import { cn } from "@/lib/utils";
 import { ApiError } from "@/lib/api";
+import { getStoredUser } from "@/lib/auth";
 import { classesApi, type ClassWithSections } from "@/lib/classes";
+import {
+  teachingAssignmentsApi,
+  type TeachingAssignmentDto,
+} from "@/lib/teaching-assignments";
 import {
   attendanceApi,
   todayISO,
@@ -51,11 +56,94 @@ function parseScope(value: ScopeValue): {
   return {};
 }
 
+/**
+ * Restrict the catalog to the classes/sections a TEACHER is assigned to.
+ *
+ * Rules per assignment:
+ *   • sectionId set  → only that section appears (under its parent class)
+ *   • sectionId null → the whole class appears, with EVERY section under it
+ *
+ * The union across all assignments is what's shown. ADMINs pass
+ * `assignments = null` to get the unfiltered catalog.
+ *
+ * Implementation note: we re-shape the original `ClassWithSections`
+ * objects rather than mutating them, so React refs stay stable for the
+ * unaffected branches.
+ */
+function filterClassesByAssignments(
+  classes: ClassWithSections[],
+  assignments: TeachingAssignmentDto[] | null,
+): ClassWithSections[] {
+  if (assignments === null) return classes;
+  if (assignments.length === 0) return [];
+
+  // Per-class allow-set: which sections (or "whole class") are allowed.
+  // `whole === true` means class-bound assignment → show every section.
+  const byClass = new Map<string, { whole: boolean; sectionIds: Set<string> }>();
+  for (const a of assignments) {
+    const entry =
+      byClass.get(a.classId) ?? { whole: false, sectionIds: new Set<string>() };
+    if (a.sectionId) {
+      entry.sectionIds.add(a.sectionId);
+    } else {
+      // Class-bound assignment: implicitly grants every section under it.
+      entry.whole = true;
+    }
+    byClass.set(a.classId, entry);
+  }
+
+  return classes
+    .filter((c) => byClass.has(c.id))
+    .map((c) => {
+      const allow = byClass.get(c.id)!;
+      const sections = allow.whole
+        ? c.sections
+        : c.sections.filter((s) => allow.sectionIds.has(s.id));
+      return { ...c, sections };
+    });
+}
+
+/**
+ * Read `?sectionId=...` or `?classId=...` from the URL once and convert
+ * to the encoded ScopeValue used by the picker. Used to seed the scope
+ * when the page is reached via a deep link (e.g. from the teacher
+ * dashboard "Take attendance" button). Empty string when neither param
+ * is present, which leaves the picker in its default empty state.
+ */
+function useInitialScopeFromQuery(): ScopeValue {
+  const params = useSearchParams();
+  // We only ever read this on first render — after that the picker is
+  // authoritative, so it's fine to ignore subsequent param changes.
+  const initial = React.useRef<ScopeValue | null>(null);
+  if (initial.current === null) {
+    const sectionId = params.get("sectionId");
+    const classId = params.get("classId");
+    initial.current = sectionId
+      ? `section:${sectionId}`
+      : classId
+        ? `class:${classId}`
+        : "";
+  }
+  return initial.current;
+}
+
 export default function AttendancePage() {
   const router = useRouter();
+  // Pre-fill scope from URL on mount so deep links from the teacher
+  // dashboard ("Take attendance") land directly on the right roster
+  // instead of an empty picker. We read once at init, not on every
+  // render — afterwards the picker is the source of truth.
+  const initialScope = useInitialScopeFromQuery();
   const [date, setDate] = React.useState<string>(todayISO());
   const [classes, setClasses] = React.useState<ClassWithSections[]>([]);
-  const [scope, setScope] = React.useState<ScopeValue>("");
+  // For TEACHER users we filter the picker to only their assigned
+  // classes/sections — they can't act outside their scope anyway, and
+  // showing the full catalog would just waste their time. ADMIN keeps
+  // the full list (`null` = "no filter applied").
+  const [assignments, setAssignments] = React.useState<
+    TeachingAssignmentDto[] | null
+  >(null);
+  const [scope, setScope] = React.useState<ScopeValue>(initialScope);
   const [roster, setRoster] = React.useState<AttendanceRoster[] | null>(null);
   const [loadingClasses, setLoadingClasses] = React.useState(true);
   const [loadingRoster, setLoadingRoster] = React.useState(false);
@@ -64,13 +152,31 @@ export default function AttendancePage() {
     () => new Set(),
   );
 
-  // Load classes once.
+  // Load classes — and, for TEACHER users, their assignments — in
+  // parallel. The dropdown blends them downstream so a teacher only
+  // sees classes/sections they're authorized for.
   React.useEffect(() => {
     let cancelled = false;
     (async () => {
+      const role = getStoredUser()?.role ?? null;
       try {
-        const data = await classesApi.list();
-        if (!cancelled) setClasses(data);
+        const [classList, myAssignments] = await Promise.all([
+          classesApi.list(),
+          role === "TEACHER"
+            ? teachingAssignmentsApi.listMine().catch((err) => {
+                // 403 here means "not a teacher row yet" — treat as
+                // "no assignments" so the dropdown collapses to empty
+                // rather than blocking the page entirely.
+                if (err instanceof ApiError && err.status === 403) {
+                  return [];
+                }
+                throw err;
+              })
+            : Promise.resolve(null),
+        ]);
+        if (cancelled) return;
+        setClasses(classList);
+        setAssignments(myAssignments);
       } catch (err) {
         if (err instanceof ApiError && err.status === 401) {
           router.replace("/login");
@@ -195,8 +301,15 @@ export default function AttendancePage() {
     }
   };
 
-  const noClasses = !loadingClasses && classes.length === 0;
-  const hasSections = classes.some((c) => c.sections.length > 0);
+  // Restrict the dropdown to assignments when the caller is a TEACHER.
+  // ADMIN users (assignments === null) see the full catalog unchanged.
+  const visibleClasses = React.useMemo(
+    () => filterClassesByAssignments(classes, assignments),
+    [classes, assignments],
+  );
+
+  const noClasses = !loadingClasses && visibleClasses.length === 0;
+  const hasSections = visibleClasses.some((c) => c.sections.length > 0);
   const scopeSelected = scope !== "";
 
   return (
@@ -249,7 +362,7 @@ export default function AttendancePage() {
                     ? "Loading classes…"
                     : "Choose a class or section…"}
               </option>
-              {classes.map((klass) => (
+              {visibleClasses.map((klass) => (
                 <optgroup key={klass.id} label={klass.name}>
                   {/* Whole-class option — essential for schools without
                       sections. Also available when sections exist, and it

@@ -16,6 +16,7 @@ import { toast } from "sonner";
 import { cn } from "@/lib/utils";
 import { ApiError } from "@/lib/api";
 import { getToken, getStoredSchool } from "@/lib/auth";
+import { DocumentLogo } from "@/components/documents/DocumentLogo";
 import {
   examsApi,
   ledgerApi,
@@ -351,30 +352,31 @@ function SheetHeader({
   schoolName: string;
 }) {
   const issued = formatDate(ledger.generatedAt);
+  // Prefer the payload's school name (always fresh) over the
+  // localStorage cached one passed as a prop. Logo comes from the
+  // payload too — null when no upload yet.
+  const displayName = ledger.school?.name ?? schoolName;
   return (
     <header className="border-b-2 border-slate-900 px-8 py-5">
-      <div className="grid grid-cols-[auto_1fr_auto] items-center gap-6">
-        <div
-          aria-hidden
-          className="flex h-14 w-14 shrink-0 items-center justify-center rounded-md border-2 border-dashed border-slate-400 bg-slate-50 text-slate-500 print:border-solid print:border-slate-700"
-          title="School logo"
-        >
-          <GraduationCap className="h-7 w-7" strokeWidth={1.5} />
-        </div>
-        <div className="text-center">
+      {/* Same stabilization as the marksheet header: fixed 64px logo,
+          center capped at 60% width with line-clamp, right column
+          shrink-0 so the issued date never gets squeezed. */}
+      <div className="grid grid-cols-[64px_1fr_auto] items-center gap-6">
+        <DocumentLogo logoUrl={ledger.school?.logoUrl} />
+        <div className="min-w-0 mx-auto max-w-[60%] text-center">
           <p className="text-[11px] font-semibold uppercase tracking-[0.25em] text-slate-500">
             CLASS LEDGER
           </p>
-          <h1 className="mt-1 text-xl font-bold tracking-tight text-slate-900 uppercase">
-            {schoolName}
+          <h1 className="mt-1 text-xl font-bold tracking-tight text-slate-900 uppercase line-clamp-2 text-balance break-words">
+            {displayName}
           </h1>
-          <p className="mt-0.5 text-xs text-slate-600">
+          <p className="mt-0.5 text-xs text-slate-600 line-clamp-1">
             {ledger.exam.name} &middot; {ledger.class.name} &middot;{" "}
             {ledger.students.length}{" "}
             {ledger.students.length === 1 ? "student" : "students"}
           </p>
         </div>
-        <div className="text-right">
+        <div className="text-right shrink-0">
           <p className="text-[10px] font-semibold uppercase tracking-wider text-slate-500">
             Issued
           </p>

@@ -155,7 +155,7 @@ export interface Receipt {
   feeStructure: { id: string; name: string; frequency: string } | null;
   /** Null for unlinked ("general credit") payments. */
   feeDetail: ReceiptFeeDetail | null;
-  school: { id: string; name: string; slug: string };
+  school: { id: string; name: string; slug: string; logoUrl: string | null };
   recordedAt: string;
 }
 

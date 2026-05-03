@@ -14,10 +14,40 @@ import type { JwtPayload } from './types/jwt-payload';
 
 export type SafeUser = Omit<User, 'password'>;
 
+/**
+ * Optional teacher context — present only when the authenticated user
+ * is a TEACHER. Lets the frontend route appropriately on login (e.g.
+ * unassigned teachers → "ask admin to assign you" page).
+ *
+ * Source of truth is the `TeachingAssignment` table — NOT the legacy
+ * `Teacher.classId/sectionId` columns. The legacy columns are kept on
+ * the row for backward compat but no permission/routing decision reads
+ * them anymore.
+ */
+export interface TeacherContext {
+  /**
+   * True when the teacher has at least one TeachingAssignment row.
+   * Drives the "ask admin to assign you" landing — `landingFor` on the
+   * frontend uses this to pick /attendance vs the unassigned hero.
+   */
+  hasAssignments: boolean;
+  /**
+   * "Primary" class ID derived from the FIRST assignment (createdAt
+   * order). Null when there are no assignments. Used only for
+   * deep-linking the post-login landing page; permission checks
+   * always re-resolve via TeacherScopeService.
+   */
+  classId: string | null;
+  /** First assignment's sectionId (or null if class-bound). */
+  sectionId: string | null;
+}
+
 export interface AuthResult {
   accessToken: string;
   user: SafeUser;
   school: School;
+  /** Populated only for TEACHER users, otherwise null. */
+  teacher: TeacherContext | null;
 }
 
 export type RegisterAdminResult = AuthResult;
@@ -64,6 +94,8 @@ export class AuthService {
       school,
       user: this.stripPassword(user),
       accessToken: this.issueToken(user),
+      // A freshly-registered ADMIN never has a teacher record.
+      teacher: null,
     };
   }
 
@@ -87,10 +119,35 @@ export class AuthService {
 
     const { school, ...userWithoutSchool } = user;
 
+    // For TEACHER users, derive the landing context from
+    // TeachingAssignment — NOT the legacy Teacher.classId column,
+    // which doesn't update when admins add new-style assignments.
+    // First assignment by createdAt is the "primary" landing class.
+    let teacher: TeacherContext | null = null;
+    if (user.role === Role.TEACHER) {
+      const t = await this.prisma.teacher.findFirst({
+        where: { userId: user.id, schoolId: user.schoolId },
+        select: {
+          assignments: {
+            orderBy: { createdAt: 'asc' },
+            take: 1,
+            select: { classId: true, sectionId: true },
+          },
+        },
+      });
+      const first = t?.assignments[0] ?? null;
+      teacher = {
+        hasAssignments: !!first,
+        classId: first?.classId ?? null,
+        sectionId: first?.sectionId ?? null,
+      };
+    }
+
     return {
       user: this.stripPassword(userWithoutSchool),
       school,
       accessToken: this.issueToken(user),
+      teacher,
     };
   }
 

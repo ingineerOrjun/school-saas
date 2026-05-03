@@ -76,6 +76,33 @@ export interface SaveResultsInput {
   entries: ResultEntry[];
 }
 
+/**
+ * Bulk-marks payload — one subject across many students. Mirrors
+ * `BulkSaveResultsDto` on the backend. The subject is hoisted out of
+ * each entry because the whole batch is for the same subject.
+ *
+ *   • subjectId — `ExamSubject.id` (per-exam subject row)
+ *   • sectionId — null/omitted → target the "no-section" subset of
+ *     the class; set → target only that section
+ */
+export interface BulkResultEntry {
+  studentId: string;
+  theoryMarks: number;
+  practicalMarks?: number;
+}
+
+export interface BulkSaveResultsInput {
+  examId: string;
+  classId: string;
+  sectionId?: string | null;
+  subjectId: string;
+  entries: BulkResultEntry[];
+}
+
+export interface BulkSaveResultsResult {
+  successCount: number;
+}
+
 export const examsApi = {
   list: () => api<ExamDto[]>("/exams"),
   create: (input: CreateExamInput) =>
@@ -100,6 +127,16 @@ export const resultsApi = {
       method: "POST",
       body: JSON.stringify(input),
     }),
+  /**
+   * Bulk-save: one subject for many students at once. The single-row
+   * `save` above is unchanged and still in use — bulk is purely
+   * additive.
+   */
+  bulkSave: (input: BulkSaveResultsInput) =>
+    api<BulkSaveResultsResult>("/results/bulk-save", {
+      method: "POST",
+      body: JSON.stringify(input),
+    }),
   get: (examId: string, studentId: string) =>
     api<StudentReport>(
       `/results?examId=${encodeURIComponent(examId)}&studentId=${encodeURIComponent(studentId)}`,
@@ -111,6 +148,7 @@ export interface Marksheet extends StudentReport {
     id: string;
     name: string;
     slug: string;
+    logoUrl: string | null;
   };
   studentSymbolNumber: string | null;
   studentSection: {
@@ -157,6 +195,13 @@ export interface LedgerStudentRow {
 export interface ClassLedger {
   exam: { id: string; name: string };
   class: { id: string; name: string };
+  /** Owning school — used to render the printable header. */
+  school: {
+    id: string;
+    name: string;
+    slug: string;
+    logoUrl: string | null;
+  };
   subjects: LedgerSubject[];
   students: LedgerStudentRow[];
   generatedAt: string;

@@ -5,22 +5,78 @@
 @layer base {
   :root {
     --background: 0 0% 100%;
-    --foreground: 224 16% 12%;
+
+    /* Body text: slate-900 (#0F172A). Sharper than the previous near-
+       black for better contrast against the surface. */
+    --foreground: 222 47% 11%;
 
     --surface: 0 0% 100%;
     --muted: 220 16% 96%;
-    --muted-foreground: 220 9% 46%;
+    /* Body-secondary: slate-600 — readable, never gray-on-gray. */
+    --muted-foreground: 215 19% 35%;
 
-    --border: 220 14% 92%;
-    --ring: 238 83% 67%;
+    /* Borders: slate-300 (#CBD5E1) — actually visible on white instead
+       of fading into the page like the previous ultra-light tone. */
+    --border: 213 27% 84%;
+    --ring: 239 84% 60%;
 
-    --primary: 238 75% 65%;
+    /* Primary: indigo-600 (#4F46E5). Matches the Tailwind palette
+       exactly so any `text-indigo-600`/`bg-indigo-600` lines up with
+       the design-token version. */
+    --primary: 239 84% 60%;
     --primary-foreground: 0 0% 100%;
 
     --destructive: 0 72% 55%;
     --destructive-foreground: 0 0% 100%;
 
     --success: 152 61% 41%;
+    --success-foreground: 0 0% 100%;
+  }
+
+  /*
+   * Dark theme. Flips every CSS variable to a calibrated dark value
+   * — anywhere the app uses a token (`bg-background`, `text-foreground`,
+   * `bg-surface`, `text-muted-foreground`, `border-border`, the
+   * `glass` utility, etc.) goes dark automatically.
+   *
+   * Background tones use the slate scale (slate-950 / slate-900 /
+   * slate-800) so the page reads as a deep, neutral, eye-friendly
+   * dark — not pitch black. Text contrast is calibrated to ~AA on
+   * the dark background. Primary indigo is brightened by +10% L so
+   * it stays vivid against the dark surface (the Tailwind palette
+   * shifts it to indigo-500 here).
+   */
+  .dark {
+    /* slate-950 (#020617) — the page canvas. */
+    --background: 222 47% 5%;
+    /* slate-100 (#F1F5F9) — body text. */
+    --foreground: 210 40% 96%;
+
+    /* slate-900 (#0F172A) — cards, modals, sidebar. Just enough lift
+       above the canvas to read as a discrete surface without floating
+       too far. */
+    --surface: 222 47% 9%;
+    /* slate-800 (#1E293B) — hover backgrounds, badge tints. */
+    --muted: 217 33% 17%;
+    /* slate-400 (#94A3B8) — secondary text. AAA-ish on slate-950. */
+    --muted-foreground: 215 20% 65%;
+
+    /* slate-700 (#334155) — visible against both card and canvas
+       without screaming. */
+    --border: 215 25% 27%;
+    --ring: 239 84% 67%;
+
+    /* indigo-500 (#6366F1) — slightly lifted so the brand color
+       stays vivid on the dark background. */
+    --primary: 239 84% 67%;
+    --primary-foreground: 0 0% 100%;
+
+    /* red-500 — punchy enough to read as alert in a dark UI. */
+    --destructive: 0 72% 55%;
+    --destructive-foreground: 0 0% 100%;
+
+    /* emerald-500 — lifted from the light-mode emerald-600. */
+    --success: 152 60% 50%;
     --success-foreground: 0 0% 100%;
   }
 
@@ -102,17 +158,37 @@
       radial-gradient(at 94% 0%, hsla(280, 85%, 75%, 0.10) 0px, transparent 55%),
       radial-gradient(at 50% 100%, hsla(220, 85%, 75%, 0.08) 0px, transparent 55%);
   }
+  /* Dark-mode mesh: same composition, much lower-luminance tints
+     (~6% alpha) that still hint at the indigo brand identity without
+     muddying the page. */
+  .dark .bg-app {
+    background-color: hsl(222 47% 5%);
+    background-image:
+      radial-gradient(at 8% 0%, hsla(238, 85%, 70%, 0.08) 0px, transparent 55%),
+      radial-gradient(at 94% 0%, hsla(280, 85%, 75%, 0.06) 0px, transparent 55%),
+      radial-gradient(at 50% 100%, hsla(220, 85%, 75%, 0.05) 0px, transparent 55%);
+  }
 
-  /* Frosted glass surface — use over a colorful/gradient background. */
+  /* Frosted glass surface — use over a colorful/gradient background.
+     Sharper border + lighter shadow for the cleaner UI direction:
+     definition comes from the slate-300 border, not from a heavy drop
+     shadow. */
   .glass {
-    background-color: hsl(var(--surface) / 0.72);
+    background-color: hsl(var(--surface) / 0.78);
     backdrop-filter: blur(14px) saturate(150%);
     -webkit-backdrop-filter: blur(14px) saturate(150%);
-    border: 1px solid hsl(0 0% 100% / 0.55);
+    border: 1px solid hsl(var(--border));
     box-shadow:
       0 1px 0 hsl(0 0% 100% / 0.4) inset,
-      0 1px 2px hsl(220 40% 20% / 0.04),
-      0 8px 24px -8px hsl(220 40% 20% / 0.08);
+      0 1px 2px hsl(220 40% 20% / 0.03);
+  }
+  /* Glass in dark mode: drop the white inner highlight (it was meant
+     to mimic top-light on a white card), and bump the shadow opacity
+     slightly to keep separation visible on a dark background. */
+  .dark .glass {
+    box-shadow:
+      0 1px 0 hsl(0 0% 100% / 0.04) inset,
+      0 1px 2px hsl(0 0% 0% / 0.4);
   }
 
   /* Stagger children's entrance — pair with animate-fade-in-up */

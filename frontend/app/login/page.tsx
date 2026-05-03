@@ -1,24 +1,76 @@
 "use client";
 
 import * as React from "react";
-import Link from "next/link";
 import { useRouter } from "next/navigation";
 import {
-  Mail,
-  Lock,
   ArrowRight,
-  Sparkles,
+  CalendarCheck,
+  GraduationCap,
   ShieldCheck,
-  Building2,
+  Sparkles,
 } from "lucide-react";
 import { toast } from "sonner";
+import { ApiError } from "@/lib/api";
 import { Button } from "@/components/ui/Button";
 import { Input } from "@/components/ui/Input";
-import { ApiError } from "@/lib/api";
-import { login, registerAdmin } from "@/lib/auth";
+import {
+  login,
+  registerAdmin,
+  type AuthResult,
+} from "@/lib/auth";
+
+/**
+ * Role-based landing page after a successful login.
+ *   • ADMIN  → /dashboard (school-wide overview).
+ *   • TEACHER with at least one TeachingAssignment → /attendance,
+ *     deep-linked to the primary class/section so they land directly
+ *     on a roster.
+ *   • TEACHER without any assignment → /dashboard. The teacher
+ *     dashboard view detects the empty state and renders the
+ *     "ask admin to assign you" hero on its own.
+ *   • Future roles fall back to the dashboard so we never strand a
+ *     newly-introduced role on a 404.
+ *
+ * `hasAssignments` is the source of truth — sourced from the
+ * TeachingAssignment table on the backend. The legacy
+ * `Teacher.classId` is no longer consulted (it doesn't update when
+ * admins use the multi-row Assignments dialog).
+ */
+function landingFor(result: AuthResult): string {
+  if (result.user.role === "TEACHER") {
+    if (!result.teacher?.hasAssignments) {
+      return "/dashboard";
+    }
+    if (result.teacher.sectionId) {
+      return `/attendance?sectionId=${result.teacher.sectionId}`;
+    }
+    if (result.teacher.classId) {
+      return `/attendance?classId=${result.teacher.classId}`;
+    }
+    return "/attendance";
+  }
+  return "/dashboard";
+}
 
 type Mode = "signin" | "signup";
 
+/**
+ * Login page — clean, professional school-system look.
+ *
+ * Layout:
+ *   • Two-column on >= md (brand left, form card right)
+ *   • Single column on mobile (brand stacks above the card)
+ *
+ * Visuals follow the user-spec:
+ *   • Light neutral background (slate-50)
+ *   • Form sits in a calm bordered card (border-slate-200, no heavy shadow)
+ *   • Single primary color (indigo-600) on buttons, focus rings, and links
+ *   • Shared `Input` + `Button` components — same primitives the rest
+ *     of the app uses, so the brand identity is consistent
+ *
+ * Auth logic and role-based routing are unchanged from the prior
+ * design — only the chrome was replaced.
+ */
 export default function LoginPage() {
   const router = useRouter();
   const [mode, setMode] = React.useState<Mode>("signin");
@@ -28,20 +80,23 @@ export default function LoginPage() {
   const [schoolName, setSchoolName] = React.useState("");
   const [error, setError] = React.useState<string | null>(null);
 
+  const isSignIn = mode === "signin";
+
   const onSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
     setError(null);
     setLoading(true);
 
     try {
+      let result: AuthResult;
       if (mode === "signin") {
-        const { school } = await login(email, password);
-        toast.success(`Welcome back to ${school.name}`);
+        result = await login(email, password);
+        toast.success(`Welcome back to ${result.school.name}`);
       } else {
-        const { school } = await registerAdmin(email, password, schoolName);
-        toast.success(`Workspace ready — welcome to ${school.name}`);
+        result = await registerAdmin(email, password, schoolName);
+        toast.success(`Workspace ready — welcome to ${result.school.name}`);
       }
-      router.push("/dashboard");
+      router.push(landingFor(result));
     } catch (err) {
       const message =
         err instanceof ApiError
@@ -56,33 +111,22 @@ export default function LoginPage() {
     }
   };
 
-  const isSignIn = mode === "signin";
-
   return (
-    <div className="grid min-h-screen lg:grid-cols-2 bg-app">
-      {/* Left — Form */}
-      <div className="flex flex-col justify-between p-8 lg:p-12">
-        <Link
-          href="/"
-          className="flex items-center gap-2.5 focus-ring rounded-md w-fit"
-        >
-          <div className="flex h-8 w-8 items-center justify-center rounded-lg bg-primary text-primary-foreground shadow-xs">
-            <Sparkles className="h-4 w-4" strokeWidth={2.5} />
-          </div>
-          <span className="text-md font-semibold tracking-tight">
-            Scholaris
-          </span>
-        </Link>
+    <div className="min-h-screen w-full bg-background flex items-center justify-center px-4 py-10">
+      <div className="w-full max-w-[1100px] grid gap-10 md:gap-16 md:grid-cols-2 md:items-center">
+        {/* ---------- Left: branding ---------- */}
+        <BrandPanel />
 
-        <div className="flex flex-1 items-center justify-center py-10">
-          <div className="w-full max-w-sm animate-fade-in-up">
-            <div className="mb-8 space-y-2">
-              <h1 className="text-3xl font-semibold tracking-tight text-foreground">
-                {isSignIn ? "Welcome back" : "Create your workspace"}
+        {/* ---------- Right: form card ---------- */}
+        <div className="w-full max-w-md mx-auto md:mx-0 md:ml-auto">
+          <div className="bg-surface border border-border rounded-lg p-6 sm:p-8">
+            <div className="space-y-1.5 mb-6">
+              <h1 className="text-2xl font-semibold tracking-tight text-foreground">
+                {isSignIn ? "Sign in to your school" : "Create your workspace"}
               </h1>
               <p className="text-sm text-muted-foreground">
                 {isSignIn
-                  ? "Sign in to your school workspace to continue."
+                  ? "Manage your school with ease."
                   : "Set up a new school in under a minute."}
               </p>
             </div>
@@ -91,63 +135,56 @@ export default function LoginPage() {
               {!isSignIn && (
                 <Input
                   label="School name"
-                  placeholder="Oakridge International"
-                  leftIcon={<Building2 className="h-4 w-4" />}
+                  placeholder="e.g. Oakridge International"
                   value={schoolName}
                   onChange={(e) => setSchoolName(e.target.value)}
                   required
                   autoFocus
+                  disabled={loading}
                 />
               )}
               <Input
                 label="Email"
                 type="email"
                 placeholder="you@school.edu"
-                leftIcon={<Mail className="h-4 w-4" />}
                 autoComplete="email"
                 value={email}
                 onChange={(e) => setEmail(e.target.value)}
                 required
+                autoFocus={isSignIn}
+                disabled={loading}
               />
-              <div>
-                <Input
-                  label="Password"
-                  type="password"
-                  placeholder={
-                    isSignIn
-                      ? "••••••••"
-                      : "Min 8 chars with an uppercase & number"
-                  }
-                  leftIcon={<Lock className="h-4 w-4" />}
-                  autoComplete={isSignIn ? "current-password" : "new-password"}
-                  value={password}
-                  onChange={(e) => setPassword(e.target.value)}
-                  required
-                  minLength={8}
-                />
-                {isSignIn && (
-                  <div className="mt-2 flex items-center justify-between text-sm">
-                    <label className="inline-flex items-center gap-2 text-muted-foreground">
-                      <input
-                        type="checkbox"
-                        className="h-4 w-4 rounded border-border text-primary focus-ring"
-                      />
-                      Remember me
-                    </label>
-                    <button
-                      type="button"
-                      className="font-medium text-primary hover:text-primary/80 transition-colors"
-                    >
-                      Forgot password?
-                    </button>
-                  </div>
-                )}
-              </div>
+              <Input
+                label="Password"
+                type="password"
+                placeholder={
+                  isSignIn ? "Your password" : "At least 8 characters"
+                }
+                autoComplete={
+                  isSignIn ? "current-password" : "new-password"
+                }
+                value={password}
+                onChange={(e) => setPassword(e.target.value)}
+                required
+                minLength={8}
+                disabled={loading}
+                hint={
+                  !isSignIn
+                    ? "Use at least 8 characters with one uppercase letter and one number."
+                    : undefined
+                }
+              />
 
+              {/* Inline error — sits above the submit button so the user
+                  doesn't have to hunt for it. The toast covers the
+                  out-of-corner case. */}
               {error && (
-                <div className="rounded-md border border-destructive/30 bg-destructive/5 px-3 py-2 text-xs text-destructive">
+                <p
+                  className="text-sm text-destructive leading-snug"
+                  role="alert"
+                >
                   {error}
-                </div>
+                </p>
               )}
 
               <Button
@@ -159,27 +196,30 @@ export default function LoginPage() {
                   !loading ? <ArrowRight className="h-4 w-4" /> : undefined
                 }
               >
-                {isSignIn ? "Sign in" : "Create workspace"}
+                {isSignIn ? "Sign In" : "Create workspace"}
               </Button>
             </form>
 
-            <p className="mt-8 text-center text-sm text-muted-foreground">
+            {/* Mode toggle — calm text link, no second CTA button.
+                Keeps the card focused on the primary action. */}
+            <div className="mt-6 pt-6 border-t border-border text-center">
               {isSignIn ? (
-                <>
-                  Don&apos;t have an account?{" "}
+                <p className="text-sm text-muted-foreground">
+                  New to Scholaris?{" "}
                   <button
                     type="button"
                     onClick={() => {
                       setMode("signup");
                       setError(null);
                     }}
-                    className="font-medium text-foreground hover:text-primary transition-colors"
+                    disabled={loading}
+                    className="font-medium text-primary hover:text-primary/80 hover:underline disabled:opacity-60 transition-colors focus:outline-none focus:underline"
                   >
-                    Start a free trial
+                    Create a workspace
                   </button>
-                </>
+                </p>
               ) : (
-                <>
+                <p className="text-sm text-muted-foreground">
                   Already have a workspace?{" "}
                   <button
                     type="button"
@@ -187,74 +227,85 @@ export default function LoginPage() {
                       setMode("signin");
                       setError(null);
                     }}
-                    className="font-medium text-foreground hover:text-primary transition-colors"
+                    disabled={loading}
+                    className="font-medium text-primary hover:text-primary/80 hover:underline disabled:opacity-60 transition-colors focus:outline-none focus:underline"
                   >
-                    Sign in
+                    Sign in instead
                   </button>
-                </>
+                </p>
               )}
-            </p>
-          </div>
-        </div>
-
-        <p className="text-xs text-muted-foreground">
-          © {new Date().getFullYear()} Scholaris, Inc. All rights reserved.
-        </p>
-      </div>
-
-      {/* Right — Showcase */}
-      <div className="relative hidden lg:flex flex-col overflow-hidden border-l border-border bg-gradient-to-br from-primary-50 via-background to-background">
-        <div className="absolute inset-0 bg-grid opacity-60 [mask-image:radial-gradient(ellipse_at_center,black_40%,transparent_75%)]" />
-        <div className="absolute -top-20 -right-20 h-[420px] w-[420px] rounded-full bg-primary/20 blur-3xl" />
-        <div className="absolute bottom-0 -left-20 h-[320px] w-[320px] rounded-full bg-primary/10 blur-3xl" />
-
-        <div className="relative z-10 flex h-full flex-col justify-between p-12">
-          <div className="inline-flex w-fit items-center gap-2 rounded-full border border-border bg-surface/60 backdrop-blur px-3 py-1 text-xs font-medium text-muted-foreground shadow-xs">
-            <ShieldCheck className="h-3.5 w-3.5 text-primary" />
-            SOC 2 Type II compliant
-          </div>
-
-          <div className="max-w-md space-y-5">
-            <h2 className="text-4xl font-semibold tracking-tight text-foreground">
-              Run your school like the best SaaS companies.
-            </h2>
-            <p className="text-md text-muted-foreground leading-relaxed">
-              Admissions, attendance, exams, fees, and parent communication —
-              all in one beautifully designed workspace built for modern
-              educators.
-            </p>
-
-            <div className="flex items-center gap-6 pt-4">
-              <Stat label="Schools" value="1,240+" />
-              <div className="h-8 w-px bg-border" />
-              <Stat label="Students" value="820K" />
-              <div className="h-8 w-px bg-border" />
-              <Stat label="Uptime" value="99.99%" />
             </div>
           </div>
 
-          <blockquote className="max-w-md border-l-2 border-primary pl-4">
-            <p className="text-sm text-foreground leading-relaxed">
-              &ldquo;Scholaris replaced five different tools. Our teachers save
-              six hours a week, and parents finally have visibility.&rdquo;
-            </p>
-            <footer className="mt-3 text-xs text-muted-foreground">
-              Dr. Priya Menon — Principal, Oakridge International
-            </footer>
-          </blockquote>
+          {/* Footer line under the card — small, calm, never competes
+              with the form. */}
+          <p className="mt-4 text-center text-xs text-muted-foreground">
+            © {new Date().getFullYear()} Scholaris. All rights reserved.
+          </p>
         </div>
       </div>
     </div>
   );
 }
 
-function Stat({ label, value }: { label: string; value: string }) {
+// ---------------------------------------------------------------------------
+// Brand panel — left column on desktop, top of stack on mobile.
+//
+// Intentionally calm: just the wordmark, the tagline, and three feature
+// bullets. No illustration, no testimonial, no marketing chrome —
+// matches the spec's "professional school system" tone.
+// ---------------------------------------------------------------------------
+
+function BrandPanel() {
   return (
-    <div className="flex flex-col">
-      <span className="text-2xl font-semibold tracking-tight text-foreground">
-        {value}
-      </span>
-      <span className="text-xs text-muted-foreground">{label}</span>
+    <div className="text-center md:text-left">
+      <div className="inline-flex items-center gap-3">
+        <div className="flex h-11 w-11 items-center justify-center rounded-lg bg-primary text-primary-foreground">
+          <Sparkles className="h-5 w-5" strokeWidth={2.5} />
+        </div>
+        <span className="text-2xl font-semibold tracking-tight text-foreground">
+          Scholaris
+        </span>
+      </div>
+
+      <h2 className="mt-6 text-3xl md:text-4xl font-semibold tracking-tight text-foreground leading-[1.15]">
+        Smart School Management System
+      </h2>
+      <p className="mt-3 text-base text-muted-foreground max-w-md mx-auto md:mx-0">
+        Everything your school needs in one calm workspace —
+        students, attendance, exams, and fees.
+      </p>
+
+      {/* Three subtle feature bullets. Visible only on >= md so the
+          mobile layout stays compact. */}
+      <ul className="mt-8 hidden md:flex flex-col gap-3 text-sm text-foreground/85">
+        <FeatureItem icon={<GraduationCap className="h-4 w-4" />}>
+          Manage students, teachers, and classes in one place.
+        </FeatureItem>
+        <FeatureItem icon={<CalendarCheck className="h-4 w-4" />}>
+          Track attendance and enter marks in seconds.
+        </FeatureItem>
+        <FeatureItem icon={<ShieldCheck className="h-4 w-4" />}>
+          Role-based access keeps every account scoped to its work.
+        </FeatureItem>
+      </ul>
     </div>
+  );
+}
+
+function FeatureItem({
+  icon,
+  children,
+}: {
+  icon: React.ReactNode;
+  children: React.ReactNode;
+}) {
+  return (
+    <li className="flex items-start gap-2.5">
+      <span className="mt-0.5 flex h-6 w-6 shrink-0 items-center justify-center rounded-md bg-primary/10 text-primary">
+        {icon}
+      </span>
+      <span>{children}</span>
+    </li>
   );
 }

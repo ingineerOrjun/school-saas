@@ -7,6 +7,7 @@ import { LetterGrade, Result } from '@prisma/client';
 import { PrismaService } from '../database/prisma.service';
 import { GradingService } from '../grading/grading.service';
 import { ExamService } from './exam.service';
+import { BulkSaveResultsDto } from './dto/bulk-save-results.dto';
 import { SaveResultsDto } from './dto/save-results.dto';
 
 export interface ResultRow {
@@ -78,6 +79,16 @@ export interface LedgerStudentRow {
 export interface ClassLedger {
   exam: { id: string; name: string };
   class: { id: string; name: string };
+  /**
+   * Owning school — included so the printable header can render the
+   * official name + logo without a second round-trip.
+   */
+  school: {
+    id: string;
+    name: string;
+    slug: string;
+    logoUrl: string | null;
+  };
   subjects: LedgerSubject[];
   students: LedgerStudentRow[];
   /** ISO timestamp when this ledger was generated. */
@@ -90,6 +101,7 @@ export interface Marksheet extends StudentReport {
     id: string;
     name: string;
     slug: string;
+    logoUrl: string | null;
   };
   studentSymbolNumber: string | null;
   studentSection: {
@@ -213,6 +225,167 @@ export class ResultService {
     return this.getStudentReport(dto.examId, dto.studentId, schoolId);
   }
 
+  /**
+   * Bulk marks entry — one subject, many students, one transaction.
+   * Same grading + upsert logic as `save`; the difference is shape:
+   * subject is hoisted to the top of the payload (one per call) and
+   * each entry carries a studentId instead of being student-scoped.
+   *
+   * Validations (in order — cheapest first):
+   *   1. Tenant guards (exam, class, section if given).
+   *   2. Subject belongs to the exam.
+   *   3. No duplicate studentIds in the payload.
+   *   4. Every studentId is in the (class, section) scope. The scope
+   *      rule mirrors the attendance roster:
+   *        sectionId set  → students with that exact sectionId
+   *        sectionId null → students with classId=X AND sectionId IS NULL
+   *      Sectioned students under a class can ONLY be reached by
+   *      naming their section. Same separation as attendance.
+   *   5. Per-entry mark-range validation.
+   *
+   * The whole upsert runs inside `prisma.$transaction` so the response
+   * either reflects every row or none of them — partial saves would
+   * leave the class half-graded with no easy way to spot the gap.
+   *
+   * Authorization (ADMIN-only or TEACHER-with-matching-assignment) is
+   * enforced upstream in the controller via
+   * `TeacherScopeService.assertBulkMarksAccess`.
+   */
+  async bulkSave(
+    dto: BulkSaveResultsDto,
+    schoolId: string,
+  ): Promise<{ successCount: number }> {
+    // 1. Tenant guards.
+    const exam = await this.exams.assertInSchool(dto.examId, schoolId);
+
+    const klass = await this.prisma.class.findFirst({
+      where: { id: dto.classId, schoolId },
+      select: { id: true },
+    });
+    if (!klass) {
+      throw new BadRequestException('Class does not belong to this school.');
+    }
+
+    if (dto.sectionId) {
+      const section = await this.prisma.section.findFirst({
+        where: { id: dto.sectionId, classId: dto.classId },
+        select: { id: true },
+      });
+      if (!section) {
+        throw new BadRequestException(
+          'Section does not belong to the given class.',
+        );
+      }
+    }
+
+    // 2. Subject must belong to this exam (and via the FK, the school).
+    const subject = await this.prisma.examSubject.findFirst({
+      where: { id: dto.subjectId, examId: exam.id },
+      select: {
+        id: true,
+        name: true,
+        theoryFullMarks: true,
+        practicalFullMarks: true,
+      },
+    });
+    if (!subject) {
+      throw new BadRequestException(
+        'Subject does not belong to the given exam.',
+      );
+    }
+
+    // 3. No duplicates — multiple entries for the same student would
+    // both upsert the same composite key in the transaction, which
+    // could non-deterministically clobber values within the batch.
+    const studentIds = dto.entries.map((e) => e.studentId);
+    const uniqueIds = [...new Set(studentIds)];
+    if (uniqueIds.length !== studentIds.length) {
+      throw new BadRequestException(
+        'Duplicate studentId entries in the request.',
+      );
+    }
+
+    // 4. Every student must live inside the (class, section) scope
+    // we're targeting. One COUNT query proves all-or-nothing — cheap
+    // and avoids per-row round-trips.
+    const expectedScope = dto.sectionId
+      ? { sectionId: dto.sectionId }
+      : { classId: dto.classId, sectionId: null };
+    const validCount = await this.prisma.student.count({
+      where: {
+        id: { in: uniqueIds },
+        schoolId,
+        ...expectedScope,
+      },
+    });
+    if (validCount !== uniqueIds.length) {
+      throw new BadRequestException(
+        'One or more students are not in the given class/section.',
+      );
+    }
+
+    // 5. Validate marks per entry, then upsert atomically.
+    await this.prisma.$transaction(
+      dto.entries.map((entry) => {
+        const theoryMarks = entry.theoryMarks;
+        const practicalMarks = entry.practicalMarks ?? 0;
+
+        if (theoryMarks < 0 || theoryMarks > subject.theoryFullMarks) {
+          throw new BadRequestException(
+            `Theory marks for "${subject.name}" must be between 0 and ${subject.theoryFullMarks}.`,
+          );
+        }
+        if (
+          practicalMarks < 0 ||
+          practicalMarks > subject.practicalFullMarks
+        ) {
+          throw new BadRequestException(
+            `Practical marks for "${subject.name}" must be between 0 and ${subject.practicalFullMarks}.`,
+          );
+        }
+
+        // Reuse the same grading helper the per-row save uses — single
+        // source of truth for the NEB pass rule + percentage math.
+        const { percentage, letterGrade, gradePoint } = gradeWithSplit(
+          this.grading,
+          theoryMarks,
+          subject.theoryFullMarks,
+          practicalMarks,
+          subject.practicalFullMarks,
+        );
+
+        return this.prisma.result.upsert({
+          where: {
+            studentId_subjectId: {
+              studentId: entry.studentId,
+              subjectId: subject.id,
+            },
+          },
+          create: {
+            examId: exam.id,
+            studentId: entry.studentId,
+            subjectId: subject.id,
+            theoryMarks,
+            practicalMarks,
+            percentage,
+            letterGrade,
+            gradePoint,
+          },
+          update: {
+            theoryMarks,
+            practicalMarks,
+            percentage,
+            letterGrade,
+            gradePoint,
+          },
+          select: { id: true },
+        });
+      }),
+    );
+
+    return { successCount: dto.entries.length };
+  }
+
   async getStudentReport(
     examId: string,
     studentId: string,
@@ -304,7 +477,7 @@ export class ResultService {
       this.getStudentReport(examId, studentId, schoolId),
       this.prisma.school.findUnique({
         where: { id: schoolId },
-        select: { id: true, name: true, slug: true },
+        select: { id: true, name: true, slug: true, logoUrl: true },
       }),
       this.prisma.student.findFirst({
         where: { id: studentId, schoolId },
@@ -350,16 +523,24 @@ export class ResultService {
     classId: string,
     schoolId: string,
   ): Promise<ClassLedger> {
-    // Tenant guards. Run in parallel — both must succeed.
-    const [exam, klass] = await Promise.all([
+    // Tenant guards + school header in parallel — three independent
+    // queries, single round-trip wall time.
+    const [exam, klass, school] = await Promise.all([
       this.exams.assertInSchool(examId, schoolId),
       this.prisma.class.findFirst({
         where: { id: classId, schoolId },
         select: { id: true, name: true },
       }),
+      this.prisma.school.findUnique({
+        where: { id: schoolId },
+        select: { id: true, name: true, slug: true, logoUrl: true },
+      }),
     ]);
     if (!klass) {
       throw new NotFoundException('Class not found.');
+    }
+    if (!school) {
+      throw new NotFoundException('School not found.');
     }
 
     // Pull subjects (ledger column order) and roster (row order) in
@@ -401,6 +582,7 @@ export class ResultService {
       return {
         exam: { id: exam.id, name: exam.name },
         class: { id: klass.id, name: klass.name },
+        school,
         subjects,
         students: [],
         generatedAt: new Date().toISOString(),
@@ -465,6 +647,7 @@ export class ResultService {
     return {
       exam: { id: exam.id, name: exam.name },
       class: { id: klass.id, name: klass.name },
+      school,
       subjects,
       students: studentRows,
       generatedAt: new Date().toISOString(),

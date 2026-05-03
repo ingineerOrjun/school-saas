@@ -10,8 +10,11 @@ import {
   Post,
   UseGuards,
 } from '@nestjs/common';
+import { Role } from '@prisma/client';
 import { CurrentUser } from '../common/decorators/current-user.decorator';
 import { JwtAuthGuard } from '../auth/guards/jwt-auth.guard';
+import { RolesGuard } from '../auth/guards/roles.guard';
+import { Roles } from '../common/decorators/roles.decorator';
 import type { AuthenticatedUser } from '../auth/jwt.strategy';
 import { AssignFeeDto } from './dto/assign-fee.dto';
 import { CreateFeeStructureDto } from './dto/create-fee-structure.dto';
@@ -20,8 +23,13 @@ import { UpdateFeeAssignmentDto } from './dto/update-fee-assignment.dto';
 import { UpdatePaymentDto } from './dto/update-payment.dto';
 import { FeesService } from './fees.service';
 
+/**
+ * The entire fees module is admin-only — fee structures, assignments,
+ * payments, dues, and receipts. Teachers don't deal with money.
+ */
 @Controller()
-@UseGuards(JwtAuthGuard)
+@UseGuards(JwtAuthGuard, RolesGuard)
+@Roles(Role.ADMIN)
 export class FeesController {
   constructor(private readonly fees: FeesService) {}
 

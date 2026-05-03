@@ -9,12 +9,12 @@ import {
   ArrowLeft,
   AlertTriangle,
   Loader2,
-  GraduationCap,
 } from "lucide-react";
 import { cn } from "@/lib/utils";
 import { ApiError } from "@/lib/api";
 import { getToken } from "@/lib/auth";
 import { marksheetApi, type Marksheet } from "@/lib/exams";
+import { DocumentLogo } from "@/components/documents/DocumentLogo";
 
 export default function MarksheetPage() {
   const params = useParams<{ examId: string; studentId: string }>();
@@ -154,32 +154,27 @@ function Header({ data }: { data: Marksheet }) {
 
   return (
     <header className="border-b-2 border-slate-900 px-10 py-6">
-      {/* Top band: logo on the left, central title block, issued date
-          on the right. Three-column grid keeps everything visually
-          balanced and prints predictably on A4. */}
-      <div className="grid grid-cols-[auto_1fr_auto] items-center gap-6">
-        {/* Logo placeholder — schools can replace this with their own
-            <img/> by swapping the inner content. The dashed border keeps
-            the slot visible until that's done. */}
-        <div
-          aria-hidden
-          className="flex h-16 w-16 shrink-0 items-center justify-center rounded-md border-2 border-dashed border-slate-400 bg-slate-50 text-slate-500 print:border-solid print:border-slate-700"
-          title="School logo"
-        >
-          <GraduationCap className="h-8 w-8" strokeWidth={1.5} />
-        </div>
+      {/* Stabilized 3-col grid:
+            [64px logo] [centered title, max 60% width] [right meta]
+          `min-w-0` lets the center column shrink so line-clamp can
+          actually trim the school name; `max-w-[60%]` caps the title
+          so it never crowds the side columns even with a very long
+          name. The logo width is fixed by the shared DocumentLogo
+          component (h-16 w-16). */}
+      <div className="grid grid-cols-[64px_1fr_auto] items-center gap-6">
+        <DocumentLogo logoUrl={data.school.logoUrl} />
 
-        <div className="text-center">
+        <div className="min-w-0 mx-auto max-w-[60%] text-center">
           <p className="text-[11px] font-semibold uppercase tracking-[0.25em] text-slate-500">
             Official Marksheet
           </p>
-          <h1 className="mt-1 text-2xl font-bold tracking-tight text-slate-900 uppercase">
+          <h1 className="mt-1 text-2xl font-bold tracking-tight text-slate-900 uppercase line-clamp-2 text-balance break-words">
             {data.school.name}
           </h1>
           <p className="mt-0.5 text-xs text-slate-500">Grade Ledger</p>
         </div>
 
-        <div className="text-right">
+        <div className="text-right shrink-0">
           <p className="text-[10px] font-semibold uppercase tracking-wider text-slate-500">
             Issued
           </p>

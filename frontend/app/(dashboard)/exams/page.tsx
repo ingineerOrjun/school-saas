@@ -15,6 +15,7 @@ import {
   AlertTriangle,
   BookOpen,
   FileText,
+  Users,
 } from "lucide-react";
 import { toast } from "sonner";
 import { cn } from "@/lib/utils";
@@ -27,6 +28,11 @@ import {
   type StudentReport,
 } from "@/lib/exams";
 import { studentsApi, type StudentDto } from "@/lib/students";
+import { getStoredUser } from "@/lib/auth";
+import {
+  teachingAssignmentsApi,
+  type TeachingAssignmentDto,
+} from "@/lib/teaching-assignments";
 import { gpa, gradeWithSplit, overallGrade } from "@/lib/grading";
 import { Button } from "@/components/ui/Button";
 import { Skeleton } from "@/components/ui/Skeleton";
@@ -36,6 +42,10 @@ export default function ExamsPage() {
   const router = useRouter();
   const [exams, setExams] = React.useState<ExamDto[] | null>(null);
   const [students, setStudents] = React.useState<StudentDto[]>([]);
+  // Teacher-only filter set. ADMIN keeps it null → no filtering applied.
+  const [assignments, setAssignments] = React.useState<
+    TeachingAssignmentDto[] | null
+  >(null);
   const [selectedExamId, setSelectedExamId] = React.useState<string>("");
   const [selectedStudentId, setSelectedStudentId] = React.useState<string>("");
   const [marksByStudent, setMarksByStudent] = React.useState<
@@ -50,12 +60,24 @@ export default function ExamsPage() {
     setLoading(true);
     setError(null);
     try {
-      const [examList, studentList] = await Promise.all([
+      // For TEACHER users, also pull their assignments so the student
+      // picker and exam-subject list collapse to what they're allowed
+      // to grade. Admins skip the request entirely.
+      const role = getStoredUser()?.role ?? null;
+      const [examList, studentList, myAssignments] = await Promise.all([
         examsApi.list(),
         studentsApi.list(),
+        role === "TEACHER"
+          ? teachingAssignmentsApi.listMine().catch((err) => {
+              // 403 means "not a teacher row yet" — treat as no scope.
+              if (err instanceof ApiError && err.status === 403) return [];
+              throw err;
+            })
+          : Promise.resolve(null),
       ]);
       setExams(examList);
       setStudents(studentList);
+      setAssignments(myAssignments);
     } catch (err) {
       if (err instanceof ApiError && err.status === 401) {
         router.replace("/login");
@@ -78,6 +100,47 @@ export default function ExamsPage() {
     () => exams?.find((e) => e.id === selectedExamId) ?? null,
     [exams, selectedExamId],
   );
+
+  // Filter students to those a TEACHER can grade. Admin → no filter.
+  const visibleStudents = React.useMemo(
+    () => filterStudentsByAssignments(students, assignments),
+    [students, assignments],
+  );
+
+  const selectedStudent = React.useMemo(
+    () => students.find((s) => s.id === selectedStudentId) ?? null,
+    [students, selectedStudentId],
+  );
+
+  /**
+   * Subject filter — narrows the exam's subject list to ones the
+   * teacher is allowed to grade FOR THE PICKED STUDENT'S CLASS.
+   *
+   * Mirrors the backend's strict rule in `assertResultsEntryAccess`:
+   *   • assignment.classId === student's effective classId
+   *   • AND (assignment.sectionId === student's sectionId OR both null)
+   *   • AND assignment has a subject (subject-less rows can't grade)
+   *   • AND assignment.subject.name (lowercase, trimmed) matches the
+   *     ExamSubject.name
+   *
+   * When no student is picked yet we DON'T filter — the table isn't
+   * rendered until a student is chosen, and showing an unhelpful
+   * "no subjects" message before that step is confusing.
+   *
+   * Admins (assignments === null) always see every subject.
+   */
+  const visibleExamSubjects = React.useMemo(() => {
+    if (!selectedExam) return [];
+    if (assignments === null) return selectedExam.subjects;
+    if (!selectedStudent) return selectedExam.subjects;
+    const allowed = allowedSubjectNamesForStudent(
+      assignments,
+      selectedStudent,
+    );
+    return selectedExam.subjects.filter((s) =>
+      allowed.has(s.name.toLowerCase().trim()),
+    );
+  }, [selectedExam, assignments, selectedStudent]);
 
   // When exam or student changes, fetch any existing report so saved marks
   // pre-fill the inputs.
@@ -188,7 +251,9 @@ export default function ExamsPage() {
 
   const handleSave = async () => {
     if (!selectedExam || !selectedStudentId) return;
-    const entries = selectedExam.subjects
+    // Only submit marks for subjects the teacher is allowed to grade.
+    // Admins see every subject (visibleExamSubjects === selectedExam.subjects).
+    const entries = visibleExamSubjects
       .map((s) => {
         const raw = currentMarks[s.id];
         if (!raw) return null;
@@ -232,9 +297,11 @@ export default function ExamsPage() {
   };
 
   // Live preview computed client-side from the marks currently in inputs.
+  // Iterates only the subjects the teacher is allowed to grade — same
+  // set the save action will submit.
   const livePreview = React.useMemo(() => {
     if (!selectedExam) return null;
-    const rows = selectedExam.subjects.map((s) => {
+    const rows = visibleExamSubjects.map((s) => {
       const raw = currentMarks[s.id] ?? { theory: "", practical: "" };
       const theoryStr = raw.theory;
       const practicalStr = raw.practical;
@@ -359,13 +426,17 @@ export default function ExamsPage() {
                   <select
                     value={selectedStudentId}
                     onChange={(e) => setSelectedStudentId(e.target.value)}
-                    disabled={noStudents}
+                    disabled={visibleStudents.length === 0}
                     className={pickerClasses}
                   >
                     <option value="">
-                      {noStudents ? "No students yet" : "Choose a student…"}
+                      {visibleStudents.length === 0
+                        ? noStudents
+                          ? "No students yet"
+                          : "No students in your assigned classes"
+                        : "Choose a student…"}
                     </option>
-                    {students.map((s) => (
+                    {visibleStudents.map((s) => (
                       <option key={s.id} value={s.id}>
                         {s.firstName} {s.lastName}
                       </option>
@@ -397,7 +468,7 @@ export default function ExamsPage() {
                     onRemove={handleRemoveSubject}
                   />
 
-                  {selectedExam.subjects.length > 0 && !selectedStudentId && (
+                  {visibleExamSubjects.length > 0 && !selectedStudentId && (
                     <div className="glass rounded-xl">
                       <EmptyState
                         icon={<BookOpen className="h-10 w-10" strokeWidth={1.5} />}
@@ -407,7 +478,30 @@ export default function ExamsPage() {
                     </div>
                   )}
 
-                  {selectedExam.subjects.length > 0 &&
+                  {/* When the exam HAS subjects but the teacher's filter
+                      removes them all FOR THE PICKED STUDENT'S CLASS,
+                      show a class-specific message instead of a blank
+                      marks pane. Only fires once a student is selected
+                      — before that the "Choose a student" empty state
+                      above is the right call. Admins never hit this. */}
+                  {selectedStudentId &&
+                    selectedExam.subjects.length > 0 &&
+                    visibleExamSubjects.length === 0 && (
+                      <div className="glass rounded-xl">
+                        <EmptyState
+                          icon={
+                            <AlertCircle
+                              className="h-10 w-10"
+                              strokeWidth={1.5}
+                            />
+                          }
+                          title="No subjects assigned for this class"
+                          description="You don't have a subject assignment that covers this student's class and section. Ask your admin to assign you the subject(s) you teach for this class."
+                        />
+                      </div>
+                    )}
+
+                  {visibleExamSubjects.length > 0 &&
                     selectedStudentId &&
                     livePreview && (
                       <MarksTable
@@ -446,7 +540,17 @@ function Header({ onRefresh }: { onRefresh: () => void }) {
           Enter marks and see Nepal NEB letter grades and GPA instantly.
         </p>
       </div>
-      <div className="flex items-center gap-2">
+      <div className="flex flex-wrap items-center gap-2">
+        {/* Bulk marks entry — alternative workflow for entering one
+            subject across an entire class at once. Per-student entry
+            on this page is unchanged. */}
+        <Link
+          href="/exams/bulk"
+          className="inline-flex h-9 items-center gap-1.5 rounded-md border border-indigo-200 bg-indigo-50 px-3 text-sm font-medium text-indigo-700 hover:border-indigo-300 hover:bg-indigo-100 transition-colors focus-ring"
+        >
+          <Users className="h-3.5 w-3.5" />
+          Bulk marks entry
+        </Link>
         {/* Class result sheet — printable A4 landscape ledger of every
             student in a class for a given exam. Opens in a new tab so
             unsaved marks on this page aren't lost. */}
@@ -1072,5 +1176,82 @@ function ErrorBanner({
         </Button>
       </div>
     </div>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// Teacher-scope filtering helpers
+// ---------------------------------------------------------------------------
+
+/**
+ * Restrict the student list to those a TEACHER can grade. ADMIN passes
+ * `assignments = null` to get the unfiltered list. A student is in
+ * scope when they're covered by at least one of the teacher's
+ * assignments using the same coverage rule the backend enforces:
+ *   • section-bound assignment → student.sectionId must match
+ *   • class-bound assignment   → student.classId === assignment.classId
+ *                                OR student.section.class.id === ...
+ */
+function filterStudentsByAssignments(
+  students: StudentDto[],
+  assignments: TeachingAssignmentDto[] | null,
+): StudentDto[] {
+  if (assignments === null) return students;
+  if (assignments.length === 0) return [];
+
+  const sectionIds = new Set<string>();
+  const classIds = new Set<string>();
+  for (const a of assignments) {
+    if (a.sectionId) sectionIds.add(a.sectionId);
+    else classIds.add(a.classId);
+  }
+
+  return students.filter((s) => {
+    if (s.sectionId && sectionIds.has(s.sectionId)) return true;
+    if (s.classId && classIds.has(s.classId)) return true;
+    if (s.section && classIds.has(s.section.class.id)) return true;
+    return false;
+  });
+}
+
+/**
+ * Set of subject names the teacher is allowed to grade FOR THIS
+ * SPECIFIC STUDENT. Mirrors the backend's `assertResultsEntryAccess`
+ * rule exactly — anything the UI surfaces here will pass server-side
+ * validation; anything stripped here would 403 on save.
+ *
+ * Rule:
+ *   keep assignments where
+ *     classId === student's effective classId
+ *     AND (sectionId === student.sectionId OR BOTH null)
+ *     AND subject !== null
+ *
+ * Then return the lowercase-trimmed set of subject names. Empty set
+ * means "no subjects allowed for this class+section" — the UI shows
+ * the "No subjects assigned for this class" empty state.
+ *
+ * Caller is responsible for skipping this when no student is picked
+ * (we'd return an empty set, which is misleading).
+ */
+function allowedSubjectNamesForStudent(
+  assignments: TeachingAssignmentDto[],
+  student: StudentDto,
+): Set<string> {
+  // Effective class: prefer direct classId, fall back to the section's
+  // parent class. Mirrors the backend's resolution.
+  const studentClassId =
+    student.classId ?? student.section?.class.id ?? null;
+  if (!studentClassId) return new Set();
+  const studentSectionId = student.sectionId ?? null;
+
+  const matching = assignments.filter(
+    (a) =>
+      a.classId === studentClassId &&
+      (a.sectionId ?? null) === studentSectionId &&
+      a.subject !== null,
+  );
+
+  return new Set(
+    matching.map((a) => a.subject!.name.toLowerCase().trim()),
   );
 }

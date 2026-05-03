@@ -16,4 +16,12 @@ export class UpdateTeacherDto {
   @IsOptional()
   @IsUUID()
   userId?: string;
+
+  @IsOptional()
+  @IsUUID()
+  classId?: string | null;
+
+  @IsOptional()
+  @IsUUID()
+  sectionId?: string | null;
 }

@@ -12,9 +12,14 @@ import {
   Query,
   UseGuards,
 } from '@nestjs/common';
+import { Role } from '@prisma/client';
 import { CurrentUser } from '../common/decorators/current-user.decorator';
 import { JwtAuthGuard } from '../auth/guards/jwt-auth.guard';
+import { RolesGuard } from '../auth/guards/roles.guard';
+import { Roles } from '../common/decorators/roles.decorator';
+import { TeacherScopeService } from '../common/auth/teacher-scope.service';
 import type { AuthenticatedUser } from '../auth/jwt.strategy';
+import { BulkSaveResultsDto } from './dto/bulk-save-results.dto';
 import { CreateExamDto } from './dto/create-exam.dto';
 import { CreateSubjectDto } from './dto/create-subject.dto';
 import { QueryLedgerDto } from './dto/query-ledger.dto';
@@ -25,19 +30,29 @@ import { ExamService } from './exam.service';
 import { ResultService } from './result.service';
 import { SubjectService } from './subject.service';
 
+/**
+ * Role rules:
+ *   • Exam CRUD + subject CRUD → ADMIN only.
+ *   • Save results → ADMIN, OR a TEACHER restricted to a student in
+ *     their assigned class (ownership check below).
+ *   • Reads (list / report / marksheet / ledger) → any auth user;
+ *     teacher-class scoping is applied per-request where applicable.
+ */
 @Controller()
-@UseGuards(JwtAuthGuard)
+@UseGuards(JwtAuthGuard, RolesGuard)
 export class ExamsController {
   constructor(
     private readonly exams: ExamService,
     private readonly subjects: SubjectService,
     private readonly results: ResultService,
+    private readonly scope: TeacherScopeService,
   ) {}
 
   // ---------- Exam CRUD ----------
 
   @Post('exams')
   @HttpCode(HttpStatus.CREATED)
+  @Roles(Role.ADMIN)
   createExam(
     @Body() dto: CreateExamDto,
     @CurrentUser() user: AuthenticatedUser,
@@ -51,6 +66,7 @@ export class ExamsController {
   }
 
   @Patch('exams/:id')
+  @Roles(Role.ADMIN)
   updateExam(
     @Param('id', ParseUUIDPipe) id: string,
     @Body() dto: UpdateExamDto,
@@ -61,6 +77,7 @@ export class ExamsController {
 
   @Delete('exams/:id')
   @HttpCode(HttpStatus.NO_CONTENT)
+  @Roles(Role.ADMIN)
   removeExam(
     @Param('id', ParseUUIDPipe) id: string,
     @CurrentUser() user: AuthenticatedUser,
@@ -72,6 +89,7 @@ export class ExamsController {
 
   @Post('exams/:id/subjects')
   @HttpCode(HttpStatus.CREATED)
+  @Roles(Role.ADMIN)
   addSubject(
     @Param('id', ParseUUIDPipe) examId: string,
     @Body() dto: CreateSubjectDto,
@@ -82,6 +100,7 @@ export class ExamsController {
 
   @Delete('exam-subjects/:id')
   @HttpCode(HttpStatus.NO_CONTENT)
+  @Roles(Role.ADMIN)
   removeSubject(
     @Param('id', ParseUUIDPipe) id: string,
     @CurrentUser() user: AuthenticatedUser,
@@ -93,11 +112,50 @@ export class ExamsController {
 
   @Post('results/save')
   @HttpCode(HttpStatus.OK)
-  saveResults(
+  async saveResults(
     @Body() dto: SaveResultsDto,
     @CurrentUser() user: AuthenticatedUser,
   ) {
+    // Strict marks-entry enforcement: the teacher must own a
+    // TeachingAssignment that matches BOTH the student's class+section
+    // AND every subject they're trying to grade. The check is batched
+    // — one round-trip's worth of validation per save call regardless
+    // of how many entries are in the payload. Admins bypass.
+    //
+    // The guard 403s with "You are not assigned to this subject/class"
+    // when any entry's subject isn't in the teacher's allowed set.
+    await this.scope.assertResultsEntryAccess(user, {
+      studentId: dto.studentId,
+      examSubjectIds: dto.entries.map((e) => e.subjectId),
+    });
     return this.results.save(dto, user.schoolId);
+  }
+
+  /**
+   * Bulk marks entry — one subject, many students, one transaction.
+   *
+   * The legacy `POST /results/save` (per-student) endpoint above is
+   * still mounted and unchanged: this is purely additive. The two
+   * coexist because they serve different teacher workflows — one
+   * student deeply (with the full GPA preview) vs. a whole class
+   * shallowly (one subject column at a time).
+   *
+   * Authorization is the LOOSER bulk rule: a class-bound assignment
+   * (assignment.sectionId IS NULL) authorizes any section of the
+   * class. See `assertBulkMarksAccess` for the full rule.
+   */
+  @Post('results/bulk-save')
+  @HttpCode(HttpStatus.OK)
+  async bulkSaveResults(
+    @Body() dto: BulkSaveResultsDto,
+    @CurrentUser() user: AuthenticatedUser,
+  ) {
+    await this.scope.assertBulkMarksAccess(user, {
+      classId: dto.classId,
+      sectionId: dto.sectionId ?? null,
+      examSubjectId: dto.subjectId,
+    });
+    return this.results.bulkSave(dto, user.schoolId);
   }
 
   @Get('results')

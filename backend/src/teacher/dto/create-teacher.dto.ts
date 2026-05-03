@@ -19,4 +19,21 @@ export class CreateTeacherDto {
   @IsOptional()
   @IsUUID()
   userId?: string;
+
+  /**
+   * Optional class assignment. A teacher with a classId can mark
+   * attendance / enter marks for that class. Null = unassigned (the
+   * teacher has read-only access until an admin assigns one).
+   */
+  @IsOptional()
+  @IsUUID()
+  classId?: string | null;
+
+  /**
+   * Optional narrower section scope. When set, section.classId must
+   * equal `classId` — enforced in the service.
+   */
+  @IsOptional()
+  @IsUUID()
+  sectionId?: string | null;
 }

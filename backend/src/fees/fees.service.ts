@@ -161,7 +161,7 @@ export interface Receipt {
   feeStructure: { id: string; name: string; frequency: string } | null;
   /** Null for unlinked payments. */
   feeDetail: ReceiptFeeDetail | null;
-  school: { id: string; name: string; slug: string };
+  school: { id: string; name: string; slug: string; logoUrl: string | null };
   recordedAt: string;
 }
 
@@ -869,7 +869,7 @@ export class FeesService {
             payments: { select: { amount: true } },
           },
         },
-        school: { select: { id: true, name: true, slug: true } },
+        school: { select: { id: true, name: true, slug: true, logoUrl: true } },
       },
     });
     if (!payment) throw new NotFoundException('Payment not found.');
