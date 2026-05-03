@@ -15,6 +15,7 @@ import { ApiError } from "@/lib/api";
 import { getToken } from "@/lib/auth";
 import { marksheetApi, type Marksheet } from "@/lib/exams";
 import { DocumentLogo } from "@/components/documents/DocumentLogo";
+import { formatDual } from "@/lib/date";
 
 export default function MarksheetPage() {
   const params = useParams<{ examId: string; studentId: string }>();
@@ -147,10 +148,13 @@ export default function MarksheetPage() {
 // ---------------------------------------------------------------------------
 
 function Header({ data }: { data: Marksheet }) {
-  const examDate = formatDate(data.examCreatedAt);
+  // Marksheets always print with both calendars (BS primary + AD
+  // parenthetical) regardless of UI preference — they're official
+  // paper artifacts and Nepali parents expect to see the BS date.
+  const examDate = formatDual(data.examCreatedAt);
   // Use the server-issued timestamp — that's the authoritative "issued"
   // moment, not the client's local clock at print time.
-  const issuedDate = formatDate(data.generatedAt);
+  const issuedDate = formatDual(data.generatedAt);
 
   return (
     <header className="border-b-2 border-slate-900 px-10 py-6">

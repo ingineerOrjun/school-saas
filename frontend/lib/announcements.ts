@@ -20,7 +20,17 @@ export interface CreateAnnouncementInput {
 }
 
 export const announcementsApi = {
-  list: () => api<AnnouncementDto[]>("/announcements"),
+  /**
+   * List announcements. Backend strict-defaults to the active
+   * session — pass an explicit `sessionId` to view a previous
+   * year's notices.
+   */
+  list: (sessionId?: string) => {
+    const qs = sessionId
+      ? `?sessionId=${encodeURIComponent(sessionId)}`
+      : "";
+    return api<AnnouncementDto[]>(`/announcements${qs}`);
+  },
   create: (input: CreateAnnouncementInput) =>
     api<AnnouncementDto>("/announcements", {
       method: "POST",

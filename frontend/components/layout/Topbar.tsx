@@ -3,7 +3,6 @@
 import * as React from "react";
 import { useRouter } from "next/navigation";
 import {
-  Bell,
   Search,
   HelpCircle,
   ChevronDown,
@@ -20,6 +19,9 @@ import {
   type SchoolSummary,
 } from "@/lib/auth";
 import { ThemeToggle } from "@/components/theme/ThemeToggle";
+import { CalendarToggle } from "@/components/calendar/CalendarToggle";
+import { SessionSelector } from "@/components/academic-session/SessionSelector";
+import { NotificationsBell } from "./NotificationsBell";
 
 export interface TopbarProps {
   /**
@@ -111,18 +113,28 @@ export function Topbar({ onMobileMenuClick }: TopbarProps) {
         </span>
       )}
 
-      {/* Help + Theme + Notifications. Help hides on mobile to save
-          space; ThemeToggle and Notifications stay because both are
+      {/* Help + Calendar + Theme + Notifications. Help hides on
+          mobile to save space; the rest stay because they're all
           frequently-tapped controls. */}
       <div className="flex items-center gap-1">
+        {/* SessionSelector self-hides when there are no sessions yet,
+            so it adds nothing to the topbar's visual weight on
+            fresh-install schools. Hidden on the smallest screens
+            because the label can be long ("2024-25"). */}
+        <span className="hidden sm:inline-flex">
+          <SessionSelector />
+        </span>
         <IconButton label="Help" className="hidden sm:inline-flex">
           <HelpCircle className="h-[18px] w-[18px]" />
         </IconButton>
+        {/* CalendarToggle hides on the smallest screens — the menu
+            takes ~52px when expanded which crowds the topbar on a
+            375px phone. Settings page can also surface this later. */}
+        <span className="hidden sm:inline-flex">
+          <CalendarToggle />
+        </span>
         <ThemeToggle />
-        <IconButton label="Notifications">
-          <Bell className="h-[18px] w-[18px]" />
-          <span className="absolute top-2 right-2 h-1.5 w-1.5 rounded-full bg-destructive ring-2 ring-surface" />
-        </IconButton>
+        <NotificationsBell />
       </div>
 
       {/* Divider — hide on mobile, the avatar already provides

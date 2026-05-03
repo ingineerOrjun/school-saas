@@ -104,7 +104,17 @@ export interface BulkSaveResultsResult {
 }
 
 export const examsApi = {
-  list: () => api<ExamDto[]>("/exams"),
+  /**
+   * List exams. Backend defaults to the active session when
+   * `sessionId` is omitted (legacy NULL fallback when no session is
+   * active). Pass an explicit id to view a different session.
+   */
+  list: (sessionId?: string) => {
+    const qs = sessionId
+      ? `?sessionId=${encodeURIComponent(sessionId)}`
+      : "";
+    return api<ExamDto[]>(`/exams${qs}`);
+  },
   create: (input: CreateExamInput) =>
     api<ExamDto>("/exams", {
       method: "POST",

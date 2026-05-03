@@ -8,6 +8,7 @@ import {
   Param,
   ParseUUIDPipe,
   Post,
+  Query,
   UseGuards,
 } from '@nestjs/common';
 import { Role } from '@prisma/client';
@@ -33,8 +34,11 @@ export class AnnouncementController {
   constructor(private readonly announcements: AnnouncementService) {}
 
   @Get()
-  list(@CurrentUser() user: AuthenticatedUser) {
-    return this.announcements.list(user.schoolId);
+  list(
+    @CurrentUser() user: AuthenticatedUser,
+    @Query('sessionId') sessionId?: string,
+  ) {
+    return this.announcements.list(user.schoolId, sessionId);
   }
 
   @Post()

@@ -2,6 +2,8 @@ import type { Metadata } from "next";
 import { Inter } from "next/font/google";
 import { Toaster } from "@/components/ui/Toaster";
 import { ThemeProvider, themeScript } from "@/components/theme/ThemeProvider";
+import { CalendarProvider } from "@/components/calendar/CalendarProvider";
+import { AcademicSessionProvider } from "@/components/academic-session/AcademicSessionProvider";
 import "./globals.css";
 
 const inter = Inter({
@@ -45,8 +47,21 @@ export default function RootLayout({
       </head>
       <body>
         <ThemeProvider>
-          {children}
-          <Toaster />
+          {/* CalendarProvider sits inside ThemeProvider so dark-mode
+              toggles don't unmount it (and lose the preference state).
+              Inverse nesting wouldn't matter for correctness — pure
+              ergonomics. */}
+          <CalendarProvider>
+            {/* AcademicSessionProvider fetches the session list from
+                the API on mount, so it sits inside the auth-token-
+                aware layer. The provider tolerates 401 (returns empty
+                list) so it doesn't crash for unauthenticated visitors
+                landing on /login. */}
+            <AcademicSessionProvider>
+              {children}
+              <Toaster />
+            </AcademicSessionProvider>
+          </CalendarProvider>
         </ThemeProvider>
       </body>
     </html>

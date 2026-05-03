@@ -32,9 +32,12 @@ import { SubjectService } from './subject.service';
 
 /**
  * Role rules:
- *   • Exam CRUD + subject CRUD → ADMIN only.
- *   • Save results → ADMIN, OR a TEACHER restricted to a student in
- *     their assigned class (ownership check below).
+ *   • Exam CRUD + exam-subject CRUD → ADMIN + STAFF.
+ *   • Save results (single + bulk) → ADMIN + STAFF + TEACHER.
+ *     - ADMIN/STAFF have school-wide scope (no class restriction).
+ *     - TEACHER restricted to students in their assigned class — the
+ *       ownership check happens inside `assertResultsEntryAccess` /
+ *       `assertBulkMarksAccess`.
  *   • Reads (list / report / marksheet / ledger) → any auth user;
  *     teacher-class scoping is applied per-request where applicable.
  */
@@ -52,32 +55,38 @@ export class ExamsController {
 
   @Post('exams')
   @HttpCode(HttpStatus.CREATED)
-  @Roles(Role.ADMIN)
+  @Roles(Role.ADMIN, Role.STAFF)
   createExam(
     @Body() dto: CreateExamDto,
     @CurrentUser() user: AuthenticatedUser,
   ) {
-    return this.exams.create(dto, user.schoolId);
+    return this.exams.create(dto, user.schoolId, user.id);
   }
 
   @Get('exams')
-  listExams(@CurrentUser() user: AuthenticatedUser) {
-    return this.exams.findAll(user.schoolId);
+  listExams(
+    @CurrentUser() user: AuthenticatedUser,
+    @Query('sessionId') sessionId?: string,
+  ) {
+    // Optional ?sessionId filter — when omitted, every exam in the
+    // school comes back. Backward-compatible with callers that
+    // haven't adopted the session selector yet.
+    return this.exams.findAll(user.schoolId, sessionId);
   }
 
   @Patch('exams/:id')
-  @Roles(Role.ADMIN)
+  @Roles(Role.ADMIN, Role.STAFF)
   updateExam(
     @Param('id', ParseUUIDPipe) id: string,
     @Body() dto: UpdateExamDto,
     @CurrentUser() user: AuthenticatedUser,
   ) {
-    return this.exams.update(id, dto, user.schoolId);
+    return this.exams.update(id, dto, user.schoolId, user.id);
   }
 
   @Delete('exams/:id')
   @HttpCode(HttpStatus.NO_CONTENT)
-  @Roles(Role.ADMIN)
+  @Roles(Role.ADMIN, Role.STAFF)
   removeExam(
     @Param('id', ParseUUIDPipe) id: string,
     @CurrentUser() user: AuthenticatedUser,
@@ -89,7 +98,7 @@ export class ExamsController {
 
   @Post('exams/:id/subjects')
   @HttpCode(HttpStatus.CREATED)
-  @Roles(Role.ADMIN)
+  @Roles(Role.ADMIN, Role.STAFF)
   addSubject(
     @Param('id', ParseUUIDPipe) examId: string,
     @Body() dto: CreateSubjectDto,
@@ -100,7 +109,7 @@ export class ExamsController {
 
   @Delete('exam-subjects/:id')
   @HttpCode(HttpStatus.NO_CONTENT)
-  @Roles(Role.ADMIN)
+  @Roles(Role.ADMIN, Role.STAFF)
   removeSubject(
     @Param('id', ParseUUIDPipe) id: string,
     @CurrentUser() user: AuthenticatedUser,
@@ -128,7 +137,7 @@ export class ExamsController {
       studentId: dto.studentId,
       examSubjectIds: dto.entries.map((e) => e.subjectId),
     });
-    return this.results.save(dto, user.schoolId);
+    return this.results.save(dto, user.schoolId, user.id);
   }
 
   /**
@@ -155,7 +164,7 @@ export class ExamsController {
       sectionId: dto.sectionId ?? null,
       examSubjectId: dto.subjectId,
     });
-    return this.results.bulkSave(dto, user.schoolId);
+    return this.results.bulkSave(dto, user.schoolId, user.id);
   }
 
   @Get('results')

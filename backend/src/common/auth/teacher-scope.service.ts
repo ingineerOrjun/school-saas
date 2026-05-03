@@ -80,10 +80,13 @@ export class TeacherScopeService {
     user: AuthenticatedUser,
     requested: { classId?: string | null; sectionId?: string | null },
   ): Promise<void> {
-    if (user.role === Role.ADMIN) return;
+    // ADMIN and STAFF both have school-wide academic scope — they can
+    // act on any class without a TeachingAssignment row. STAFF is the
+    // mid-level role added for academic ops without full admin reach.
+    if (user.role === Role.ADMIN || user.role === Role.STAFF) return;
     if (user.role !== Role.TEACHER) {
       throw new ForbiddenException(
-        'Only ADMIN and TEACHER roles can perform this action.',
+        'Only ADMIN, STAFF, and TEACHER roles can perform this action.',
       );
     }
 
@@ -136,7 +139,9 @@ export class TeacherScopeService {
     user: AuthenticatedUser,
     studentIds: string[],
   ): Promise<void> {
-    if (user.role === Role.ADMIN) return;
+    // ADMIN + STAFF have school-wide scope — they can act on any
+    // student in the school without a TeachingAssignment row.
+    if (user.role === Role.ADMIN || user.role === Role.STAFF) return;
     if (studentIds.length === 0) return;
 
     const assignments = await this.getAssignments(user);
@@ -196,16 +201,17 @@ export class TeacherScopeService {
    *   name within the school. Once the FK lands this method can switch
    *   to a strict id comparison without changing call sites.
    *
-   * ADMINs bypass.
+   * ADMIN + STAFF both bypass — STAFF is a school-wide academic role
+   * with no per-class restriction.
    */
   async assertResultsEntryAccess(
     user: AuthenticatedUser,
     input: { studentId: string; examSubjectIds: string[] },
   ): Promise<void> {
-    if (user.role === Role.ADMIN) return;
+    if (user.role === Role.ADMIN || user.role === Role.STAFF) return;
     if (user.role !== Role.TEACHER) {
       throw new ForbiddenException(
-        'Only ADMIN and TEACHER roles can enter results.',
+        'Only ADMIN, STAFF, and TEACHER roles can enter results.',
       );
     }
     if (input.examSubjectIds.length === 0) return;
@@ -339,7 +345,8 @@ export class TeacherScopeService {
    * input `examSubjectId` refers to an `ExamSubject.id` (same shape
    * as the per-row save endpoint).
    *
-   * ADMIN bypasses unconditionally.
+   * ADMIN + STAFF bypass unconditionally — both have school-wide
+   * academic scope.
    */
   async assertBulkMarksAccess(
     user: AuthenticatedUser,
@@ -349,10 +356,10 @@ export class TeacherScopeService {
       examSubjectId: string;
     },
   ): Promise<void> {
-    if (user.role === Role.ADMIN) return;
+    if (user.role === Role.ADMIN || user.role === Role.STAFF) return;
     if (user.role !== Role.TEACHER) {
       throw new ForbiddenException(
-        'Only ADMIN and TEACHER roles can enter results.',
+        'Only ADMIN, STAFF, and TEACHER roles can enter results.',
       );
     }
 

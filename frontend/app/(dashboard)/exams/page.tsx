@@ -33,6 +33,7 @@ import {
   teachingAssignmentsApi,
   type TeachingAssignmentDto,
 } from "@/lib/teaching-assignments";
+import { useAcademicSession } from "@/components/academic-session/AcademicSessionProvider";
 import { gpa, gradeWithSplit, overallGrade } from "@/lib/grading";
 import { Button } from "@/components/ui/Button";
 import { Skeleton } from "@/components/ui/Skeleton";
@@ -56,6 +57,10 @@ export default function ExamsPage() {
   const [savedReport, setSavedReport] = React.useState<StudentReport | null>(null);
   const [saving, setSaving] = React.useState(false);
 
+  // Selected session — passed to examsApi.list so switching sessions
+  // in the topbar refetches a different academic year's exams.
+  const { selected: selectedSession } = useAcademicSession();
+
   const refresh = React.useCallback(async () => {
     setLoading(true);
     setError(null);
@@ -65,7 +70,7 @@ export default function ExamsPage() {
       // to grade. Admins skip the request entirely.
       const role = getStoredUser()?.role ?? null;
       const [examList, studentList, myAssignments] = await Promise.all([
-        examsApi.list(),
+        examsApi.list(selectedSession?.id),
         studentsApi.list(),
         role === "TEACHER"
           ? teachingAssignmentsApi.listMine().catch((err) => {
@@ -90,7 +95,9 @@ export default function ExamsPage() {
     } finally {
       setLoading(false);
     }
-  }, [router]);
+    // selectedSession.id in deps so the user switching academic
+    // session in the topbar triggers a fresh fetch.
+  }, [router, selectedSession?.id]);
 
   React.useEffect(() => {
     refresh();

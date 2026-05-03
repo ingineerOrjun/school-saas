@@ -31,6 +31,9 @@ export class AttendanceController {
   async findRoster(
     @Query() query: GetAttendanceQueryDto,
     @CurrentUser() user: AuthenticatedUser,
+    // Optional override — when omitted, the service applies the
+    // strict-default rule (active session, or NULL legacy fallback).
+    @Query('sessionId') sessionId?: string,
   ) {
     // Teacher scope check — passes through both ids so the service
     // can apply section-bound vs class-bound rules.
@@ -42,6 +45,7 @@ export class AttendanceController {
       query.date,
       { sectionId: query.sectionId, classId: query.classId },
       user.schoolId,
+      sessionId,
     );
   }
 
@@ -74,6 +78,7 @@ export class AttendanceController {
   async getReport(
     @Query() query: ReportQueryDto,
     @CurrentUser() user: AuthenticatedUser,
+    @Query('sessionId') sessionId?: string,
   ) {
     if (query.studentId) {
       await this.scope.assertStudentsInScope(user, [query.studentId]);
@@ -83,7 +88,7 @@ export class AttendanceController {
         sectionId: query.sectionId,
       });
     }
-    return this.attendance.getReport(query, user.schoolId);
+    return this.attendance.getReport(query, user.schoolId, sessionId);
   }
 }
 

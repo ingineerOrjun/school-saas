@@ -1,10 +1,12 @@
 "use client";
 
 import * as React from "react";
+import Link from "next/link";
 import { useRouter } from "next/navigation";
 import {
   BookOpen,
   Building2,
+  CalendarRange,
   GraduationCap,
   Image as ImageIcon,
   Loader2,
@@ -26,6 +28,7 @@ import { usersApi, type UserDto } from "@/lib/users";
 import { Button } from "@/components/ui/Button";
 import { Input } from "@/components/ui/Input";
 import { Skeleton } from "@/components/ui/Skeleton";
+import { DualDate } from "@/components/calendar/DualDate";
 import { cn } from "@/lib/utils";
 
 /**
@@ -68,12 +71,44 @@ export default function SettingsPage() {
     <div className="space-y-6">
       <Header />
       <SchoolProfileSection />
+      <AcademicSessionsLink />
       {/* Subjects catalog must exist before AssignmentsDialog can offer
           subject-scoped TeachingAssignments. Putting it before Users
           surfaces it during the natural admin onboarding flow. */}
       <SubjectsSection />
       <UsersSection currentUserId={getStoredUser()?.id ?? null} />
     </div>
+  );
+}
+
+/**
+ * Pointer card to the dedicated /settings/sessions page. Kept tiny —
+ * sessions deserve a dedicated surface (CRUD + activate flow), and
+ * cluttering the main settings page with a third inline manager
+ * would push Users below the fold.
+ */
+function AcademicSessionsLink() {
+  return (
+    <Link
+      href="/settings/sessions"
+      className="block rounded-xl border border-border bg-surface p-6 hover:border-primary/40 hover:bg-muted/40 transition-colors focus-ring animate-fade-in-up"
+    >
+      <div className="flex items-center gap-3">
+        <span className="flex h-9 w-9 items-center justify-center rounded-md bg-primary/10 text-primary">
+          <CalendarRange className="h-5 w-5" />
+        </span>
+        <div className="flex-1 min-w-0">
+          <h2 className="text-md font-semibold tracking-tight text-foreground">
+            Academic sessions
+          </h2>
+          <p className="text-sm text-muted-foreground">
+            Manage academic years and pick the one that drives new
+            exams, attendance, and announcements.
+          </p>
+        </div>
+        <span className="text-xs text-muted-foreground">Open →</span>
+      </div>
+    </Link>
   );
 }
 
@@ -732,7 +767,7 @@ function UsersSection({ currentUserId }: { currentUserId: string | null }) {
                     )}
                   </div>
                   <p className="text-xs text-muted-foreground">
-                    Joined {formatDate(u.createdAt)}
+                    Joined <DualDate date={u.createdAt} />
                   </p>
                 </div>
                 <RoleBadge role={u.role} />
@@ -752,6 +787,7 @@ function UsersSection({ currentUserId }: { currentUserId: string | null }) {
                     )}
                   >
                     <option value="ADMIN">Admin</option>
+                    <option value="STAFF">Staff</option>
                     <option value="TEACHER">Teacher</option>
                   </select>
                   {isSaving && (
@@ -792,15 +828,19 @@ function UserAvatar({ email, role }: { email: string; role: Role }) {
 function RoleBadge({ role }: { role: Role }) {
   const labels: Record<Role, string> = {
     ADMIN: "Admin",
+    STAFF: "Staff",
     TEACHER: "Teacher",
     STUDENT: "Student",
     PARENT: "Parent",
   };
   const tones: Record<Role, string> = {
     ADMIN: "bg-primary/10 text-primary",
-    TEACHER: "bg-emerald-500/10 text-emerald-700",
-    STUDENT: "bg-sky-500/10 text-sky-700",
-    PARENT: "bg-amber-500/10 text-amber-700",
+    // STAFF — calmer indigo tone so it reads as "admin-adjacent"
+    // without being mistaken for full admin.
+    STAFF: "bg-violet-500/10 text-violet-700 dark:text-violet-400",
+    TEACHER: "bg-emerald-500/10 text-emerald-700 dark:text-emerald-400",
+    STUDENT: "bg-sky-500/10 text-sky-700 dark:text-sky-400",
+    PARENT: "bg-amber-500/10 text-amber-700 dark:text-amber-400",
   };
   return (
     <span

@@ -33,10 +33,14 @@ type NavItem = {
 const primary: NavItem[] = [
   { label: "Dashboard", href: "/dashboard", icon: LayoutDashboard },
   { label: "Students", href: "/students", icon: Users },
-  // Teachers + Classes are admin-config surfaces; non-admin users
-  // shouldn't see them in the nav.
+  // Teachers + Classes are admin-config surfaces — STAFF doesn't
+  // manage either of them per the role spec.
   { label: "Teachers", href: "/teachers", icon: GraduationCap, requiresRole: ["ADMIN"] },
   { label: "Classes", href: "/classes", icon: BookOpen, requiresRole: ["ADMIN"] },
+  // Subjects: shared admin/staff academic catalog. Hidden from teachers
+  // since they can't write here and the dropdowns where they'd consume
+  // it (assignment dialog) aren't theirs to use either.
+  { label: "Subjects", href: "/subjects", icon: BookOpen, requiresRole: ["ADMIN", "STAFF"] },
   { label: "Attendance", href: "/attendance", icon: CalendarCheck },
   { label: "Exams", href: "/exams", icon: ClipboardList },
   // Fees + receipts are financial — admin-only per the role spec.

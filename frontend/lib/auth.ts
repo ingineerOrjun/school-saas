@@ -6,7 +6,17 @@ const TOKEN_KEY = "scholaris:token";
 const USER_KEY = "scholaris:user";
 const SCHOOL_KEY = "scholaris:school";
 
-export type Role = "ADMIN" | "TEACHER" | "STUDENT" | "PARENT";
+/**
+ * Role hierarchy:
+ *   • ADMIN   — full access (school config, users, fees, everything).
+ *   • STAFF   — mid-level academic role. Manages subjects, exams,
+ *               and enters results/attendance for ANY class without
+ *               a teacher-scope check. Cannot manage students, fees,
+ *               users, classes, or teachers.
+ *   • TEACHER — class-bound. Acts only on TeachingAssignment scope.
+ *   • STUDENT / PARENT — read-only roles, not yet wired into the UI.
+ */
+export type Role = "ADMIN" | "STAFF" | "TEACHER" | "STUDENT" | "PARENT";
 
 export interface SafeUser {
   id: string;

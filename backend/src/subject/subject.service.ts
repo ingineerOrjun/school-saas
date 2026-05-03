@@ -13,18 +13,29 @@ import { UpdateSubjectDto } from './dto/update-subject.dto';
  * "this teacher teaches Math to Class 8" — without subject the teacher
  * is treated as a class-teacher (attendance only, no exam writes).
  *
- * The `ExamSubject` table (per-exam subject row with full marks) does
- * NOT yet link to this catalog — that's a separate migration. For now
- * Subject is a standalone catalog used only by TeachingAssignment.
+ * Audit: every create populates `createdById` + `updatedById`; every
+ * update bumps `updatedById`. The `userId` parameter on the write
+ * methods comes from `req.user.id` in the controller layer.
  */
 @Injectable()
 export class SubjectService {
   constructor(private readonly prisma: PrismaService) {}
 
-  async create(dto: CreateSubjectDto, schoolId: string): Promise<Subject> {
+  async create(
+    dto: CreateSubjectDto,
+    schoolId: string,
+    userId: string,
+  ): Promise<Subject> {
     try {
       return await this.prisma.subject.create({
-        data: { name: dto.name.trim(), schoolId },
+        data: {
+          name: dto.name.trim(),
+          schoolId,
+          // Both audit fields point at the same user on insert —
+          // the creator is also the most-recent editor by definition.
+          createdById: userId,
+          updatedById: userId,
+        },
       });
     } catch (e) {
       if (isUniqueViolation(e)) {
@@ -47,12 +58,18 @@ export class SubjectService {
     id: string,
     dto: UpdateSubjectDto,
     schoolId: string,
+    userId: string,
   ): Promise<Subject> {
     await this.assertInSchool(id, schoolId);
     try {
       return await this.prisma.subject.update({
         where: { id },
-        data: { name: dto.name?.trim() },
+        data: {
+          name: dto.name?.trim(),
+          // Stamp the editor on every update — even a "rename" is
+          // worth attributing for audit trails.
+          updatedById: userId,
+        },
       });
     } catch (e) {
       if (isUniqueViolation(e)) {

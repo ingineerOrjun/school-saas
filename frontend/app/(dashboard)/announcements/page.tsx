@@ -22,6 +22,8 @@ import { Input } from "@/components/ui/Input";
 import { Modal } from "@/components/ui/Modal";
 import { Skeleton } from "@/components/ui/Skeleton";
 import { EmptyState } from "@/components/ui/EmptyState";
+import { DualDate } from "@/components/calendar/DualDate";
+import { useAcademicSession } from "@/components/academic-session/AcademicSessionProvider";
 import { cn } from "@/lib/utils";
 
 /**
@@ -53,11 +55,17 @@ export default function AnnouncementsPage() {
   }, []);
   const isAdmin = role === "ADMIN";
 
+  // Selected session drives the feed filter — switching sessions in
+  // the topbar refetches with the new id. `selected` may be null
+  // briefly during the provider's initial load; the API call still
+  // works (backend applies its strict-default rule).
+  const { selected: selectedSession } = useAcademicSession();
+
   const refresh = React.useCallback(async () => {
     setLoading(true);
     setError(null);
     try {
-      const data = await announcementsApi.list();
+      const data = await announcementsApi.list(selectedSession?.id);
       setList(data);
     } catch (err) {
       if (err instanceof ApiError && err.status === 401) {
@@ -75,8 +83,9 @@ export default function AnnouncementsPage() {
     } finally {
       setLoading(false);
     }
-  }, [router]);
+  }, [router, selectedSession?.id]);
 
+  // Re-fetch when the user switches academic session in the topbar.
   React.useEffect(() => {
     void refresh();
   }, [refresh]);
@@ -279,7 +288,7 @@ function AnnouncementCard({
               </h2>
               <p className="mt-0.5 text-xs text-muted-foreground">
                 Posted {formatRelative(announcement.createdAt)} ·{" "}
-                {formatExact(announcement.createdAt)}
+                <DualDate date={announcement.createdAt} />
               </p>
             </div>
           </div>

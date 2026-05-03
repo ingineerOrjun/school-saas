@@ -2,6 +2,7 @@ import { Module } from '@nestjs/common';
 import { ConfigModule } from '@nestjs/config';
 import { ServeStaticModule } from '@nestjs/serve-static';
 import { join } from 'node:path';
+import { AcademicSessionModule } from './academic-session/academic-session.module';
 import { AnnouncementModule } from './announcement/announcement.module';
 import { AuthModule } from './auth/auth.module';
 import { TeacherScopeModule } from './common/auth/teacher-scope.module';
@@ -13,6 +14,7 @@ import { DashboardModule } from './dashboard/dashboard.module';
 import { ExamsModule } from './exams/exams.module';
 import { FeesModule } from './fees/fees.module';
 import { GradingModule } from './grading/grading.module';
+import { PromotionModule } from './promotion/promotion.module';
 import { SchoolModule } from './school/school.module';
 import { SectionModule } from './section/section.module';
 import { StudentModule } from './student/student.module';
@@ -43,6 +45,7 @@ import { UserModule } from './user/user.module';
     DatabaseModule,
     AuthModule,
     TeacherScopeModule,
+    AcademicSessionModule,
     StudentModule,
     TeacherModule,
     ClassModule,
@@ -57,6 +60,7 @@ import { UserModule } from './user/user.module';
     SchoolModule,
     UserModule,
     AnnouncementModule,
+    PromotionModule,
     // Future feature modules will be added here
   ],
   controllers: [],

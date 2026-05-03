@@ -32,6 +32,7 @@ import {
 import { Button } from "@/components/ui/Button";
 import { Skeleton } from "@/components/ui/Skeleton";
 import { EmptyState } from "@/components/ui/EmptyState";
+import { DualDate } from "@/components/calendar/DualDate";
 
 /**
  * Composite scope identifier for the roster dropdown. Encoded as a
@@ -318,7 +319,7 @@ export default function AttendancePage() {
 
       {/* Controls */}
       <div className="glass rounded-xl p-4 flex flex-col gap-3 sm:flex-row sm:items-end animate-fade-in-up">
-        <div className="flex flex-col gap-1.5 sm:w-48">
+        <div className="flex flex-col gap-1.5 sm:w-56">
           <label className="text-xs font-semibold uppercase tracking-wider text-muted-foreground">
             Date
           </label>
@@ -336,6 +337,13 @@ export default function AttendancePage() {
               )}
             />
           </div>
+          {/* Show the picked date in the user's preferred calendar
+              under the input. The native picker is locked to A.D., so
+              this is how Nepali admins see the BS equivalent without
+              us writing a custom calendar widget. */}
+          <p className="text-[11px] text-muted-foreground">
+            <DualDate date={date} />
+          </p>
         </div>
 
         <div className="flex-1 flex flex-col gap-1.5">

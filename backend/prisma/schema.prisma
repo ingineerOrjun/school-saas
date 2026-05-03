@@ -20,6 +20,11 @@ datasource db {
 
 enum Role {
   ADMIN
+  /// Mid-level academic role. STAFF can manage subjects, exams, and
+  /// enter results / attendance for ANY class (no teacher-scope check).
+  /// Cannot manage students, fees, users, classes, or teachers — those
+  /// stay admin-only.
+  STAFF
   TEACHER
   STUDENT
   PARENT
@@ -55,6 +60,16 @@ enum FeeFrequency {
   ONE_TIME
 }
 
+/// Outcome of an academic session for a single student. Set when
+/// promotion runs; immutable history afterwards.
+enum StudentSessionStatus {
+  PROMOTED
+  RETAINED
+  /// Withdrew or transferred mid-session — record exists for the
+  /// year that was attended, but no class change is applied.
+  LEFT
+}
+
 enum PaymentMethod {
   CASH
   BANK
@@ -86,8 +101,10 @@ model School {
   teachingAssignments TeachingAssignment[]
   feeStructures       FeeStructure[]
   feeAssignments      FeeAssignment[]
-  payments            Payment[]
-  announcements       Announcement[]
+  payments               Payment[]
+  announcements          Announcement[]
+  academicSessions       AcademicSession[]
+  studentAcademicRecords StudentAcademicRecord[]
 
   @@map("schools")
 }
@@ -108,6 +125,17 @@ model User {
   // 1:1 profile rows (a user is either a teacher or a student, never both)
   student Student?
   teacher Teacher?
+
+  // Audit back-relations. Named explicitly with `relation("…")` because
+  // each target model has TWO foreign keys pointing at User
+  // (createdById + updatedById) — Prisma needs the disambiguators.
+  // Use `@@ignore`-equivalent of "no FK constraint name collisions".
+  subjectsCreated     Subject[]      @relation("SubjectCreatedBy")
+  subjectsUpdated     Subject[]      @relation("SubjectUpdatedBy")
+  examsCreated        Exam[]         @relation("ExamCreatedBy")
+  examsUpdated        Exam[]         @relation("ExamUpdatedBy")
+  resultsCreated      Result[]       @relation("ResultCreatedBy")
+  resultsUpdated      Result[]       @relation("ResultUpdatedBy")
 
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
@@ -167,6 +195,7 @@ model Student {
   results        Result[]
   feeAssignments FeeAssignment[]
   payments       Payment[]
+  academicRecords StudentAcademicRecord[]
 
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
@@ -194,6 +223,7 @@ model Class {
   teachers            Teacher[]
   teachingAssignments TeachingAssignment[]
   feeStructures       FeeStructure[]
+  academicRecords     StudentAcademicRecord[]
 
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
@@ -213,6 +243,7 @@ model Section {
   students            Student[]
   teachers            Teacher[]
   teachingAssignments TeachingAssignment[]
+  academicRecords     StudentAcademicRecord[]
 
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
@@ -238,11 +269,17 @@ model Attendance {
   schoolId String @db.Uuid
   school   School @relation(fields: [schoolId], references: [id], onDelete: Cascade)
 
+  /// Academic session — defaults to the active session at write
+  /// time. Reports filter by this when comparing year-over-year.
+  sessionId String?          @db.Uuid
+  session   AcademicSession? @relation(fields: [sessionId], references: [id], onDelete: SetNull)
+
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
 
   @@unique([studentId, date])
   @@index([schoolId, date])
+  @@index([schoolId, sessionId, date])
   @@map("attendance")
 }
 
@@ -260,11 +297,26 @@ model Exam {
   subjects ExamSubject[]
   results  Result[]
 
+  /// Audit. Same nullable + SetNull pattern as Subject — see comment
+  /// on Subject for the reasoning.
+  createdById String? @db.Uuid
+  createdBy   User?   @relation("ExamCreatedBy", fields: [createdById], references: [id], onDelete: SetNull)
+  updatedById String? @db.Uuid
+  updatedBy   User?   @relation("ExamUpdatedBy", fields: [updatedById], references: [id], onDelete: SetNull)
+
+  /// Academic session this exam belongs to. Nullable: existing rows
+  /// from before the session feature have no session attached. New
+  /// writes default to the active session; SetNull on session delete
+  /// so removing a session detaches its exams instead of cascading.
+  sessionId String?         @db.Uuid
+  session   AcademicSession? @relation(fields: [sessionId], references: [id], onDelete: SetNull)
+
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
 
   @@unique([schoolId, name])
   @@index([schoolId])
+  @@index([schoolId, sessionId])
   @@map("exams")
 }
 
@@ -310,12 +362,27 @@ model Result {
   letterGrade    LetterGrade
   gradePoint     Float
 
+  /// Audit. Particularly useful for results since they're often
+  /// disputed — knowing which teacher / staff / admin entered or
+  /// last edited a mark is important for compliance.
+  createdById String? @db.Uuid
+  createdBy   User?   @relation("ResultCreatedBy", fields: [createdById], references: [id], onDelete: SetNull)
+  updatedById String? @db.Uuid
+  updatedBy   User?   @relation("ResultUpdatedBy", fields: [updatedById], references: [id], onDelete: SetNull)
+
+  /// Academic session — denormalized from the parent Exam so result
+  /// queries can filter by session without a join. Set to the exam's
+  /// session at insert time; left untouched on later edits.
+  sessionId String?          @db.Uuid
+  session   AcademicSession? @relation(fields: [sessionId], references: [id], onDelete: SetNull)
+
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
 
   @@unique([studentId, subjectId])
   @@index([examId])
   @@index([studentId])
+  @@index([sessionId])
   @@map("results")
 }
 
@@ -388,6 +455,16 @@ model Subject {
   school   School @relation(fields: [schoolId], references: [id], onDelete: Cascade)
 
   teachingAssignments TeachingAssignment[]
+
+  /// Audit: who originally created this row + who last touched it.
+  /// Both nullable: existing rows from before this migration have
+  /// no creator on file, and we'd rather keep the row than fabricate
+  /// one. SetNull on user delete so removing a teacher/admin doesn't
+  /// nuke the subject they once created.
+  createdById String? @db.Uuid
+  createdBy   User?   @relation("SubjectCreatedBy", fields: [createdById], references: [id], onDelete: SetNull)
+  updatedById String? @db.Uuid
+  updatedBy   User?   @relation("SubjectUpdatedBy", fields: [updatedById], references: [id], onDelete: SetNull)
 
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
@@ -572,11 +649,112 @@ model Announcement {
   schoolId String @db.Uuid
   school   School @relation(fields: [schoolId], references: [id], onDelete: Cascade)
 
+  /// Optional session scope. Many announcements span sessions
+  /// ("Welcome back!" in early-year etc.) so this is purely a
+  /// classifier — the announcements feed doesn't filter on it by
+  /// default. Defaults to the active session at write time.
+  sessionId String?          @db.Uuid
+  session   AcademicSession? @relation(fields: [sessionId], references: [id], onDelete: SetNull)
+
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
 
   // Listed newest-first; the (schoolId, createdAt) pair makes the
   // tenant-scoped feed query an index-only seek-and-scan.
   @@index([schoolId, createdAt])
+  @@index([schoolId, sessionId])
   @@map("announcements")
+}
+
+// -----------------------------------------------------------------------------
+// Academic sessions (multi-year support)
+// -----------------------------------------------------------------------------
+
+/// One academic year per school. Drives report scoping and the
+/// promotion workflow. The "active" flag is the school's current
+/// session — exactly one row per school can have it set, enforced by
+/// a partial unique index in the migration.
+///
+/// Existing rows on the four target tables (Exam, Result, Attendance,
+/// Announcement) carry sessionId = NULL until explicitly assigned
+/// — the queries that filter by session treat NULL as "any session"
+/// to keep legacy data visible during the transition.
+model AcademicSession {
+  id        String   @id @default(uuid()) @db.Uuid
+  /// Display label — e.g. "2082/83" or "2024-25". Unique per school.
+  name      String   @db.VarChar(40)
+  startDate DateTime @db.Date
+  endDate   DateTime @db.Date
+  isActive  Boolean  @default(false)
+
+  /// When true, the session is read-only: attendance writes,
+  /// marks updates, and exam edits/creates all reject. Lock is
+  /// the precondition for running promotion — admins lock the
+  /// year, double-check the books, then run promotion to roll
+  /// students into the next session.
+  isLocked  Boolean  @default(false)
+
+  schoolId String @db.Uuid
+  school   School @relation(fields: [schoolId], references: [id], onDelete: Cascade)
+
+  // Children — back-relations for the tables that gain a sessionId.
+  // SetNull on session delete (defined on the FK side) for the
+  // historical records; cascade for the academic records (those are
+  // session-shaped data, no point keeping orphans).
+  exams           Exam[]
+  results         Result[]
+  attendance      Attendance[]
+  announcements   Announcement[]
+  academicRecords StudentAcademicRecord[]
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@unique([schoolId, name])
+  @@index([schoolId])
+  @@index([schoolId, isActive])
+  @@map("academic_sessions")
+}
+
+/// Per-student per-session history row. Captures the class the
+/// student WAS IN during the session (snapshot at promotion time)
+/// plus the outcome (promoted / retained / left). Immutable once
+/// written — never edited, never deleted (cascade-on-delete only
+/// kicks if the parent session/student is removed).
+///
+/// `(studentId, sessionId)` is unique — exactly one outcome per
+/// student per academic year.
+model StudentAcademicRecord {
+  id String @id @default(uuid()) @db.Uuid
+
+  studentId String  @db.Uuid
+  student   Student @relation(fields: [studentId], references: [id], onDelete: Cascade)
+
+  sessionId String          @db.Uuid
+  session   AcademicSession @relation(fields: [sessionId], references: [id], onDelete: Cascade)
+
+  /// Class the student was in DURING this session. Snapshot — does
+  /// NOT update if the class is later renamed (we want the historical
+  /// truth, not the current display).
+  classId String @db.Uuid
+  class   Class  @relation(fields: [classId], references: [id], onDelete: Cascade)
+
+  /// Optional section snapshot. Null when the school doesn't use
+  /// sections or the student wasn't placed in one.
+  sectionId String?  @db.Uuid
+  section   Section? @relation(fields: [sectionId], references: [id], onDelete: SetNull)
+
+  schoolId String @db.Uuid
+  school   School @relation(fields: [schoolId], references: [id], onDelete: Cascade)
+
+  status StudentSessionStatus @default(PROMOTED)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@unique([studentId, sessionId])
+  @@index([sessionId])
+  @@index([classId])
+  @@index([schoolId])
+  @@map("student_academic_records")
 }

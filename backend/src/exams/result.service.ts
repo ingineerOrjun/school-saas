@@ -5,6 +5,7 @@ import {
 } from '@nestjs/common';
 import { LetterGrade, Result } from '@prisma/client';
 import { PrismaService } from '../database/prisma.service';
+import { AcademicSessionService } from '../academic-session/academic-session.service';
 import { GradingService } from '../grading/grading.service';
 import { ExamService } from './exam.service';
 import { BulkSaveResultsDto } from './dto/bulk-save-results.dto';
@@ -119,16 +120,29 @@ export class ResultService {
     private readonly prisma: PrismaService,
     private readonly grading: GradingService,
     private readonly exams: ExamService,
+    private readonly sessions: AcademicSessionService,
   ) {}
 
   /**
    * Upsert results for a student across multiple subjects.
    * Grade data is always computed server-side from `marks` — clients can
    * display their own preview, but the server is authoritative.
+   *
+   * Audit: `createdById` is set on the INSERT path only (preserves the
+   * original author when a row is later edited); `updatedById` is set
+   * on BOTH paths so every save stamps the most-recent editor.
    */
-  async save(dto: SaveResultsDto, schoolId: string): Promise<StudentReport> {
+  async save(
+    dto: SaveResultsDto,
+    schoolId: string,
+    userId: string,
+  ): Promise<StudentReport> {
     // Tenant guards.
     const exam = await this.exams.assertInSchool(dto.examId, schoolId);
+    // Lock guard — once a session is locked, marks updates are
+    // frozen even if there's a different active session. The exam
+    // remains in its original session for life.
+    await this.sessions.assertSessionUnlocked(exam.sessionId);
 
     const student = await this.prisma.student.findFirst({
       where: { id: dto.studentId, schoolId },
@@ -162,6 +176,12 @@ export class ResultService {
       );
     }
     const subjectById = new Map(subjects.map((s) => [s.id, s]));
+
+    // Denormalize the parent exam's session onto every Result row
+    // so result-side queries don't need to JOIN through Exam.
+    // Stamped on insert only (the update path leaves it alone — the
+    // exam can't change sessions mid-life).
+    const sessionId = exam.sessionId ?? null;
 
     // Validate per-component ranges, apply NEB theory+practical pass rule,
     // then upsert each result.
@@ -209,6 +229,11 @@ export class ResultService {
             percentage,
             letterGrade,
             gradePoint,
+            // First save → record the original author. Both audit
+            // fields point at the same user on insert.
+            createdById: userId,
+            updatedById: userId,
+            sessionId,
           },
           update: {
             theoryMarks,
@@ -216,6 +241,9 @@ export class ResultService {
             percentage,
             letterGrade,
             gradePoint,
+            // Edit path leaves `createdById` alone so the original
+            // author is preserved. Only `updatedById` rolls forward.
+            updatedById: userId,
           },
           select: { id: true },
         });
@@ -254,9 +282,12 @@ export class ResultService {
   async bulkSave(
     dto: BulkSaveResultsDto,
     schoolId: string,
+    userId: string,
   ): Promise<{ successCount: number }> {
     // 1. Tenant guards.
     const exam = await this.exams.assertInSchool(dto.examId, schoolId);
+    // Same lock guard as the per-row save above — see comment there.
+    await this.sessions.assertSessionUnlocked(exam.sessionId);
 
     const klass = await this.prisma.class.findFirst({
       where: { id: dto.classId, schoolId },
@@ -324,6 +355,10 @@ export class ResultService {
       );
     }
 
+    // Denormalize the parent exam's session onto every Result row —
+    // same rule as the per-row save above.
+    const sessionId = exam.sessionId ?? null;
+
     // 5. Validate marks per entry, then upsert atomically.
     await this.prisma.$transaction(
       dto.entries.map((entry) => {
@@ -370,6 +405,12 @@ export class ResultService {
             percentage,
             letterGrade,
             gradePoint,
+            // Same audit pattern as the per-row save: stamp both on
+            // insert; only updatedById on edit so the original author
+            // survives later corrections.
+            createdById: userId,
+            updatedById: userId,
+            sessionId,
           },
           update: {
             theoryMarks,
@@ -377,6 +418,7 @@ export class ResultService {
             percentage,
             letterGrade,
             gradePoint,
+            updatedById: userId,
           },
           select: { id: true },
         });

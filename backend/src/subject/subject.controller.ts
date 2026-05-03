@@ -24,7 +24,8 @@ import { SubjectService } from './subject.service';
 /**
  * Subject CRUD. Read access is open to any authenticated user (teachers
  * need the catalog to populate their assignment dropdowns); writes are
- * admin-only — same convention as the other config-surface endpoints.
+ * ADMIN + STAFF — STAFF is the mid-level academic role that owns the
+ * subject catalog without full admin access.
  */
 @Controller('subjects')
 @UseGuards(JwtAuthGuard, RolesGuard)
@@ -38,27 +39,27 @@ export class SubjectController {
 
   @Post()
   @HttpCode(HttpStatus.CREATED)
-  @Roles(Role.ADMIN)
+  @Roles(Role.ADMIN, Role.STAFF)
   create(
     @Body() dto: CreateSubjectDto,
     @CurrentUser() user: AuthenticatedUser,
   ) {
-    return this.subjects.create(dto, user.schoolId);
+    return this.subjects.create(dto, user.schoolId, user.id);
   }
 
   @Patch(':id')
-  @Roles(Role.ADMIN)
+  @Roles(Role.ADMIN, Role.STAFF)
   update(
     @Param('id', ParseUUIDPipe) id: string,
     @Body() dto: UpdateSubjectDto,
     @CurrentUser() user: AuthenticatedUser,
   ) {
-    return this.subjects.update(id, dto, user.schoolId);
+    return this.subjects.update(id, dto, user.schoolId, user.id);
   }
 
   @Delete(':id')
   @HttpCode(HttpStatus.NO_CONTENT)
-  @Roles(Role.ADMIN)
+  @Roles(Role.ADMIN, Role.STAFF)
   remove(
     @Param('id', ParseUUIDPipe) id: string,
     @CurrentUser() user: AuthenticatedUser,

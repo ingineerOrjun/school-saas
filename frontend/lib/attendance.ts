@@ -92,10 +92,15 @@ export interface RosterScope {
 }
 
 export const attendanceApi = {
-  getRoster: (date: string, scope: RosterScope) => {
+  /**
+   * Roster for a date + scope. Backend strict-defaults to the
+   * active session; pass `sessionId` to view a different year.
+   */
+  getRoster: (date: string, scope: RosterScope, sessionId?: string) => {
     const params = new URLSearchParams({ date });
     if (scope.sectionId) params.set("sectionId", scope.sectionId);
     else if (scope.classId) params.set("classId", scope.classId);
+    if (sessionId) params.set("sessionId", sessionId);
     return api<AttendanceRoster[]>(`/attendance?${params.toString()}`);
   },
   mark: (input: MarkAttendanceInput) =>
@@ -103,7 +108,7 @@ export const attendanceApi = {
       method: "POST",
       body: JSON.stringify(input),
     }),
-  getReport: (q: ReportQuery) => {
+  getReport: (q: ReportQuery, sessionId?: string) => {
     const params = new URLSearchParams({
       fromDate: q.fromDate,
       toDate: q.toDate,
@@ -111,6 +116,7 @@ export const attendanceApi = {
     if (q.sectionId) params.set("sectionId", q.sectionId);
     else if (q.classId) params.set("classId", q.classId);
     if (q.studentId) params.set("studentId", q.studentId);
+    if (sessionId) params.set("sessionId", sessionId);
     return api<AttendanceReport>(`/attendance/report?${params.toString()}`);
   },
 };

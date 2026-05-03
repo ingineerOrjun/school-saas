@@ -4,6 +4,7 @@ import {
   NotFoundException,
 } from '@nestjs/common';
 import { AttendanceStatus, Prisma } from '@prisma/client';
+import { AcademicSessionService } from '../academic-session/academic-session.service';
 import { PrismaService } from '../database/prisma.service';
 import { MarkAttendanceDto } from './dto/mark-attendance.dto';
 import { ReportQueryDto } from './dto/report-query.dto';
@@ -74,7 +75,10 @@ export type AttendanceReport =
 
 @Injectable()
 export class AttendanceService {
-  constructor(private readonly prisma: PrismaService) {}
+  constructor(
+    private readonly prisma: PrismaService,
+    private readonly sessions: AcademicSessionService,
+  ) {}
 
   /**
    * Return the roster for a section or a whole class on a given date.
@@ -92,6 +96,7 @@ export class AttendanceService {
     dateISO: string,
     scope: { sectionId?: string; classId?: string },
     schoolId: string,
+    sessionId?: string,
   ): Promise<AttendanceRoster[]> {
     let studentWhere: Prisma.StudentWhereInput;
 
@@ -135,10 +140,19 @@ export class AttendanceService {
 
     if (students.length === 0) return [];
 
+    // Strict-default session filter — only show attendance attributed
+    // to the active session unless the caller explicitly requested
+    // another. Falls back to NULL legacy rows when no session exists.
+    const sessionFilter = await this.sessions.resolveReadFilter(
+      schoolId,
+      sessionId,
+    );
+
     const records = await this.prisma.attendance.findMany({
       where: {
         date,
         studentId: { in: students.map((s) => s.id) },
+        ...sessionFilter,
       },
       select: { studentId: true, status: true },
     });
@@ -182,6 +196,14 @@ export class AttendanceService {
       );
     }
 
+    // STRICT — every new attendance row must belong to the active
+    // session AND the active session must not be locked. Throws:
+    //   • "No active academic session"          → none set up yet
+    //   • "Active session is locked. …"         → admin froze the year
+    // Inserts only — the update path leaves sessionId alone so
+    // re-marking a stale day never accidentally moves it forward.
+    const sessionId = await this.sessions.requireActiveUnlocked(schoolId);
+
     const results = await this.prisma.$transaction(
       dto.entries.map((e) =>
         this.prisma.attendance.upsert({
@@ -191,6 +213,7 @@ export class AttendanceService {
             date,
             status: e.status,
             schoolId,
+            sessionId,
           },
           update: { status: e.status },
           select: { id: true },
@@ -211,12 +234,21 @@ export class AttendanceService {
   async getReport(
     query: ReportQueryDto,
     schoolId: string,
+    sessionId?: string,
   ): Promise<AttendanceReport> {
     const from = parseDate(query.fromDate);
     const to = parseDate(query.toDate);
     if (to < from) {
       throw new BadRequestException('toDate must be on or after fromDate.');
     }
+
+    // Resolve the session filter ONCE and pass to whichever private
+    // does the heavy lifting — they all run the same attendance
+    // query shape under the hood.
+    const sessionFilter = await this.sessions.resolveReadFilter(
+      schoolId,
+      sessionId,
+    );
 
     if (query.studentId) {
       return this.getStudentReport(
@@ -226,6 +258,7 @@ export class AttendanceService {
         query.fromDate,
         query.toDate,
         schoolId,
+        sessionFilter,
       );
     }
 
@@ -237,6 +270,7 @@ export class AttendanceService {
         query.fromDate,
         query.toDate,
         schoolId,
+        sessionFilter,
       );
     }
 
@@ -248,6 +282,7 @@ export class AttendanceService {
         query.fromDate,
         query.toDate,
         schoolId,
+        sessionFilter,
       );
     }
 
@@ -263,6 +298,7 @@ export class AttendanceService {
     fromIso: string,
     toIso: string,
     schoolId: string,
+    sessionFilter: { sessionId: string | null },
   ): Promise<StudentAttendanceReport> {
     const student = await this.prisma.student.findFirst({
       where: { id: studentId, schoolId },
@@ -282,7 +318,11 @@ export class AttendanceService {
 
     const grouped = await this.prisma.attendance.groupBy({
       by: ['status'],
-      where: { studentId, date: { gte: from, lte: to } },
+      where: {
+        studentId,
+        date: { gte: from, lte: to },
+        ...sessionFilter,
+      },
       _count: { _all: true },
     });
     const present = countFor(grouped, AttendanceStatus.PRESENT);
@@ -316,6 +356,7 @@ export class AttendanceService {
     fromIso: string,
     toIso: string,
     schoolId: string,
+    sessionFilter: { sessionId: string | null },
   ): Promise<SectionAttendanceReport> {
     const section = await this.prisma.section.findFirst({
       where: { id: sectionId, class: { schoolId } },
@@ -360,6 +401,7 @@ export class AttendanceService {
       where: {
         studentId: { in: students.map((s) => s.id) },
         date: { gte: from, lte: to },
+        ...sessionFilter,
       },
       select: { studentId: true, status: true },
     });
@@ -420,6 +462,7 @@ export class AttendanceService {
     fromIso: string,
     toIso: string,
     schoolId: string,
+    sessionFilter: { sessionId: string | null },
   ): Promise<ClassAttendanceReport> {
     const klass = await this.prisma.class.findFirst({
       where: { id: classId, schoolId },
@@ -456,6 +499,7 @@ export class AttendanceService {
       where: {
         studentId: { in: students.map((s) => s.id) },
         date: { gte: from, lte: to },
+        ...sessionFilter,
       },
       select: { studentId: true, status: true },
     });

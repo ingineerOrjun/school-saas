@@ -16,6 +16,7 @@ import { ApiError } from "@/lib/api";
 import { getToken } from "@/lib/auth";
 import { feesApi, type Receipt, type PaymentMethod } from "@/lib/fees";
 import { DocumentLogo } from "@/components/documents/DocumentLogo";
+import { formatDual } from "@/lib/date";
 
 export default function ReceiptPage() {
   const params = useParams<{ paymentId: string }>();
@@ -178,8 +179,13 @@ function Header({ data }: { data: Receipt }) {
           <p className="text-[10px] font-semibold uppercase tracking-wider text-slate-500">
             Date
           </p>
+          {/* Receipts always print with both calendars regardless of
+              the user's UI preference — they're paper artifacts that
+              circulate beyond the issuing user. formatDual is used
+              directly (rather than <DualDate>) so the same string
+              appears in print and on screen. */}
           <p className="mt-0.5 font-mono text-sm text-slate-900">
-            {formatDate(data.date)}
+            {formatDual(data.date)}
           </p>
         </div>
       </div>

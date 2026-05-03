@@ -34,6 +34,7 @@ import { useDashboardData } from "@/lib/use-dashboard-data";
 import { classesApi, type ClassWithSections } from "@/lib/classes";
 import type { StudentDto } from "@/lib/students";
 import { ApiError } from "@/lib/api";
+import { getStoredUser, type Role } from "@/lib/auth";
 import type {
   DashboardStats,
   FeeStatus,
@@ -68,6 +69,12 @@ type StatConfig = {
   // Themed gradients per metric — soft tints layered over the glass card.
   gradient: string;
   iconBg: string;
+  /**
+   * When set, the card only renders for users with one of these roles.
+   * Used to hide finance-related cards from STAFF (whose href would
+   * 403 anyway) and other admin-only links.
+   */
+  requiresRole?: Role[];
 };
 
 const currencyFmt = new Intl.NumberFormat("en-US", {
@@ -102,6 +109,8 @@ const STAT_CONFIGS: StatConfig[] = [
     href: "/teachers",
     gradient: "from-sky-500/10 via-blue-500/5 to-transparent",
     iconBg: "bg-sky-500/12 text-sky-600 ring-sky-500/20",
+    // Teachers admin page is admin-only; href would 404/403 for STAFF.
+    requiresRole: ["ADMIN"],
   },
   {
     key: "attendanceTodayPct",
@@ -122,6 +131,8 @@ const STAT_CONFIGS: StatConfig[] = [
     href: "/fees",
     gradient: "from-amber-500/10 via-orange-500/5 to-transparent",
     iconBg: "bg-amber-500/12 text-amber-600 ring-amber-500/20",
+    // Finance is admin-only — STAFF can't access /fees.
+    requiresRole: ["ADMIN"],
   },
   {
     key: "totalCredit",
@@ -134,6 +145,7 @@ const STAT_CONFIGS: StatConfig[] = [
     href: "/fees",
     gradient: "from-violet-500/10 via-fuchsia-500/5 to-transparent",
     iconBg: "bg-violet-500/12 text-violet-600 ring-violet-500/20",
+    requiresRole: ["ADMIN"],
   },
 ];
 
@@ -142,6 +154,11 @@ interface QuickActionItem {
   description: string;
   href: string;
   icon: React.ComponentType<{ className?: string }>;
+  /**
+   * When set, the action only renders for users with one of these
+   * roles. Same role-gating mechanism as the stat cards above.
+   */
+  requiresRole?: Role[];
 }
 
 const QUICK_ACTIONS: QuickActionItem[] = [
@@ -156,6 +173,7 @@ const QUICK_ACTIONS: QuickActionItem[] = [
     description: "Record payments and issue receipts",
     href: "/fees",
     icon: Receipt,
+    requiresRole: ["ADMIN"],
   },
   {
     label: "Schedule an exam",
@@ -168,6 +186,7 @@ const QUICK_ACTIONS: QuickActionItem[] = [
     description: "Add staff to your workspace",
     href: "/teachers",
     icon: GraduationCap,
+    requiresRole: ["ADMIN"],
   },
   {
     label: "Announcements",
@@ -213,6 +232,30 @@ export function AdminDashboardView() {
   // teachers see their own dedicated unassigned hero instead.
   const searchParams = useSearchParams();
   const setupNotice = searchParams.get("setup");
+
+  // Cached role drives which stat cards / quick actions render. STAFF
+  // shares this dashboard with ADMIN but can't access fees / teachers
+  // / users surfaces, so those entries get filtered out.
+  const [role, setRole] = React.useState<Role | null>(null);
+  React.useEffect(() => {
+    setRole(getStoredUser()?.role ?? null);
+  }, []);
+  const isAdmin = role === "ADMIN";
+  // Helper: matches the same shape as the Sidebar's role gate.
+  const matchesRole = React.useCallback(
+    (item: { requiresRole?: Role[] }) =>
+      !item.requiresRole ||
+      (role !== null && item.requiresRole.includes(role)),
+    [role],
+  );
+  const visibleStatConfigs = React.useMemo(
+    () => STAT_CONFIGS.filter(matchesRole),
+    [matchesRole],
+  );
+  const visibleQuickActions = React.useMemo(
+    () => QUICK_ACTIONS.filter(matchesRole),
+    [matchesRole],
+  );
 
   // Load classes once for the Add-Student dialog's section dropdown.
   React.useEffect(() => {
@@ -312,6 +355,10 @@ export function AdminDashboardView() {
         exporting={loadingStudents}
         onRefresh={refresh}
         refreshing={refreshing}
+        // Add student is admin-only on the backend (POST /students
+        // requires @Roles(ADMIN)). Hide for STAFF so the button isn't
+        // a 403-in-waiting; STAFF still gets Refresh + Export CSV.
+        canAddStudent={isAdmin}
       />
 
       {/* Error banner — sits above the grid so the user always sees what
@@ -320,19 +367,20 @@ export function AdminDashboardView() {
         <ErrorBanner message={error ?? "Something went wrong."} onRetry={refresh} />
       )}
 
-      {/* Stats row — 5 cards. On mobile they stack; at sm → 2 per row;
-          at lg → 5 in a single row. */}
+      {/* Stats row — admin sees 5 cards, STAFF sees 3 (fees +
+          teachers cards filtered out). On mobile they stack; at sm
+          → 2 per row; at lg → up to 5 in a single row. */}
       <section className="grid grid-cols-1 gap-4 sm:grid-cols-2 lg:grid-cols-5 stagger">
         {isLoading &&
-          Array.from({ length: STAT_CONFIGS.length }).map((_, i) => (
+          Array.from({ length: visibleStatConfigs.length }).map((_, i) => (
             <StatCardSkeleton key={i} />
           ))}
         {(isEmpty || isError) &&
-          STAT_CONFIGS.map((cfg) => (
+          visibleStatConfigs.map((cfg) => (
             <StatCardPlaceholder key={cfg.key} config={cfg} />
           ))}
         {isReady &&
-          STAT_CONFIGS.map((cfg) => (
+          visibleStatConfigs.map((cfg) => (
             <StatCard key={cfg.key} stats={data!.stats} config={cfg} />
           ))}
       </section>
@@ -364,13 +412,26 @@ export function AdminDashboardView() {
             {isEmpty && (
               <EmptyState
                 icon={<UserPlus className="h-10 w-10" strokeWidth={1.5} />}
-                title="Your school is a clean slate ✨"
-                description="Add your first student to bring this dashboard to life."
-                action={{
-                  label: "Add your first student",
-                  icon: <Plus className="h-4 w-4" />,
-                  onClick: () => setModalOpen(true),
-                }}
+                title={
+                  isAdmin
+                    ? "Your school is a clean slate ✨"
+                    : "No students enrolled yet"
+                }
+                description={
+                  isAdmin
+                    ? "Add your first student to bring this dashboard to life."
+                    : "Once your admin enrolls students, this dashboard will fill in."
+                }
+                // CTA only renders for admin — STAFF can view but not write.
+                action={
+                  isAdmin
+                    ? {
+                        label: "Add your first student",
+                        icon: <Plus className="h-4 w-4" />,
+                        onClick: () => setModalOpen(true),
+                      }
+                    : undefined
+                }
               />
             )}
             {isError && !isLoading && (
@@ -413,7 +474,9 @@ export function AdminDashboardView() {
             />
           )}
 
-          {(isReady || isEmpty) && <QuickActionsCard />}
+          {(isReady || isEmpty) && (
+            <QuickActionsCard items={visibleQuickActions} />
+          )}
         </div>
       </section>
 
@@ -473,6 +536,7 @@ function WelcomeHero({
   exporting,
   onRefresh,
   refreshing,
+  canAddStudent,
 }: {
   loading: boolean;
   schoolName: string;
@@ -484,6 +548,8 @@ function WelcomeHero({
   exporting: boolean;
   onRefresh: () => void;
   refreshing: boolean;
+  /** False for STAFF — POST /students requires admin. */
+  canAddStudent: boolean;
 }) {
   const isOnboarding = progress < 100;
 
@@ -566,14 +632,16 @@ function WelcomeHero({
           >
             Export CSV
           </Button>
-          <Button
-            size="lg"
-            leftIcon={<Plus className="h-4 w-4" />}
-            onClick={onAdd}
-            className="shadow-md shadow-primary/20 hover:shadow-lg hover:shadow-primary/30 hover:-translate-y-px transition-all"
-          >
-            Add student
-          </Button>
+          {canAddStudent && (
+            <Button
+              size="lg"
+              leftIcon={<Plus className="h-4 w-4" />}
+              onClick={onAdd}
+              className="shadow-md shadow-primary/20 hover:shadow-lg hover:shadow-primary/30 hover:-translate-y-px transition-all"
+            >
+              Add student
+            </Button>
+          )}
         </div>
       </div>
     </div>
@@ -783,7 +851,7 @@ function TableSkeleton() {
 // Quick actions
 // ---------------------------------------------------------------------------
 
-function QuickActionsCard() {
+function QuickActionsCard({ items }: { items: QuickActionItem[] }) {
   return (
     <div className="glass rounded-xl p-5">
       <h3 className="text-md font-semibold tracking-tight text-foreground">
@@ -791,7 +859,7 @@ function QuickActionsCard() {
       </h3>
       <p className="mt-0.5 text-sm text-muted-foreground">Common workflows</p>
       <div className="mt-4 flex flex-col gap-2">
-        {QUICK_ACTIONS.map((item) => (
+        {items.map((item) => (
           <QuickAction key={item.label} item={item} />
         ))}
       </div>
