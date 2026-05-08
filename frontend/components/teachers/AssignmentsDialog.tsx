@@ -4,21 +4,16 @@ import * as React from "react";
 import Link from "next/link";
 import {
   AlertCircle,
-  BookOpen,
-  CalendarCheck,
-  ClipboardList,
+  Check,
   GraduationCap,
   Layers,
-  Loader2,
-  Plus,
   Sparkles,
-  Trash2,
-  X,
 } from "lucide-react";
 import { toast } from "sonner";
 import { ApiError } from "@/lib/api";
 import {
   teachingAssignmentsApi,
+  type BulkAssignmentTuple,
   type TeachingAssignmentDto,
 } from "@/lib/teaching-assignments";
 import type { ClassWithSections } from "@/lib/classes";
@@ -35,32 +30,41 @@ export interface AssignmentsDialogProps {
   classes: ClassWithSections[];
   subjects: SubjectDto[];
   onClose: () => void;
+  /**
+   * Fired after every successful bulk save so the parent (the
+   * `/teachers` table) can refresh its row data and pick up the
+   * new `assignmentCounts`. Without this, the table's "Unassigned"
+   * red pill stays stuck on the value from the initial list fetch
+   * even after the admin ticks cells and saves.
+   */
+  onSaved?: () => void;
 }
 
 /**
- * Multi-row assignment manager for a single teacher. Designed to be a
- * "single screen" for an admin to set up everything a teacher can act
- * on without leaving the dialog.
+ * Class-first assignment editor for a single teacher.
  *
- * Layout:
- *   • Summary header with the running count
- *   • Existing assignments grouped BY CLASS (one card per class with
- *     its rows underneath) — fewer scan distances when a teacher has
- *     several rows on the same class
- *   • Per-row quick actions: Attendance (deep-linked to that roster),
- *     Marks (→ /exams), Delete
- *   • Always-visible add form with three dropdowns (subject → class →
- *     section). Enter submits. Picking a class auto-focuses the
- *     section dropdown. After a successful add the same subject + class
- *     stick so admins can rapid-fire sibling rows.
- *   • Inline duplicate detection: blocks the Add button BEFORE the
- *     server returns 409, with a one-line explanation.
+ * Replaces the old "pick subject + class + section, click Add, repeat"
+ * form with a visual grid the admin can tick through in seconds:
+ *
+ *   • Top: chips showing which classes the teacher already touches
+ *     (also act as quick-jumps to that class's grid).
+ *   • Middle: a class picker + a (subjects × sections) checkbox grid
+ *     for the selected class. The first row covers "Whole class (no
+ *     subject)"; the first column covers "Whole class (any subject)".
+ *     Cells start checked if a matching TeachingAssignment exists.
+ *   • Bottom: sticky Save bar that shows the pending diff count and
+ *     commits adds + removes in a single transactional bulk call.
+ *
+ * The grid only edits ONE class at a time. Other classes' assignments
+ * are preserved untouched on save — the diff is scoped to the cells
+ * the admin actually saw.
  */
 export function AssignmentsDialog({
   teacher,
   classes,
   subjects,
   onClose,
+  onSaved,
 }: AssignmentsDialogProps) {
   const open = teacher !== null;
   const [assignments, setAssignments] = React.useState<
@@ -68,33 +72,33 @@ export function AssignmentsDialog({
   >(null);
   const [loading, setLoading] = React.useState(false);
   const [error, setError] = React.useState<string | null>(null);
+  const [saving, setSaving] = React.useState(false);
 
-  // Pending IDs control the per-row delete spinner. We use a Set so
-  // multiple deletes can run in parallel without a stale-render race.
-  const [removingIds, setRemovingIds] = React.useState<Set<string>>(
-    () => new Set(),
+  // Which class the grid is currently editing. Defaults to the first
+  // class the teacher already has assignments in (or the first school
+  // class if none) once the load completes.
+  const [selectedClassId, setSelectedClassId] = React.useState<string | null>(
+    null,
   );
 
-  // Add-form state. Always-visible form sits below the table so admins
-  // can keep adding rows without hunting for a "+ Add" button.
-  const [draftSubjectId, setDraftSubjectId] = React.useState<string>("");
-  const [draftClassId, setDraftClassId] = React.useState<string>("");
-  const [draftSectionId, setDraftSectionId] = React.useState<string>("");
-  const [adding, setAdding] = React.useState(false);
+  // Live cell state for the rendered grid: cellKey → checked. Seeded
+  // from `assignments` whenever the selected class changes; mutated
+  // by the cell checkboxes; diffed against `initialCellState` on save.
+  const [cellState, setCellState] = React.useState<Map<string, boolean>>(
+    () => new Map(),
+  );
+  const [initialCellState, setInitialCellState] = React.useState<
+    Map<string, boolean>
+  >(() => new Map());
 
-  // Section ref for keyboard focus. Set on the <select> element so
-  // we can pull the admin straight into the next field when a class
-  // is chosen — saves a click on the most common path.
-  const sectionRef = React.useRef<HTMLSelectElement | null>(null);
-
-  // Reset & fetch whenever the dialog opens for a different teacher.
+  // ---- Initial load when the dialog opens for a new teacher ----
   React.useEffect(() => {
     if (!teacher) {
       setAssignments(null);
       setError(null);
-      setDraftSubjectId("");
-      setDraftClassId("");
-      setDraftSectionId("");
+      setSelectedClassId(null);
+      setCellState(new Map());
+      setInitialCellState(new Map());
       return;
     }
     let cancelled = false;
@@ -103,16 +107,17 @@ export function AssignmentsDialog({
       setError(null);
       try {
         const list = await teachingAssignmentsApi.listForTeacher(teacher.id);
-        if (!cancelled) setAssignments(list);
+        if (cancelled) return;
+        setAssignments(list);
+        // Pick the first class with existing assignments; fall back to
+        // the first school class so the grid is never empty when there
+        // are classes available.
+        const firstAssignedClassId = list[0]?.classId ?? null;
+        const firstSchoolClassId = classes[0]?.id ?? null;
+        setSelectedClassId(firstAssignedClassId ?? firstSchoolClassId);
       } catch (err) {
         if (cancelled) return;
-        setError(
-          err instanceof ApiError
-            ? err.message
-            : err instanceof Error
-              ? err.message
-              : "Failed to load assignments.",
-        );
+        setError(extractErrorMessage(err, "Failed to load assignments."));
       } finally {
         if (!cancelled) setLoading(false);
       }
@@ -120,640 +125,738 @@ export function AssignmentsDialog({
     return () => {
       cancelled = true;
     };
+    // `classes` is intentionally excluded — we only want to seed the
+    // class selection on the initial open, not bounce it around if the
+    // parent's class list re-renders mid-edit.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [teacher]);
 
-  // Section depends on class — reset whenever the picked class changes
-  // so a stale section ID never leaks through, and pull focus into the
-  // section dropdown so the admin's next press lands there.
+  // ---- Re-seed cell state whenever the selected class changes ----
   React.useEffect(() => {
-    setDraftSectionId("");
-    if (draftClassId) {
-      // Wait one frame so the disabled→enabled transition completes
-      // before focus moves; otherwise focus silently bounces away.
-      const id = window.requestAnimationFrame(() => {
-        sectionRef.current?.focus();
-      });
-      return () => window.cancelAnimationFrame(id);
+    if (!assignments || !selectedClassId) {
+      setCellState(new Map());
+      setInitialCellState(new Map());
+      return;
     }
-  }, [draftClassId]);
+    const seed = buildCellMap(assignments, selectedClassId);
+    setCellState(new Map(seed));
+    setInitialCellState(new Map(seed));
+  }, [assignments, selectedClassId]);
 
-  const draftClass = React.useMemo(
-    () => classes.find((c) => c.id === draftClassId) ?? null,
-    [classes, draftClassId],
+  // ---- Derived: counts per class for the chip strip ----
+  const countsByClass = React.useMemo(() => {
+    const m = new Map<string, number>();
+    for (const a of assignments ?? []) {
+      m.set(a.classId, (m.get(a.classId) ?? 0) + 1);
+    }
+    return m;
+  }, [assignments]);
+
+  // ---- Derived: the class object currently being edited ----
+  const selectedClass = React.useMemo(
+    () => classes.find((c) => c.id === selectedClassId) ?? null,
+    [classes, selectedClassId],
   );
 
-  // Group existing assignments by class so the rendered list reads
-  // like "Grade 10 → Math · A, Science · B / Grade 9 → English". Sort
-  // by class name for stable, alphabetical scanning; within a class
-  // sort by section (Whole class first) then subject.
-  const groupedAssignments = React.useMemo(
-    () => groupByClass(assignments ?? []),
-    [assignments],
+  // ---- Derived: pending diff (add[] / remove[]) ----
+  const diff = React.useMemo(
+    () => computeDiff(initialCellState, cellState, selectedClassId),
+    [initialCellState, cellState, selectedClassId],
   );
+  const pendingCount = diff.add.length + diff.remove.length;
+  const isDirty = pendingCount > 0;
 
-  // Inline duplicate detection. The DB has a unique index on the
-  // (teacher, class, section, subject) tuple, but Postgres treats
-  // NULLs as DISTINCT — meaning the index doesn't catch (Class 8,
-  // NULL section, NULL subject) duplicates. We hand-check ALL field
-  // combinations here so the admin doesn't have to wait for a 409 to
-  // discover the row already exists.
-  const isDuplicate = React.useMemo(() => {
-    if (!assignments || !draftClassId) return false;
-    const sectionId = draftSectionId || null;
-    const subjectId = draftSubjectId || null;
-    return assignments.some(
-      (a) =>
-        a.classId === draftClassId &&
-        (a.sectionId ?? null) === sectionId &&
-        (a.subjectId ?? null) === subjectId,
-    );
-  }, [assignments, draftClassId, draftSectionId, draftSubjectId]);
-
-  const canAdd = !!draftClassId && !adding && !isDuplicate;
-
+  // ---- Handlers ----
   const handleClose = () => {
-    if (adding || removingIds.size > 0) return;
+    if (saving) return;
+    if (
+      isDirty &&
+      !window.confirm(
+        `You have ${pendingCount} unsaved change${pendingCount === 1 ? "" : "s"}. Discard and close?`,
+      )
+    ) {
+      return;
+    }
     onClose();
   };
 
-  const handleAdd = async () => {
-    if (!teacher || !canAdd) return;
-    setAdding(true);
-    try {
-      const created = await teachingAssignmentsApi.create(teacher.id, {
-        classId: draftClassId,
-        sectionId: draftSectionId || null,
-        subjectId: draftSubjectId || null,
-      });
-      setAssignments((prev) => (prev ? [...prev, created] : [created]));
-      // Keep subject + class so admins can rapid-fire sibling rows
-      // ("Math · Class 8 · A" → switch section to "B" → Add). Only
-      // section resets — and we re-focus it for keyboard flow.
-      setDraftSectionId("");
-      window.requestAnimationFrame(() => sectionRef.current?.focus());
-      toast.success("Assignment added");
-    } catch (err) {
-      const msg =
-        err instanceof ApiError
-          ? err.message
-          : err instanceof Error
-            ? err.message
-            : "Failed to add assignment.";
-      toast.error(msg);
-    } finally {
-      setAdding(false);
+  const handleSelectClass = (classId: string) => {
+    if (classId === selectedClassId) return;
+    if (
+      isDirty &&
+      !window.confirm(
+        `You have ${pendingCount} unsaved change${pendingCount === 1 ? "" : "s"} for the current class. Discard and switch?`,
+      )
+    ) {
+      return;
     }
+    setSelectedClassId(classId);
   };
 
-  const handleRemove = async (assignment: TeachingAssignmentDto) => {
-    setRemovingIds((prev) => new Set(prev).add(assignment.id));
+  const toggleCell = (subjectId: string | null, sectionId: string | null) => {
+    if (saving) return;
+    const key = cellKey(subjectId, sectionId);
+    setCellState((prev) => {
+      const next = new Map(prev);
+      next.set(key, !prev.get(key));
+      return next;
+    });
+  };
+
+  const handleDiscard = () => {
+    setCellState(new Map(initialCellState));
+  };
+
+  const handleSave = async () => {
+    if (!teacher || !isDirty) return;
+    setSaving(true);
     try {
-      await teachingAssignmentsApi.remove(assignment.id);
-      setAssignments((prev) =>
-        prev ? prev.filter((a) => a.id !== assignment.id) : prev,
+      const updated = await teachingAssignmentsApi.bulk(teacher.id, {
+        add: diff.add,
+        remove: diff.remove,
+      });
+      setAssignments(updated);
+      // Diagnostic — surfaces what the admin's perspective just
+      // wrote. Pair this with the teacher-dashboard log to spot
+      // mismatches between "what I saved" and "what the teacher's
+      // dashboard reads back".
+      console.log("Assignments (admin save result):", updated);
+      // Re-seed initial state from the just-saved cells so isDirty
+      // flips back to false. Server is the source of truth, so we
+      // also rebuild from `updated` rather than from cellState — that
+      // way any server-side normalization (e.g., dropping stale rows)
+      // shows up immediately.
+      const fresh = selectedClassId
+        ? buildCellMap(updated, selectedClassId)
+        : new Map<string, boolean>();
+      setCellState(new Map(fresh));
+      setInitialCellState(new Map(fresh));
+      toast.success(
+        pendingCount === 1
+          ? "1 change saved"
+          : `${pendingCount} changes saved`,
       );
-      toast.success("Assignment removed");
+
+      // Tell the parent so the /teachers table can re-pull and
+      // refresh the per-row "X Classes · Y Subjects" pill. Without
+      // this the pill stays stuck on the count captured at initial
+      // page-load time — admins ticked cells, saved successfully,
+      // closed the dialog, and STILL saw the red "Unassigned" pill
+      // on the row they'd just assigned.
+      onSaved?.();
+
+      // (The diagnostic listMine() call that lived here was removed:
+      // api.ts now turns any 403 into a hard logout + redirect, and
+      // an admin hitting /teachers/me/assignments would always 403,
+      // which would silently sign the admin out the moment they
+      // saved any teacher's assignments. The teacher-side dashboard
+      // log + the backend [listMine] log together cover the same
+      // diagnostic without the side effect.)
     } catch (err) {
-      const msg =
-        err instanceof ApiError
-          ? err.message
-          : err instanceof Error
-            ? err.message
-            : "Failed to remove assignment.";
-      toast.error(msg);
+      toast.error(extractErrorMessage(err, "Failed to save assignments."));
     } finally {
-      setRemovingIds((prev) => {
-        const next = new Set(prev);
-        next.delete(assignment.id);
-        return next;
-      });
+      setSaving(false);
     }
   };
 
-  const onSubmit = (e: React.FormEvent) => {
-    e.preventDefault();
-    if (canAdd) void handleAdd();
-  };
-
-  const count = assignments?.length ?? 0;
-  const isEmpty = !loading && !error && count === 0;
+  const totalCount = assignments?.length ?? 0;
+  const hasNoClasses = classes.length === 0;
 
   return (
     <Modal
       open={open}
       onClose={handleClose}
       title={teacher ? `Assignments — ${teacher.name}` : "Assignments"}
-      description="Each row is one (subject × class × section) the teacher can act on. Subject and section are optional."
+      description="Pick a class and tick the (subject × section) cells the teacher should cover. Save commits all changes at once."
       size="lg"
       footer={
-        <Button variant="ghost" onClick={handleClose} type="button">
-          Done
-        </Button>
+        <div className="flex w-full items-center justify-between gap-3">
+          <span
+            className={cn(
+              "text-xs font-medium tabular-nums",
+              isDirty
+                ? "text-amber-700 dark:text-amber-400"
+                : "text-muted-foreground",
+            )}
+          >
+            {isDirty
+              ? `${pendingCount} unsaved change${pendingCount === 1 ? "" : "s"}`
+              : "All changes saved"}
+          </span>
+          <div className="flex items-center gap-2">
+            {isDirty && (
+              <Button
+                variant="ghost"
+                type="button"
+                onClick={handleDiscard}
+                disabled={saving}
+              >
+                Discard
+              </Button>
+            )}
+            <Button
+              variant="ghost"
+              type="button"
+              onClick={handleClose}
+              disabled={saving}
+            >
+              Close
+            </Button>
+            <Button
+              type="button"
+              onClick={handleSave}
+              disabled={!isDirty || saving}
+              loading={saving}
+              leftIcon={!saving ? <Check className="h-4 w-4" /> : undefined}
+            >
+              Save changes
+            </Button>
+          </div>
+        </div>
       }
     >
       <div className="space-y-5">
-        {/* ----- Summary header ----- */}
-        <div className="flex items-center justify-between">
-          <div className="inline-flex items-center gap-2 rounded-full border border-border bg-muted/40 px-2.5 py-1 text-xs font-medium text-muted-foreground">
-            <ClipboardList className="h-3.5 w-3.5" />
-            Assignments:{" "}
-            <span className="font-semibold text-foreground tabular-nums">
-              {loading ? "—" : count}
-            </span>
-          </div>
-          {error && (
-            <span className="text-xs text-destructive">{error}</span>
-          )}
-        </div>
+        {/* Orphan-teacher warning is gone in 20260511 — every Teacher row
+            now has a NOT NULL `userId` (createWithUser is the only
+            allowed creation path), so the orphan case can no longer
+            exist. The login hard-guard on the backend additionally
+            rejects unassigned teachers, so this dialog is the
+            unambiguous source of "is this teacher set up?" — admins act
+            on the cells, no extra warnings needed. */}
 
-        {/* ----- Orphan-teacher warning -----
-            Assignments live on the Teacher row; the teacher's dashboard
-            resolves them via Teacher.userId === user.id. If userId is
-            null (typical for QuickAdd-created rows) the assignments
-            won't appear anywhere — silent failure unless we surface it
-            HERE, where the admin is in the act of creating them. */}
-        {teacher && teacher.userId === null && <OrphanTeacherWarning />}
-
-        {/* ----- Existing assignments — grouped by class ----- */}
-        {loading && <GroupSkeleton />}
-
-        {isEmpty && <EmptyState />}
-
-        {!loading && !isEmpty && groupedAssignments.length > 0 && (
-          <div className="space-y-3">
-            {groupedAssignments.map((group) => (
-              <ClassGroup
-                key={group.classId}
-                group={group}
-                removingIds={removingIds}
-                onRemove={handleRemove}
-              />
-            ))}
+        {/* Inline error from the initial load. Save errors go via toast. */}
+        {error && (
+          <div className="flex items-start gap-2 rounded-md border border-destructive/30 bg-destructive/5 px-3 py-2 text-sm text-destructive">
+            <AlertCircle className="h-4 w-4 mt-0.5 shrink-0" />
+            <span>{error}</span>
           </div>
         )}
 
-        {/* ----- Add form ----- */}
-        <form
-          onSubmit={onSubmit}
-          className="rounded-lg border border-dashed border-border bg-muted/20 p-4 space-y-3"
-        >
-          <div className="flex items-center gap-2 text-sm font-medium text-foreground">
-            <Plus className="h-4 w-4 text-emerald-600" strokeWidth={2.5} />
-            Add assignment
-          </div>
+        {/* ---- Summary chips: classes the teacher already touches ----
+            Each chip is also a quick-jump button into that class's grid.
+            Distinct color tints separate "currently editing this one"
+            from "exists but not selected". */}
+        {!loading && (
+          <ClassSummaryStrip
+            classes={classes}
+            countsByClass={countsByClass}
+            selectedClassId={selectedClassId}
+            onSelect={handleSelectClass}
+            totalCount={totalCount}
+          />
+        )}
 
-          <div className="grid grid-cols-1 gap-3 sm:grid-cols-3">
-            <DropdownField
-              label="Subject"
-              hint="Optional — leave blank for attendance-only"
-              icon={<BookOpen className="h-3.5 w-3.5" />}
-            >
-              <select
-                value={draftSubjectId}
-                onChange={(e) => setDraftSubjectId(e.target.value)}
-                disabled={adding}
-                className={selectClasses}
-              >
-                <option value="">No subject (attendance only)</option>
-                {subjects.map((s) => (
-                  <option key={s.id} value={s.id}>
-                    {s.name}
-                  </option>
-                ))}
-              </select>
-            </DropdownField>
+        {/* ---- Class picker + grid ---- */}
+        {hasNoClasses ? (
+          <NoClassesState />
+        ) : loading ? (
+          <GridSkeleton />
+        ) : (
+          <>
+            <ClassPicker
+              classes={classes}
+              countsByClass={countsByClass}
+              selectedClassId={selectedClassId}
+              onChange={handleSelectClass}
+              disabled={saving}
+            />
 
-            <DropdownField
-              label="Class"
-              hint="Required"
-              icon={<GraduationCap className="h-3.5 w-3.5" />}
-            >
-              <select
-                value={draftClassId}
-                onChange={(e) => setDraftClassId(e.target.value)}
-                disabled={adding}
-                className={selectClasses}
-              >
-                <option value="">Choose a class…</option>
-                {classes.map((c) => (
-                  <option key={c.id} value={c.id}>
-                    {c.name}
-                  </option>
-                ))}
-              </select>
-            </DropdownField>
-
-            <DropdownField
-              label="Section"
-              hint={
-                draftClass
-                  ? draftClass.sections.length === 0
-                    ? "No sections in this class"
-                    : "Optional — blank means whole class"
-                  : "Pick a class first"
-              }
-              icon={<Layers className="h-3.5 w-3.5" />}
-            >
-              <select
-                ref={sectionRef}
-                value={draftSectionId}
-                onChange={(e) => setDraftSectionId(e.target.value)}
-                disabled={
-                  adding || !draftClass || draftClass.sections.length === 0
-                }
-                className={selectClasses}
-              >
-                <option value="">Whole class</option>
-                {draftClass?.sections.map((s) => (
-                  <option key={s.id} value={s.id}>
-                    {s.name}
-                  </option>
-                ))}
-              </select>
-            </DropdownField>
-          </div>
-
-          {/* Inline duplicate error — only when class is picked AND the
-              tuple already exists. Empty draft never triggers it. */}
-          {isDuplicate && (
-            <div className="flex items-start gap-2 rounded-md border border-destructive/30 bg-destructive/5 px-3 py-2 text-xs text-destructive">
-              <AlertCircle className="h-3.5 w-3.5 mt-0.5 shrink-0" />
-              <span>
-                This assignment already exists. Pick a different combination
-                or remove the existing row first.
-              </span>
-            </div>
-          )}
-
-          <div className="flex items-center justify-between gap-2 pt-1">
-            <p className="text-[11px] text-muted-foreground">
-              Subjects come from the school catalog.{" "}
-              <Link
-                href="/settings"
-                className="text-primary hover:underline focus-ring rounded-sm"
-              >
-                Manage subjects
-              </Link>
-            </p>
-            <div className="flex items-center gap-2">
-              {(draftSubjectId || draftClassId || draftSectionId) && (
-                <Button
-                  variant="ghost"
-                  size="sm"
-                  type="button"
-                  onClick={() => {
-                    setDraftSubjectId("");
-                    setDraftClassId("");
-                    setDraftSectionId("");
-                  }}
-                  leftIcon={<X className="h-3.5 w-3.5" />}
-                  disabled={adding}
-                >
-                  Reset
-                </Button>
-              )}
-              <Button
-                size="sm"
-                type="submit"
-                disabled={!canAdd}
-                loading={adding}
-                leftIcon={!adding ? <Plus className="h-3.5 w-3.5" /> : undefined}
-              >
-                Add assignment
-              </Button>
-            </div>
-          </div>
-        </form>
+            {selectedClass && (
+              <AssignmentGrid
+                klass={selectedClass}
+                subjects={subjects}
+                cellState={cellState}
+                initialCellState={initialCellState}
+                onToggle={toggleCell}
+                disabled={saving}
+              />
+            )}
+          </>
+        )}
       </div>
     </Modal>
   );
 }
 
 // ---------------------------------------------------------------------------
-// Class group + row
+// Class summary chip strip
 // ---------------------------------------------------------------------------
 
-interface AssignmentGroup {
-  classId: string;
-  className: string;
-  items: TeachingAssignmentDto[];
-}
-
-function ClassGroup({
-  group,
-  removingIds,
-  onRemove,
+function ClassSummaryStrip({
+  classes,
+  countsByClass,
+  selectedClassId,
+  onSelect,
+  totalCount,
 }: {
-  group: AssignmentGroup;
-  removingIds: Set<string>;
-  onRemove: (a: TeachingAssignmentDto) => void;
+  classes: ClassWithSections[];
+  countsByClass: Map<string, number>;
+  selectedClassId: string | null;
+  onSelect: (classId: string) => void;
+  totalCount: number;
 }) {
-  return (
-    <div className="rounded-lg border border-border overflow-hidden">
-      {/* Class header — large, distinct from row chrome so the eye locks
-          onto class boundaries first. */}
-      <div className="flex items-center justify-between bg-muted/40 px-4 py-2">
-        <div className="inline-flex items-center gap-2">
-          <GraduationCap className="h-3.5 w-3.5 text-muted-foreground" />
-          <span className="text-sm font-semibold text-foreground">
-            {group.className}
-          </span>
-        </div>
-        <span className="text-[11px] text-muted-foreground">
-          {group.items.length}{" "}
-          {group.items.length === 1 ? "assignment" : "assignments"}
-        </span>
-      </div>
-      <ul className="divide-y divide-border/60">
-        {group.items.map((a) => (
-          <AssignmentRow
-            key={a.id}
-            assignment={a}
-            removing={removingIds.has(a.id)}
-            onRemove={() => onRemove(a)}
-          />
-        ))}
-      </ul>
-    </div>
-  );
-}
+  // Surface ONLY classes that already have assignments — this is a
+  // "where are they currently teaching" overview, not a full school
+  // class browser. (The picker dropdown below covers the full list.)
+  const assignedClasses = classes.filter((c) => countsByClass.has(c.id));
 
-function AssignmentRow({
-  assignment,
-  removing,
-  onRemove,
-}: {
-  assignment: TeachingAssignmentDto;
-  removing: boolean;
-  onRemove: () => void;
-}) {
-  const attendanceHref = assignment.sectionId
-    ? `/attendance?sectionId=${assignment.sectionId}`
-    : `/attendance?classId=${assignment.classId}`;
-  // Marks doesn't deep-link by class yet; the exams page picker isn't
-  // URL-controlled. Plain /exams is the closest jump and still saves
-  // the admin a navigation hop from this dialog.
-  const marksHref = "/exams";
-
-  return (
-    <li
-      className={cn(
-        "flex items-center gap-3 px-4 py-3 transition-colors",
-        !removing && "hover:bg-muted/20",
-        removing && "opacity-60",
-      )}
-    >
-      {/* Subject pill — colored by name hash for consistent recognition. */}
-      <div className="flex min-w-0 flex-1 items-center gap-3">
-        <SubjectPill subject={assignment.subject} />
-        <span className="text-sm text-muted-foreground tabular-nums">
-          {assignment.section ? assignment.section.name : "Whole class"}
-        </span>
-      </div>
-
-      <div className="flex shrink-0 items-center gap-1.5">
-        <Link
-          href={attendanceHref}
-          className="inline-flex h-8 items-center gap-1.5 rounded-md border border-border bg-surface px-2.5 text-xs font-medium text-foreground transition-all hover:border-emerald-300 hover:text-emerald-700 hover:-translate-y-px focus-ring"
-          title="Open attendance for this scope"
-        >
-          <CalendarCheck className="h-3.5 w-3.5" />
-          Attendance
-        </Link>
-        <Link
-          href={marksHref}
-          className="inline-flex h-8 items-center gap-1.5 rounded-md border border-border bg-surface px-2.5 text-xs font-medium text-foreground transition-all hover:border-indigo-300 hover:text-indigo-700 hover:-translate-y-px focus-ring"
-          title="Open exams to enter marks"
-        >
-          <ClipboardList className="h-3.5 w-3.5" />
-          Marks
-        </Link>
-        <button
-          type="button"
-          onClick={onRemove}
-          disabled={removing}
-          aria-label="Remove assignment"
-          className={cn(
-            "inline-flex h-8 w-8 items-center justify-center rounded-md text-muted-foreground",
-            "transition-all duration-150 focus-ring",
-            "hover:bg-destructive/10 hover:text-destructive",
-            removing && "cursor-not-allowed opacity-60",
-          )}
-        >
-          {removing ? (
-            <Loader2 className="h-3.5 w-3.5 animate-spin" />
-          ) : (
-            <Trash2 className="h-3.5 w-3.5" />
-          )}
-        </button>
-      </div>
-    </li>
-  );
-}
-
-// ---------------------------------------------------------------------------
-// Subject pill — deterministic color from the subject's name so the
-// same subject always gets the same tint across the dialog (and across
-// reloads). Subject-less rows render the muted "No subject" pill.
-// ---------------------------------------------------------------------------
-
-const SUBJECT_PALETTES = [
-  "bg-emerald-50 text-emerald-700 ring-emerald-200/60",
-  "bg-sky-50 text-sky-700 ring-sky-200/60",
-  "bg-indigo-50 text-indigo-700 ring-indigo-200/60",
-  "bg-violet-50 text-violet-700 ring-violet-200/60",
-  "bg-amber-50 text-amber-700 ring-amber-200/60",
-  "bg-rose-50 text-rose-700 ring-rose-200/60",
-  "bg-teal-50 text-teal-700 ring-teal-200/60",
-  "bg-fuchsia-50 text-fuchsia-700 ring-fuchsia-200/60",
-];
-
-function paletteForSubject(name: string): string {
-  let sum = 0;
-  for (let i = 0; i < name.length; i++) sum += name.charCodeAt(i);
-  return SUBJECT_PALETTES[sum % SUBJECT_PALETTES.length];
-}
-
-function SubjectPill({
-  subject,
-}: {
-  subject: TeachingAssignmentDto["subject"];
-}) {
-  if (!subject) {
+  if (assignedClasses.length === 0) {
     return (
-      <span className="inline-flex shrink-0 items-center rounded-full bg-muted/70 px-2 py-0.5 text-xs font-medium text-muted-foreground italic ring-1 ring-inset ring-border/60">
-        No subject
-      </span>
+      <div className="flex items-center gap-2 rounded-md border border-dashed border-border bg-muted/20 px-3 py-2 text-xs text-muted-foreground">
+        <Sparkles className="h-3.5 w-3.5 text-emerald-600" />
+        No assignments yet. Pick a class below and tick what they teach.
+      </div>
     );
   }
+
   return (
-    <span
-      className={cn(
-        "inline-flex shrink-0 items-center rounded-full px-2 py-0.5 text-xs font-medium ring-1 ring-inset",
-        paletteForSubject(subject.name),
-      )}
-    >
-      {subject.name}
-    </span>
+    <div className="flex flex-wrap items-center gap-2">
+      <span className="text-xs font-medium text-muted-foreground">
+        Teaches in:
+      </span>
+      {assignedClasses.map((c) => {
+        const isActive = c.id === selectedClassId;
+        const count = countsByClass.get(c.id) ?? 0;
+        return (
+          <button
+            key={c.id}
+            type="button"
+            onClick={() => onSelect(c.id)}
+            className={cn(
+              "inline-flex items-center gap-1.5 rounded-full border px-2.5 py-1 text-xs font-medium transition-all focus-ring",
+              isActive
+                ? "border-emerald-300 bg-emerald-500/10 text-emerald-800 dark:text-emerald-300"
+                : "border-border bg-surface text-foreground hover:border-emerald-300 hover:bg-emerald-500/5",
+            )}
+            title={`Edit assignments for ${c.name}`}
+          >
+            <GraduationCap className="h-3.5 w-3.5" />
+            {c.name}
+            <span
+              className={cn(
+                "rounded-full px-1.5 text-[10px] tabular-nums",
+                isActive
+                  ? "bg-emerald-500/20 text-emerald-900 dark:text-emerald-200"
+                  : "bg-muted text-muted-foreground",
+              )}
+            >
+              {count}
+            </span>
+          </button>
+        );
+      })}
+      <span className="ml-auto text-[11px] text-muted-foreground tabular-nums">
+        {totalCount} total
+      </span>
+    </div>
   );
 }
 
 // ---------------------------------------------------------------------------
-// Empty state + skeleton + form helpers
+// Class picker (full school list)
 // ---------------------------------------------------------------------------
 
-function EmptyState() {
-  return (
-    <div className="rounded-lg border border-dashed border-border bg-muted/10 px-6 py-10 text-center">
-      <div className="mx-auto flex h-12 w-12 items-center justify-center rounded-full bg-emerald-500/10 text-emerald-600 ring-1 ring-inset ring-emerald-500/20">
-        <Sparkles className="h-5 w-5" />
-      </div>
-      <h3 className="mt-3 text-sm font-semibold text-foreground">
-        No assignments yet
-      </h3>
-      <p className="mt-1 text-xs text-muted-foreground">
-        Use the form below to add the first one.
-      </p>
-    </div>
-  );
-}
-
-/**
- * Loud, unmissable banner shown when the teacher row has no linked
- * User account. Without that link the teacher's dashboard can never
- * see the assignments — the dashboard resolves them by
- * `Teacher.userId === currentUser.id`, which returns nothing.
- *
- * QuickAdd is the usual culprit: it creates a Teacher with name only
- * (no email/password), so userId stays null. The fix is to recreate
- * the teacher via "Add teacher" with email + password.
- */
-function OrphanTeacherWarning() {
-  return (
-    <div className="rounded-lg border border-amber-300/60 bg-amber-50 px-4 py-3">
-      <div className="flex items-start gap-3">
-        <div className="flex h-7 w-7 shrink-0 items-center justify-center rounded-full bg-amber-500/15 text-amber-700">
-          <AlertCircle className="h-4 w-4" />
-        </div>
-        <div className="min-w-0 space-y-1">
-          <p className="text-sm font-semibold text-amber-900">
-            This teacher has no login account
-          </p>
-          <p className="text-xs text-amber-800 leading-relaxed">
-            You can still add assignment rows below, but the teacher
-            won&apos;t see them on their dashboard until they&apos;re
-            linked to a login. Close this dialog and use{" "}
-            <span className="font-medium">&ldquo;Add teacher&rdquo;</span>{" "}
-            (with email + password) to create a teacher record that ships
-            with a login account.
-          </p>
-        </div>
-      </div>
-    </div>
-  );
-}
-
-function GroupSkeleton() {
-  return (
-    <div className="space-y-3">
-      {Array.from({ length: 2 }).map((_, gi) => (
-        <div
-          key={gi}
-          className="rounded-lg border border-border overflow-hidden"
-        >
-          <div className="bg-muted/40 px-4 py-2">
-            <Skeleton className="h-4 w-24" />
-          </div>
-          <div className="divide-y divide-border/60">
-            {Array.from({ length: 2 }).map((_, ri) => (
-              <div key={ri} className="flex items-center gap-3 px-4 py-3">
-                <Skeleton className="h-5 w-16 rounded-full" />
-                <Skeleton className="h-4 w-20" />
-                <div className="ml-auto flex items-center gap-1.5">
-                  <Skeleton className="h-8 w-24 rounded-md" />
-                  <Skeleton className="h-8 w-16 rounded-md" />
-                  <Skeleton className="h-8 w-8 rounded-md" />
-                </div>
-              </div>
-            ))}
-          </div>
-        </div>
-      ))}
-    </div>
-  );
-}
-
-const selectClasses = cn(
-  "h-9 w-full rounded-md border border-border bg-surface px-2.5 text-sm",
-  "focus:outline-none focus:ring-2 focus:ring-primary/25 focus:border-primary",
-  "disabled:cursor-not-allowed disabled:bg-muted disabled:opacity-60",
-  "transition-colors",
-);
-
-function DropdownField({
-  label,
-  hint,
-  icon,
-  children,
+function ClassPicker({
+  classes,
+  countsByClass,
+  selectedClassId,
+  onChange,
+  disabled,
 }: {
-  label: string;
-  hint?: string;
-  icon?: React.ReactNode;
-  children: React.ReactNode;
+  classes: ClassWithSections[];
+  countsByClass: Map<string, number>;
+  selectedClassId: string | null;
+  onChange: (classId: string) => void;
+  disabled?: boolean;
 }) {
   return (
     <label className="flex flex-col gap-1.5">
-      <span className="inline-flex items-center gap-1.5 text-[11px] font-semibold uppercase tracking-wider text-muted-foreground">
-        {icon ? <span className="text-muted-foreground/80">{icon}</span> : null}
-        {label}
+      <span className="text-[11px] font-semibold uppercase tracking-wider text-muted-foreground">
+        Edit assignments for
       </span>
-      {children}
-      {hint && (
-        <span className="text-[11px] text-muted-foreground/80">{hint}</span>
-      )}
+      <div className="relative">
+        <GraduationCap className="pointer-events-none absolute left-2.5 top-1/2 -translate-y-1/2 h-4 w-4 text-muted-foreground" />
+        <select
+          value={selectedClassId ?? ""}
+          onChange={(e) => onChange(e.target.value)}
+          disabled={disabled}
+          className={cn(
+            "h-10 w-full rounded-md border border-border bg-surface pl-9 pr-3 text-sm font-medium text-foreground",
+            "focus:outline-none focus:ring-2 focus:ring-primary/25 focus:border-primary",
+            "disabled:cursor-not-allowed disabled:opacity-60",
+          )}
+        >
+          {classes.map((c) => {
+            const count = countsByClass.get(c.id) ?? 0;
+            return (
+              <option key={c.id} value={c.id}>
+                {c.name}
+                {count > 0 ? ` — ${count} assigned` : ""}
+              </option>
+            );
+          })}
+        </select>
+      </div>
     </label>
   );
 }
 
 // ---------------------------------------------------------------------------
-// Grouping helpers
+// The assignment grid
+// ---------------------------------------------------------------------------
+
+function AssignmentGrid({
+  klass,
+  subjects,
+  cellState,
+  initialCellState,
+  onToggle,
+  disabled,
+}: {
+  klass: ClassWithSections;
+  subjects: SubjectDto[];
+  cellState: Map<string, boolean>;
+  initialCellState: Map<string, boolean>;
+  onToggle: (subjectId: string | null, sectionId: string | null) => void;
+  disabled?: boolean;
+}) {
+  // Rows: a synthetic "(no subject)" row first, then one row per
+  // subject in the school catalog. Columns: a synthetic "Whole class"
+  // column first, then one column per section in the chosen class.
+  const sectionColumns = klass.sections;
+  const hasSections = sectionColumns.length > 0;
+
+  const rows: Array<{ id: string | null; label: string; isSynthetic: boolean }> =
+    [
+      { id: null, label: "Whole class (no subject)", isSynthetic: true },
+      ...subjects.map((s) => ({ id: s.id, label: s.name, isSynthetic: false })),
+    ];
+
+  return (
+    <div className="rounded-lg border border-border overflow-hidden">
+      {/* Header strip — explains what the rows/columns mean. Subject
+          catalog deep-link sits here so admins can jump out and add
+          subjects without losing the grid state (we re-seed on
+          remount, but the dialog itself stays). */}
+      <div className="flex items-center justify-between gap-3 bg-muted/30 px-4 py-2 text-xs">
+        <span className="font-semibold uppercase tracking-wider text-muted-foreground">
+          {klass.name} · {hasSections ? `${sectionColumns.length} section${sectionColumns.length === 1 ? "" : "s"}` : "no sections"}
+        </span>
+        <Link
+          href="/settings"
+          className="font-medium text-primary/80 hover:text-primary hover:underline focus-ring rounded-sm"
+        >
+          Manage subjects
+        </Link>
+      </div>
+
+      {subjects.length === 0 ? (
+        // Subject catalog empty: only the "(no subject)" row makes
+        // sense. Nudge the admin to populate the catalog.
+        <div className="px-4 py-6 text-center text-sm text-muted-foreground">
+          <p className="mb-2">No subjects in your school yet.</p>
+          <p className="text-xs">
+            You can still tick the &quot;Whole class&quot; cell below to give
+            this teacher attendance access; add subjects in{" "}
+            <Link
+              href="/settings"
+              className="font-medium text-primary hover:underline"
+            >
+              Settings
+            </Link>{" "}
+            for per-subject assignments.
+          </p>
+        </div>
+      ) : null}
+
+      <div className="overflow-x-auto">
+        <table className="w-full border-separate border-spacing-0 text-sm">
+          <thead>
+            <tr className="bg-surface">
+              {/* Top-left corner cell: empty (intersection of row +
+                  column headers). */}
+              <th className="sticky left-0 z-10 bg-surface px-3 py-2 text-left text-[11px] font-semibold uppercase tracking-wider text-muted-foreground border-b border-r border-border">
+                Subject ↓ / Section →
+              </th>
+              <ColumnHeader
+                icon={<Layers className="h-3.5 w-3.5" />}
+                label="Whole class"
+                hint="No specific section"
+              />
+              {sectionColumns.map((s) => (
+                <ColumnHeader key={s.id} label={s.name} />
+              ))}
+            </tr>
+          </thead>
+          <tbody>
+            {rows.map((row, idx) => (
+              <tr
+                key={row.id ?? "_no_subject"}
+                className={cn(
+                  "transition-colors",
+                  idx % 2 === 1 && "bg-muted/20",
+                  row.isSynthetic && "bg-emerald-500/[0.04]",
+                )}
+              >
+                <th
+                  scope="row"
+                  className={cn(
+                    "sticky left-0 z-10 px-3 py-2 text-left align-middle text-sm font-medium border-b border-r border-border",
+                    idx % 2 === 1 ? "bg-muted/40" : "bg-surface",
+                    row.isSynthetic &&
+                      "bg-emerald-500/10 text-emerald-900 dark:text-emerald-200 italic",
+                  )}
+                >
+                  {row.label}
+                </th>
+
+                {/* "Whole class" cell (sectionId = null) */}
+                <GridCell
+                  subjectId={row.id}
+                  sectionId={null}
+                  cellState={cellState}
+                  initialCellState={initialCellState}
+                  onToggle={onToggle}
+                  disabled={disabled}
+                />
+
+                {sectionColumns.map((s) => (
+                  <GridCell
+                    key={s.id}
+                    subjectId={row.id}
+                    sectionId={s.id}
+                    cellState={cellState}
+                    initialCellState={initialCellState}
+                    onToggle={onToggle}
+                    disabled={disabled}
+                  />
+                ))}
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      </div>
+
+      <GridLegend />
+    </div>
+  );
+}
+
+function ColumnHeader({
+  label,
+  hint,
+  icon,
+}: {
+  label: string;
+  hint?: string;
+  icon?: React.ReactNode;
+}) {
+  return (
+    <th
+      className="px-3 py-2 text-center text-[11px] font-semibold uppercase tracking-wider text-muted-foreground border-b border-border"
+      title={hint}
+    >
+      <div className="inline-flex items-center gap-1">
+        {icon}
+        {label}
+      </div>
+    </th>
+  );
+}
+
+function GridCell({
+  subjectId,
+  sectionId,
+  cellState,
+  initialCellState,
+  onToggle,
+  disabled,
+}: {
+  subjectId: string | null;
+  sectionId: string | null;
+  cellState: Map<string, boolean>;
+  initialCellState: Map<string, boolean>;
+  onToggle: (subjectId: string | null, sectionId: string | null) => void;
+  disabled?: boolean;
+}) {
+  const key = cellKey(subjectId, sectionId);
+  const checked = cellState.get(key) ?? false;
+  const initial = initialCellState.get(key) ?? false;
+  const isDirty = checked !== initial;
+
+  return (
+    <td className="border-b border-border p-0 text-center align-middle">
+      <button
+        type="button"
+        onClick={() => onToggle(subjectId, sectionId)}
+        disabled={disabled}
+        aria-pressed={checked}
+        aria-label={
+          checked
+            ? "Assigned — click to remove"
+            : "Not assigned — click to add"
+        }
+        className={cn(
+          "group flex h-10 w-full items-center justify-center transition-colors focus:outline-none focus-visible:ring-2 focus-visible:ring-primary/40",
+          // Dirty cells get a subtle amber wash so the admin can see
+          // what's about to change at a glance.
+          isDirty &&
+            (checked
+              ? "bg-emerald-500/15"
+              : "bg-amber-500/15 ring-1 ring-inset ring-amber-300/60"),
+          !isDirty && "hover:bg-muted/40",
+          disabled && "cursor-not-allowed opacity-50",
+        )}
+      >
+        <span
+          className={cn(
+            "flex h-5 w-5 items-center justify-center rounded border transition-all",
+            checked
+              ? "border-emerald-500 bg-emerald-500 text-white shadow-sm"
+              : "border-border bg-surface text-transparent group-hover:border-emerald-300",
+          )}
+        >
+          <Check className="h-3.5 w-3.5" strokeWidth={3} />
+        </span>
+      </button>
+    </td>
+  );
+}
+
+function GridLegend() {
+  return (
+    <div className="flex flex-wrap items-center gap-3 border-t border-border bg-muted/20 px-4 py-2 text-[11px] text-muted-foreground">
+      <span className="inline-flex items-center gap-1.5">
+        <span className="inline-flex h-3.5 w-3.5 items-center justify-center rounded border border-emerald-500 bg-emerald-500 text-white">
+          <Check className="h-2.5 w-2.5" strokeWidth={3} />
+        </span>
+        Assigned
+      </span>
+      <span className="inline-flex items-center gap-1.5">
+        <span className="inline-block h-3 w-3 rounded bg-amber-500/30 ring-1 ring-inset ring-amber-300/60" />
+        Pending change (not yet saved)
+      </span>
+      <span className="ml-auto italic">
+        Click any cell to toggle. Save commits all changes at once.
+      </span>
+    </div>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// Empty / loading states
+// ---------------------------------------------------------------------------
+
+function NoClassesState() {
+  return (
+    <div className="rounded-lg border border-dashed border-border bg-muted/10 px-6 py-10 text-center">
+      <div className="mx-auto flex h-12 w-12 items-center justify-center rounded-full bg-amber-500/10 text-amber-600 ring-1 ring-inset ring-amber-500/20">
+        <AlertCircle className="h-5 w-5" />
+      </div>
+      <h3 className="mt-3 text-sm font-semibold text-foreground">
+        No classes in this school yet
+      </h3>
+      <p className="mt-1 text-xs text-muted-foreground">
+        Create classes in{" "}
+        <Link
+          href="/classes"
+          className="font-medium text-primary hover:underline"
+        >
+          Classes
+        </Link>{" "}
+        before assigning teachers.
+      </p>
+    </div>
+  );
+}
+
+function GridSkeleton() {
+  return (
+    <div className="space-y-3">
+      <Skeleton className="h-10 w-full rounded-md" />
+      <div className="rounded-lg border border-border overflow-hidden">
+        <div className="bg-muted/30 px-4 py-2">
+          <Skeleton className="h-4 w-32" />
+        </div>
+        <div className="divide-y divide-border/60">
+          {Array.from({ length: 4 }).map((_, ri) => (
+            <div key={ri} className="flex items-center gap-3 px-4 py-3">
+              <Skeleton className="h-4 w-24" />
+              <div className="ml-auto flex items-center gap-2">
+                {Array.from({ length: 4 }).map((_, ci) => (
+                  <Skeleton key={ci} className="h-5 w-5 rounded" />
+                ))}
+              </div>
+            </div>
+          ))}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// Helpers
 // ---------------------------------------------------------------------------
 
 /**
- * Group assignments by class. Within each class, sort so "whole class"
- * rows surface first (they're the most general), then alphabetically
- * by section name; tiebreak by subject name. Cross-class order is
- * alphabetical by class name for stable scanning.
+ * Stable key for a (subjectId | null, sectionId | null) cell. Uses an
+ * underscore as the null sentinel — assignment ids are UUIDs so there
+ * is no collision risk.
  */
-function groupByClass(
+function cellKey(subjectId: string | null, sectionId: string | null): string {
+  return `${subjectId ?? "_"}__${sectionId ?? "_"}`;
+}
+
+/**
+ * Build the "checked" map for a class from the teacher's full
+ * assignments list. Only rows on the requested class contribute.
+ */
+function buildCellMap(
   assignments: TeachingAssignmentDto[],
-): AssignmentGroup[] {
-  const map = new Map<string, AssignmentGroup>();
+  classId: string,
+): Map<string, boolean> {
+  const m = new Map<string, boolean>();
   for (const a of assignments) {
-    let group = map.get(a.classId);
-    if (!group) {
-      group = {
-        classId: a.classId,
-        className: a.class.name,
-        items: [],
-      };
-      map.set(a.classId, group);
-    }
-    group.items.push(a);
+    if (a.classId !== classId) continue;
+    m.set(cellKey(a.subjectId, a.sectionId), true);
   }
-  for (const group of map.values()) {
-    group.items.sort((x, y) => {
-      // "Whole class" (null section) before specific sections.
-      if (!x.section && y.section) return -1;
-      if (x.section && !y.section) return 1;
-      const sectionCmp = (x.section?.name ?? "").localeCompare(
-        y.section?.name ?? "",
-      );
-      if (sectionCmp !== 0) return sectionCmp;
-      return (x.subject?.name ?? "").localeCompare(y.subject?.name ?? "");
-    });
+  return m;
+}
+
+/**
+ * Diff the current cell state against the seed snapshot. Only cells
+ * that flipped contribute. Works on the union of keys so a cell
+ * present in one map but missing from the other is still considered.
+ */
+function computeDiff(
+  initial: Map<string, boolean>,
+  current: Map<string, boolean>,
+  classId: string | null,
+): { add: BulkAssignmentTuple[]; remove: BulkAssignmentTuple[] } {
+  const add: BulkAssignmentTuple[] = [];
+  const remove: BulkAssignmentTuple[] = [];
+  if (!classId) return { add, remove };
+
+  const allKeys = new Set<string>([...initial.keys(), ...current.keys()]);
+  for (const key of allKeys) {
+    const was = initial.get(key) ?? false;
+    const now = current.get(key) ?? false;
+    if (was === now) continue;
+    const [subjectIdRaw, sectionIdRaw] = key.split("__");
+    const tuple: BulkAssignmentTuple = {
+      classId,
+      subjectId: subjectIdRaw === "_" ? null : subjectIdRaw,
+      sectionId: sectionIdRaw === "_" ? null : sectionIdRaw,
+    };
+    if (now) add.push(tuple);
+    else remove.push(tuple);
   }
-  return Array.from(map.values()).sort((a, b) =>
-    a.className.localeCompare(b.className),
-  );
+  return { add, remove };
+}
+
+function extractErrorMessage(err: unknown, fallback: string): string {
+  if (err instanceof ApiError) return err.message;
+  if (err instanceof Error) return err.message;
+  return fallback;
 }

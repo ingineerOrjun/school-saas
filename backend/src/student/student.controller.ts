@@ -83,6 +83,43 @@ export class StudentController {
     return this.students.findAll(user.schoolId);
   }
 
+  /**
+   * Cashier-workspace typeahead. Matches `q` against name, symbol no,
+   * phone, parent name. Empty query → most-recent students (used as
+   * the "no input yet" dropdown state). Capped at `limit` (default 10,
+   * max 50) on the server.
+   *
+   * Defined BEFORE the parametric `:id` route — Nest matches in
+   * declaration order, and `/students/search` would otherwise be
+   * captured by `:id` and 400 on the UUID parse.
+   */
+  @Get('search')
+  search(
+    @CurrentUser() user: AuthenticatedUser,
+    @Query('q') q?: string,
+    @Query('limit') limit?: string,
+  ) {
+    return this.students.search(
+      user.schoolId,
+      q ?? '',
+      limit ? parseInt(limit, 10) : undefined,
+    );
+  }
+
+  /**
+   * Aggregated student analytics for the Analytics Center. ADMIN-only —
+   * the per-class roster size could leak admissions data principals
+   * don't want lower-tier staff seeing.
+   *
+   * Like `/search`, must come BEFORE the parametric `:id` route for
+   * the same Nest declaration-order reason.
+   */
+  @Get('analytics')
+  @Roles(Role.ADMIN)
+  getAnalytics(@CurrentUser() user: AuthenticatedUser) {
+    return this.students.getAnalytics(user.schoolId);
+  }
+
   @Get(':id')
   findOne(
     @Param('id', ParseUUIDPipe) id: string,

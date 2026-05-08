@@ -490,11 +490,9 @@ function SignatureLine({ label }: { label: string }) {
 
 // ---------------------------------------------------------------------------
 
-function formatDate(iso: string): string {
-  const d = new Date(iso);
-  return d.toLocaleDateString(undefined, {
-    year: "numeric",
-    month: "short",
-    day: "numeric",
-  });
-}
+// `formatDate` removed: dead code that bypassed the calendar
+// preference. Marksheet date surfaces use <DualDate /> directly,
+// which routes through `formatByMode` and honors the user's choice
+// (B.S. / A.D. / Dual) — adding back a Western-only formatter here
+// would silently re-introduce the divergence the dual-date system
+// is meant to prevent.

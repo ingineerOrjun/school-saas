@@ -22,6 +22,7 @@ import type { AuthenticatedUser } from '../auth/jwt.strategy';
 import { BulkSaveResultsDto } from './dto/bulk-save-results.dto';
 import { CreateExamDto } from './dto/create-exam.dto';
 import { CreateSubjectDto } from './dto/create-subject.dto';
+import { GridSaveResultsDto } from './dto/grid-save-results.dto';
 import { QueryLedgerDto } from './dto/query-ledger.dto';
 import { QueryResultsDto } from './dto/query-results.dto';
 import { SaveResultsDto } from './dto/save-results.dto';
@@ -72,6 +73,20 @@ export class ExamsController {
     // school comes back. Backward-compatible with callers that
     // haven't adopted the session selector yet.
     return this.exams.findAll(user.schoolId, sessionId);
+  }
+
+  /**
+   * Per-exam analytics for the Analytics Center. Public (any
+   * authenticated user) — same rationale as the existing GET /exams
+   * route. The aggregated payload doesn't expose anything you can't
+   * already see by walking the per-student marksheet.
+   */
+  @Get('exams/:id/analytics')
+  getAnalytics(
+    @Param('id', ParseUUIDPipe) id: string,
+    @CurrentUser() user: AuthenticatedUser,
+  ) {
+    return this.exams.getAnalytics(id, user.schoolId);
   }
 
   @Patch('exams/:id')
@@ -165,6 +180,54 @@ export class ExamsController {
       examSubjectId: dto.subjectId,
     });
     return this.results.bulkSave(dto, user.schoolId, user.id);
+  }
+
+  /**
+   * Grid roster — single-call payload that hydrates the
+   * `/exams/marks-entry` grid: exam + class + section + subject
+   * metadata, the full student roster, and each student's existing
+   * result for the (exam, subject). Same scope rule + authorization
+   * as `bulk-save` so admins/staff/teachers can only fetch rosters
+   * they're allowed to grade.
+   */
+  @Get('results/grid-roster')
+  async getGridRoster(
+    @Query('examId', ParseUUIDPipe) examId: string,
+    @Query('classId', ParseUUIDPipe) classId: string,
+    @Query('subjectId', ParseUUIDPipe) subjectId: string,
+    @Query('sectionId') sectionId: string | undefined,
+    @CurrentUser() user: AuthenticatedUser,
+  ) {
+    const normalizedSectionId = sectionId && sectionId.length > 0 ? sectionId : null;
+    await this.scope.assertBulkMarksAccess(user, {
+      classId,
+      sectionId: normalizedSectionId,
+      examSubjectId: subjectId,
+    });
+    return this.results.getGridRoster(
+      { examId, classId, sectionId: normalizedSectionId, subjectId },
+      user.schoolId,
+    );
+  }
+
+  /**
+   * Grid save — fast bulk path used by `/exams/marks-entry`. Same
+   * scope rule as `bulk-save` (a class-bound assignment authorizes
+   * any section). Coexists with `bulk-save` and the per-student
+   * `save` — this is purely additive, not a replacement.
+   */
+  @Post('results/grid-save')
+  @HttpCode(HttpStatus.OK)
+  async gridSaveResults(
+    @Body() dto: GridSaveResultsDto,
+    @CurrentUser() user: AuthenticatedUser,
+  ) {
+    await this.scope.assertBulkMarksAccess(user, {
+      classId: dto.classId,
+      sectionId: dto.sectionId ?? null,
+      examSubjectId: dto.subjectId,
+    });
+    return this.results.gridSave(dto, user.schoolId, user.id);
   }
 
   @Get('results')

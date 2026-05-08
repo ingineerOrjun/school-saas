@@ -19,6 +19,11 @@ datasource db {
 // -----------------------------------------------------------------------------
 
 enum Role {
+  /// Platform owner — bypasses school scoping and accesses the
+  /// /platform UI. Created manually via seed; cannot be promoted from
+  /// the school admin UI. School admins never see these rows in
+  /// their User management list (the service filters them out).
+  SUPER_ADMIN
   ADMIN
   /// Mid-level academic role. STAFF can manage subjects, exams, and
   /// enter results / attendance for ANY class (no teacher-scope check).
@@ -28,6 +33,85 @@ enum Role {
   TEACHER
   STUDENT
   PARENT
+}
+
+/// Platform-level audit action taxonomy. Phase 8 ships with one
+/// action; subsequent platform phases will ADD VALUE for their own
+/// (e.g. SCHOOL_CREATED, SUBSCRIPTION_CHANGED, FEATURE_FLAG_CHANGED,
+/// IMPERSONATION_STARTED, IMPERSONATION_ENDED, ADMIN_PASSWORD_RESET).
+enum PlatformAuditAction {
+  SCHOOL_STATUS_CHANGED
+  /// SUPER_ADMIN started impersonating a school user (Phase 7).
+  /// `target` is the impersonated user; `actor` is the SUPER_ADMIN.
+  IMPERSONATION_STARTED
+  /// Impersonation session ended — either via the explicit "Exit
+  /// impersonation" button or via re-login. Recorded for the
+  /// session-duration trail.
+  IMPERSONATION_ENDED
+  /// New subscription period created for a school (Phase 4). Covers
+  /// initial plan creation, renewals, plan changes, and extensions
+  /// — all are append-only writes via the same code path.
+  SUBSCRIPTION_CREATED
+  /// School-level feature override changed (Phase 5). The
+  /// `before`/`after` JSON snapshots carry the override map so the
+  /// audit row alone tells the full "who turned what on/off" story.
+  FEATURE_FLAG_CHANGED
+  /// Single user's existing JWTs invalidated (Phase 9). Used when
+  /// an operator suspects one account is compromised.
+  USER_FORCE_LOGOUT
+  /// Every user at a school had their JWTs invalidated (Phase 9).
+  /// Heavier hammer than USER_FORCE_LOGOUT — used during incident
+  /// response or after a school-wide credential leak.
+  SCHOOL_FORCE_LOGOUT
+  /// SUPER_ADMIN reset a school user's password (Phase 9). The
+  /// plaintext temp password is delivered to the operator via the
+  /// API response only; the audit row carries no secret material.
+  ADMIN_PASSWORD_RESET
+}
+
+/// Subscription plan tiers (Phase 4). Real billing integration is
+/// out of scope for v1 — the platform owner manually records what
+/// each school is on. Phase 4.x can wire Stripe / eSewa later.
+enum SubscriptionPlan {
+  /// Time-limited evaluation. Same access as MONTHLY but flagged
+  /// for the "trial expiring" warning + the school's `status` is
+  /// auto-set to TRIAL on creation.
+  TRIAL
+  MONTHLY
+  YEARLY
+  /// Perpetual access. `endDate` is NULL on UNLIMITED rows.
+  UNLIMITED
+}
+
+/// Billing cadence. Decoupled from `SubscriptionPlan` because a
+/// future MONTHLY plan billed quarterly (or a YEARLY plan billed
+/// monthly) is realistic. For v1 they line up 1:1.
+enum BillingCycle {
+  MONTHLY
+  YEARLY
+  /// Trials — single payment / one-shot evaluation.
+  ONE_TIME
+  /// UNLIMITED plans — never billed again.
+  PERPETUAL
+}
+
+/// Lifecycle status of a school (tenant) on the platform.
+///
+///   ACTIVE    — paid + healthy. Default for every school today.
+///   TRIAL     — limited-time evaluation. Same access as ACTIVE,
+///               flagged for the principal banner + platform-side
+///               expiry tracking.
+///   SUSPENDED — admin-flipped. Users at this school are blocked
+///               from logging in until the platform owner reactivates.
+///               Existing data preserved untouched.
+///   EXPIRED   — subscription ended. Same effect as SUSPENDED today;
+///               a future Phase 4 will let the platform owner choose
+///               read-only mode instead of full block.
+enum SchoolStatus {
+  ACTIVE
+  TRIAL
+  SUSPENDED
+  EXPIRED
 }
 
 enum AttendanceStatus {
@@ -88,6 +172,42 @@ model School {
   /// Public URL of the school's logo image (PNG/JPG/WebP). Null until
   /// uploaded. Path is served by NestJS at `/uploads/logos/<file>`.
   logoUrl   String?
+  /// Free-form postal/street address shown on printable artifacts
+  /// (receipts, marksheets, ledgers). Nullable — left blank until the
+  /// admin fills it in from Settings.
+  address   String?
+  /// Public phone number, free-form so country code + format are
+  /// admin-controlled. Shown beside the address on receipts.
+  phone     String?  @db.VarChar(40)
+
+  /// Public contact email. Used by the platform layer for support
+  /// communication and subscription notifications. Optional — pre-
+  /// platform schools have no email on file.
+  email     String?  @db.VarChar(180)
+
+  /// Lifecycle status. Default ACTIVE; only the platform layer
+  /// (SUPER_ADMIN) can mutate this. Login + most write paths reject
+  /// when status is SUSPENDED or EXPIRED.
+  status    SchoolStatus @default(ACTIVE)
+
+  /// Subscription expiry. Optional today (Phase 4 wires the full
+  /// subscription model); a non-null value lets the platform UI
+  /// surface "expires in N days" warnings.
+  expiresAt DateTime?
+
+  /// Phase 5 — per-tenant feature overrides. Keys are feature
+  /// catalog entries (see backend/src/feature-flags/feature-catalog.ts);
+  /// values are booleans. An entry here OVERRIDES whatever the
+  /// current subscription says, in either direction:
+  ///
+  ///   • { sms: true }   → force SMS on even if the plan disables it.
+  ///   • { sms: false }  → force SMS off even if the plan enables it.
+  ///
+  /// Absent keys fall through to the subscription layer, then to the
+  /// default catalog. Default `{}` so legacy schools have no
+  /// overrides — they inherit subscription + catalog behaviour.
+  featureOverrides Json @default("{}")
+
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
 
@@ -105,7 +225,9 @@ model School {
   announcements          Announcement[]
   academicSessions       AcademicSession[]
   studentAcademicRecords StudentAcademicRecord[]
+  subscriptions          SchoolSubscription[]
 
+  @@index([status])
   @@map("schools")
 }
 
@@ -122,6 +244,22 @@ model User {
   schoolId String @db.Uuid
   school   School @relation(fields: [schoolId], references: [id], onDelete: Cascade)
 
+  /// Phase 9 — session-invalidation watermark. JWTs whose `iat`
+  /// (issued-at) is older than this timestamp are rejected by the
+  /// auth strategy, regardless of their `exp`. Null on legacy rows
+  /// + on freshly-created users (no revocation point set).
+  ///
+  /// Set by:
+  ///   • SUPER_ADMIN clicking "Force logout" on a user (now()).
+  ///   • SUPER_ADMIN clicking "Force logout all" on a school (now()).
+  ///   • SUPER_ADMIN resetting an admin's password (now()).
+  ///
+  /// The user's next successful login issues a fresh JWT whose
+  /// `iat` is by definition >= tokensValidAfter, so login-then-
+  /// continue works normally. There's no per-token allowlist to
+  /// maintain — this is a watermark, not a denylist.
+  tokensValidAfter DateTime?
+
   // 1:1 profile rows (a user is either a teacher or a student, never both)
   student Student?
   teacher Teacher?
@@ -136,6 +274,10 @@ model User {
   examsUpdated        Exam[]         @relation("ExamUpdatedBy")
   resultsCreated      Result[]       @relation("ResultCreatedBy")
   resultsUpdated      Result[]       @relation("ResultUpdatedBy")
+  paymentsCreated     Payment[]      @relation("PaymentCreatedBy")
+  paymentsUpdated     Payment[]      @relation("PaymentUpdatedBy")
+  platformAuditEvents PlatformAuditEvent[] @relation("PlatformAuditActor")
+  subscriptionsCreated SchoolSubscription[] @relation("SubscriptionCreatedBy")
 
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
@@ -220,7 +362,9 @@ model Class {
 
   sections            Section[]
   students            Student[]
-  teachers            Teacher[]
+  // `teachers` back-relation removed: the legacy Teacher.classId FK
+  // was dropped in 20260511. Teacher → Class is reachable only via
+  // TeachingAssignment.classId now.
   teachingAssignments TeachingAssignment[]
   feeStructures       FeeStructure[]
   academicRecords     StudentAcademicRecord[]
@@ -241,7 +385,9 @@ model Section {
   class   Class  @relation(fields: [classId], references: [id], onDelete: Cascade)
 
   students            Student[]
-  teachers            Teacher[]
+  // `teachers` back-relation removed: the legacy Teacher.sectionId FK
+  // was dropped in 20260511. Teacher → Section is reachable only via
+  // TeachingAssignment.sectionId now.
   teachingAssignments TeachingAssignment[]
   academicRecords     StudentAcademicRecord[]
 
@@ -362,6 +508,13 @@ model Result {
   letterGrade    LetterGrade
   gradePoint     Float
 
+  /// Marked-absent flag for bulk grid entry. When true, the student
+  /// did not appear for this subject — marks are forced to 0 and the
+  /// computed letter grade is NG (NEB rule: failing to appear = NG).
+  /// Defaults to false so every existing row stays valid; the column
+  /// was added in 20260512 for the marks-entry grid.
+  absent Boolean @default(false)
+
   /// Audit. Particularly useful for results since they're often
   /// disputed — knowing which teacher / staff / admin entered or
   /// last edited a mark is important for compliance.
@@ -401,37 +554,20 @@ model Teacher {
   userId String @unique @db.Uuid
   user   User   @relation(fields: [userId], references: [id], onDelete: Cascade)
 
-  /// Assigned class. Drives role-based access: a TEACHER user is only
-  /// allowed to mark attendance / enter marks for students in this
-  /// class. Null when the admin hasn't assigned the teacher anywhere
-  /// yet — a teacher with no classId effectively has read-only access.
-  classId String? @db.Uuid
-  class   Class?  @relation(fields: [classId], references: [id], onDelete: SetNull)
-
-  /// Optional narrower scope. When set, the teacher can ONLY act on
-  /// students in this section (a subset of `class`). Useful when one
-  /// class has multiple sections taught by different teachers.
-  /// The service enforces section.classId === teacher.classId on writes.
-  ///
-  /// DEPRECATED: superseded by the `teachingAssignments` relation. Kept
-  /// on the row so the login flow can still surface a "primary" class
-  /// for routing decisions, and so old admin UIs keep working until
-  /// they migrate. New permission checks read from TeachingAssignment.
-  sectionId String?  @db.Uuid
-  section   Section? @relation(fields: [sectionId], references: [id], onDelete: SetNull)
-
   /// Source of truth for what the teacher can act on. Each row pairs
   /// the teacher with a (class, optional section, optional subject).
   /// A teacher can have many — covering multiple classes and/or
   /// multiple subjects.
+  ///
+  /// NOTE: the legacy `classId` / `sectionId` columns that used to
+  /// live on this row were removed in 20260511 — TeachingAssignment
+  /// is the only place that information lives now.
   assignments TeachingAssignment[]
 
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
 
   @@index([schoolId])
-  @@index([classId])
-  @@index([sectionId])
   @@map("teachers")
 }
 
@@ -618,6 +754,45 @@ model Payment {
   /// How the payment was made. Optional — not every record carries this detail.
   method PaymentMethod?
 
+  /// Lifecycle status — explicit so refund flows mark the source row,
+  /// not just rely on the existence of a back-link. VOID is reserved
+  /// for future "cancel before reconciliation" flows.
+  status PaymentStatus @default(ACTIVE)
+
+  /// When this row is a refund, points back at the original payment it
+  /// reverses. The refund itself is stored as a separate row with
+  /// negative `amount` so the audit history stays append-only — the
+  /// original receipt remains untouched and a new FR-…-R receipt
+  /// number is issued for the refund slip.
+  refundOfPaymentId String?  @unique @db.Uuid
+  refundOf          Payment? @relation("PaymentRefund", fields: [refundOfPaymentId], references: [id], onDelete: SetNull)
+  refundedBy        Payment? @relation("PaymentRefund")
+
+  /// Required for refund rows; null on regular payments. Captures WHY
+  /// the refund happened — auditors will ask, and the operator's
+  /// memory will fail.
+  refundReason String?
+
+  /// Caller-supplied idempotency key. Two POST /payments calls with the
+  /// same `(schoolId, clientRequestId)` resolve to the same Payment row.
+  /// Optional so legacy callers without an idempotency key still work.
+  clientRequestId String? @db.Uuid
+
+  /// Audit: the cashier (User row) who originally recorded this
+  /// payment. Surfaces on the receipt as "Received by …" and on the
+  /// global Payment History table. Nullable for legacy rows that
+  /// pre-date this column; ON DELETE SET NULL preserves the payment
+  /// row if the user is later removed.
+  createdById String? @db.Uuid
+  createdBy   User?   @relation("PaymentCreatedBy", fields: [createdById], references: [id], onDelete: SetNull)
+
+  /// Audit: most recent editor of the row's mutable annotations
+  /// (notes / method via PATCH /payments/:id). Frozen fields like
+  /// amount / receiptNumber are NEVER touched by an edit, but the
+  /// updatedById flips so the trail still reflects who annotated.
+  updatedById String? @db.Uuid
+  updatedBy   User?   @relation("PaymentUpdatedBy", fields: [updatedById], references: [id], onDelete: SetNull)
+
   schoolId String @db.Uuid
   school   School @relation(fields: [schoolId], references: [id], onDelete: Cascade)
 
@@ -625,10 +800,140 @@ model Payment {
   updatedAt DateTime @updatedAt
 
   @@unique([schoolId, receiptNumber])
+  @@unique([schoolId, clientRequestId])
   @@index([schoolId])
   @@index([studentId])
   @@index([feeAssignmentId])
+  @@index([status])
+  @@index([createdById])
   @@map("payments")
+}
+
+/// Lifecycle status of a payment row.
+///   ACTIVE   — the payment counts toward the student's balance.
+///   REFUNDED — the payment was reversed via `POST /payments/:id/refund`.
+///              The reversal is its own row with negative amount; this
+///              flag flips on the source row so dashboards and reports
+///              can see "this was undone" without joining the refund
+///              back-link.
+///   VOID     — reserved. Not currently set by any code path; here for
+///              future "cancel before posting" flows.
+enum PaymentStatus {
+  ACTIVE
+  REFUNDED
+  VOID
+}
+
+// -----------------------------------------------------------------------------
+// Platform audit log
+// -----------------------------------------------------------------------------
+
+/// Append-only log of every platform-level write (Phase 8).
+///
+/// Schema is intentionally generic so a new platform action type
+/// only needs a new `PlatformAuditAction` enum value — never a new
+/// table column. `before` / `after` JSON snapshots store the
+/// minimal slice of the target row that changed, not the whole row;
+/// keeps the audit narrow + privacy-respecting.
+///
+/// `actorUserId` is `NOT NULL` even though the FK constraint is
+/// declared `SetNull` — Postgres will reject a delete of a user who
+/// has audit rows. That's intentional: removing an actor whose
+/// actions are still in the trail would orphan history. Phase 9 may
+/// relax this if the spec needs to support user removal.
+model PlatformAuditEvent {
+  id            String              @id @default(uuid()) @db.Uuid
+  action        PlatformAuditAction
+  /// User who performed the action — typically a SUPER_ADMIN. Email
+  /// + role are denormalized snapshots so deleting/renaming the
+  /// actor later doesn't rewrite history.
+  actorUserId   String              @db.Uuid
+  actor         User                @relation("PlatformAuditActor", fields: [actorUserId], references: [id], onDelete: SetNull)
+  actorEmail    String?
+  actorRole     String?
+  /// What was acted upon. `targetType` is a free-form tag
+  /// ("SCHOOL", "USER", "SUBSCRIPTION") not enforced as an enum —
+  /// it grows as new actions land and we don't want a coupled
+  /// migration every time. `targetLabel` is a human-readable
+  /// snapshot (e.g. the school name) so the audit row is readable
+  /// even if the target is later renamed or deleted.
+  targetType    String
+  targetId      String              @db.Uuid
+  targetLabel   String?
+  /// JSON snapshots of the relevant slice. Keep narrow.
+  before        Json?
+  after         Json?
+  /// Free-form audit reason captured at the call site (required for
+  /// destructive actions like SCHOOL_STATUS_CHANGED → SUSPENDED).
+  reason        String?
+  /// Best-effort capture of network context.
+  ip            String?
+  userAgent     String?
+  createdAt     DateTime            @default(now())
+
+  @@index([action])
+  @@index([actorUserId])
+  @@index([targetType, targetId])
+  @@index([createdAt(sort: Desc)])
+  @@map("platform_audit_events")
+}
+
+// -----------------------------------------------------------------------------
+// School subscriptions
+// -----------------------------------------------------------------------------
+
+/// Append-only subscription history per school. The "current"
+/// subscription is the most recent row by createdAt where the
+/// endDate is in the future (or NULL for UNLIMITED).
+///
+/// Why append-only:
+///   • Every plan change / renewal / extension is its own row, so
+///     the audit trail naturally reflects the lifecycle without
+///     needing version columns or change-tracking. The corresponding
+///     SUBSCRIPTION_CREATED audit event captures the actor + reason.
+///   • Old rows are never edited — that means a future PDF receipt
+///     for "what plan did this school have on date X?" is just a
+///     range query.
+///
+/// Status integration:
+///   • Creating a TRIAL subscription sets `school.status = TRIAL`
+///     and `school.expiresAt = endDate`.
+///   • Creating any other plan whose endDate is in the future flips
+///     the school back to ACTIVE (unless SUSPENDED — the operator
+///     must explicitly reactivate suspended schools).
+///   • `school.expiresAt` is the denormalized cache of the current
+///     subscription's `endDate`. Reads use it; writes update it.
+model SchoolSubscription {
+  id              String           @id @default(uuid()) @db.Uuid
+  schoolId        String           @db.Uuid
+  school          School           @relation(fields: [schoolId], references: [id], onDelete: Cascade)
+  plan            SubscriptionPlan
+  billingCycle    BillingCycle
+  startDate       DateTime
+  /// Null only for UNLIMITED plans. For all other tiers, the
+  /// service computes startDate + cycle if the operator doesn't
+  /// pass an explicit value.
+  endDate         DateTime?
+  /// Null = unlimited. Phase 5 will enforce on writes; today these
+  /// drive the "X of Y students" indicator on the platform UI.
+  studentLimit    Int?
+  teacherLimit    Int?
+  /// Per-feature flags (Phase 5 enforcement). Default `{}` means
+  /// "no overrides; baseline schoolwide-defaults apply."
+  enabledFeatures Json             @default("{}")
+  /// Free-form note captured at create time. Used by the platform
+  /// owner to record "Renewed early at parent's request" or
+  /// "Refunded last cycle, this is the replacement period".
+  notes           String?
+
+  createdById     String?          @db.Uuid
+  createdBy       User?            @relation("SubscriptionCreatedBy", fields: [createdById], references: [id], onDelete: SetNull)
+
+  createdAt       DateTime         @default(now())
+  updatedAt       DateTime         @updatedAt
+
+  @@index([schoolId, createdAt(sort: Desc)])
+  @@map("school_subscriptions")
 }
 
 // -----------------------------------------------------------------------------

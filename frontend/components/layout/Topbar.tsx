@@ -3,11 +3,15 @@
 import * as React from "react";
 import { useRouter } from "next/navigation";
 import {
-  Search,
-  HelpCircle,
+  Briefcase,
   ChevronDown,
+  GraduationCap,
+  HelpCircle,
   LogOut,
   Menu,
+  Search,
+  ShieldCheck,
+  User as UserIcon,
 } from "lucide-react";
 import { toast } from "sonner";
 import { cn } from "@/lib/utils";
@@ -15,12 +19,15 @@ import {
   getStoredUser,
   getStoredSchool,
   logout,
+  type Role,
   type SafeUser,
   type SchoolSummary,
 } from "@/lib/auth";
+import { Skeleton } from "@/components/ui/Skeleton";
 import { ThemeToggle } from "@/components/theme/ThemeToggle";
 import { CalendarToggle } from "@/components/calendar/CalendarToggle";
 import { SessionSelector } from "@/components/academic-session/SessionSelector";
+import { SyncStatusBadge } from "@/components/sync/SyncStatusBadge";
 import { NotificationsBell } from "./NotificationsBell";
 
 export interface TopbarProps {
@@ -35,13 +42,33 @@ export function Topbar({ onMobileMenuClick }: TopbarProps) {
   const router = useRouter();
   const [user, setUser] = React.useState<SafeUser | null>(null);
   const [school, setSchool] = React.useState<SchoolSummary | null>(null);
+  const [hydrated, setHydrated] = React.useState(false);
   const [menuOpen, setMenuOpen] = React.useState(false);
   const menuRef = React.useRef<HTMLDivElement | null>(null);
 
+  // Read auth from localStorage on mount. Until then, `hydrated` is
+  // false → the identity banner shows a skeleton instead of "…", which
+  // matches the spec's fallback rule.
   React.useEffect(() => {
     setUser(getStoredUser());
     setSchool(getStoredSchool());
+    setHydrated(true);
   }, []);
+
+  // Dev-mode session breadcrumb. Fires once whenever the resolved
+  // user changes — useful when debugging "which account am I on?"
+  // tickets where two tabs got their localStorage crossed. Stripped
+  // out of production bundles by the NODE_ENV check.
+  React.useEffect(() => {
+    if (process.env.NODE_ENV === "production") return;
+    if (!user) return;
+    // eslint-disable-next-line no-console
+    console.log("[SESSION]", {
+      name: displayNameFromEmail(user.email),
+      email: user.email,
+      role: user.role,
+    });
+  }, [user]);
 
   React.useEffect(() => {
     if (!menuOpen) return;
@@ -59,13 +86,10 @@ export function Topbar({ onMobileMenuClick }: TopbarProps) {
   };
 
   const initials = user ? initialsFromEmail(user.email) : "??";
-  const displayName = user ? displayNameFromEmail(user.email) : "…";
-  const roleLabel = user ? formatRole(user.role) : "";
 
   return (
     <header className="sticky top-0 z-30 flex h-16 items-center gap-2 sm:gap-4 border-b border-border bg-surface/80 backdrop-blur-md px-3 sm:px-6">
-      {/* Hamburger — mobile only. Opens the sidebar drawer; the parent
-          layout owns the open state and the close handlers. */}
+      {/* Hamburger — mobile only. */}
       <button
         type="button"
         onClick={onMobileMenuClick}
@@ -75,8 +99,7 @@ export function Topbar({ onMobileMenuClick }: TopbarProps) {
         <Menu className="h-[18px] w-[18px]" />
       </button>
 
-      {/* Search — hidden below sm so the topbar stays single-row on
-          phones. Users can still navigate via the hamburger menu. */}
+      {/* Search — hidden below sm so the topbar stays single-row. */}
       <div className="relative hidden sm:block flex-1 max-w-md">
         <Search className="pointer-events-none absolute left-3 top-1/2 -translate-y-1/2 h-4 w-4 text-muted-foreground" />
         <input
@@ -94,42 +117,23 @@ export function Topbar({ onMobileMenuClick }: TopbarProps) {
         </kbd>
       </div>
 
-      {/* Spacer on mobile (no search) so the user cluster pushes right. */}
+      {/* Spacer on mobile so the user cluster pushes right. */}
       <div className="flex-1 sm:hidden" />
 
-      {/* Always-visible role pill — gives the current user immediate
-          context for what they can and can't do. ADMIN gets the
-          indigo brand pill; TEACHER gets a quieter slate pill. */}
-      {user && (
-        <span
-          className={cn(
-            "hidden sm:inline-flex items-center gap-1 rounded-full px-2 py-0.5 text-[10px] font-semibold uppercase tracking-wider",
-            user.role === "ADMIN"
-              ? "bg-primary-50 text-primary-700"
-              : "bg-slate-100 text-slate-700",
-          )}
-        >
-          {roleLabel}
-        </span>
-      )}
-
-      {/* Help + Calendar + Theme + Notifications. Help hides on
-          mobile to save space; the rest stay because they're all
-          frequently-tapped controls. */}
+      {/* Help / session / calendar / theme / notifications.
+          The SyncStatusBadge sits at the front of this cluster so a
+          teacher noticing they're offline mid-roll-call sees it
+          before scanning the rest of the topbar. The badge also
+          mounts the sync engine lifecycle (mount + online event +
+          30s poll) for the entire dashboard tree. */}
       <div className="flex items-center gap-1">
-        {/* SessionSelector self-hides when there are no sessions yet,
-            so it adds nothing to the topbar's visual weight on
-            fresh-install schools. Hidden on the smallest screens
-            because the label can be long ("2024-25"). */}
+        <SyncStatusBadge />
         <span className="hidden sm:inline-flex">
           <SessionSelector />
         </span>
         <IconButton label="Help" className="hidden sm:inline-flex">
           <HelpCircle className="h-[18px] w-[18px]" />
         </IconButton>
-        {/* CalendarToggle hides on the smallest screens — the menu
-            takes ~52px when expanded which crowds the topbar on a
-            375px phone. Settings page can also surface this later. */}
         <span className="hidden sm:inline-flex">
           <CalendarToggle />
         </span>
@@ -137,53 +141,58 @@ export function Topbar({ onMobileMenuClick }: TopbarProps) {
         <NotificationsBell />
       </div>
 
-      {/* Divider — hide on mobile, the avatar already provides
-          sufficient visual separation in the tighter layout. */}
+      {/* Divider — separates utility actions from the identity cluster. */}
       <div className="hidden sm:block mx-2 h-6 w-px bg-border" />
 
-      {/* User menu */}
+      {/* ---------------- Session Identity Banner ---------------- */}
+      {/*
+        Spec'd in the "Session Identity Banner" task — the topbar's
+        right-edge cluster ALWAYS shows who's logged in:
+          • avatar + name (with role-coded pill on the same line)
+          • email on the line below
+        Replaces the old "name / role-text" two-line layout AND the
+        standalone role pill that used to sit among the action icons
+        (which was duplicating the same info, just less prominently).
+        Skeleton placeholder until localStorage hydration completes.
+      */}
       <div className="relative shrink-0" ref={menuRef}>
         <button
           type="button"
           onClick={() => setMenuOpen((v) => !v)}
           className="flex items-center gap-2.5 rounded-md px-1.5 py-1 hover:bg-muted transition-colors focus-ring"
+          aria-label="Open account menu"
         >
           <div className="flex h-8 w-8 items-center justify-center rounded-full bg-gradient-to-br from-primary-400 to-primary-700 text-xs font-semibold text-primary-foreground shadow-xs">
             {initials}
           </div>
-          <div className="hidden sm:flex flex-col items-start leading-tight">
-            <span className="text-sm font-medium text-foreground">
-              {displayName}
-            </span>
-            <span className="text-xs text-muted-foreground">{roleLabel}</span>
-          </div>
+          <IdentityBanner user={user} hydrated={hydrated} />
           <ChevronDown className="hidden sm:block h-4 w-4 text-muted-foreground" />
         </button>
 
         {menuOpen && (
           <div className="absolute right-0 mt-2 w-64 origin-top-right glass rounded-lg p-1 shadow-xl animate-scale-in">
-            <div className="px-3 py-2.5 border-b border-border/50">
+            <div className="px-3 py-2.5 border-b border-border/50 space-y-1.5">
+              {/* Mobile-only identity strip — same Name + Role + Email
+                  the desktop banner shows, surfaced inside the menu so
+                  small-screen users still see the full identity once
+                  they tap the avatar. */}
+              <div className="sm:hidden">
+                <p className="text-sm font-medium text-foreground truncate">
+                  {user ? displayNameFromEmail(user.email) : "—"}
+                </p>
+                {user && (
+                  <div className="mt-1">
+                    <RoleBadge role={user.role} />
+                  </div>
+                )}
+              </div>
               <p className="text-sm font-medium text-foreground truncate">
                 {user?.email ?? "—"}
               </p>
               {school && (
-                <p className="mt-0.5 text-xs text-muted-foreground truncate">
+                <p className="text-xs text-muted-foreground truncate">
                   {school.name}
                 </p>
-              )}
-              {/* Mobile: surface the role pill inside the menu since
-                  the always-visible pill is hidden by the sm: prefix. */}
-              {user && (
-                <span
-                  className={cn(
-                    "sm:hidden mt-2 inline-flex items-center gap-1 rounded-full px-2 py-0.5 text-[10px] font-semibold uppercase tracking-wider",
-                    user.role === "ADMIN"
-                      ? "bg-primary-50 text-primary-700"
-                      : "bg-slate-100 text-slate-700",
-                  )}
-                >
-                  {roleLabel}
-                </span>
               )}
             </div>
             <button
@@ -200,6 +209,148 @@ export function Topbar({ onMobileMenuClick }: TopbarProps) {
     </header>
   );
 }
+
+// ---------------------------------------------------------------------------
+// Identity banner + role badge
+// ---------------------------------------------------------------------------
+
+/**
+ * Two-line cluster shown next to the avatar: name + role pill on top,
+ * email below. The whole banner is hidden on mobile (`hidden sm:flex`)
+ * — small screens fall back to the avatar-only view, with the full
+ * identity available inside the dropdown menu.
+ *
+ * `hydrated` is the gate that distinguishes "we haven't read
+ * localStorage yet" from "we read it and there's no user". The first
+ * case shows skeletons; the second hides the banner entirely so the
+ * topbar collapses cleanly.
+ */
+function IdentityBanner({
+  user,
+  hydrated,
+}: {
+  user: SafeUser | null;
+  hydrated: boolean;
+}) {
+  if (!hydrated) {
+    return (
+      <div className="hidden sm:flex flex-col gap-1 leading-tight">
+        <Skeleton className="h-3 w-28" />
+        <Skeleton className="h-3 w-36" />
+      </div>
+    );
+  }
+  if (!user) {
+    // Hydrated but no user — the layout's auth gate should have
+    // redirected to /login already; render nothing rather than show
+    // empty placeholders.
+    return null;
+  }
+
+  return (
+    <div className="hidden sm:flex flex-col items-start leading-tight max-w-[220px]">
+      <div className="flex items-center gap-1.5 w-full">
+        <span className="text-sm font-medium text-foreground truncate">
+          {displayNameFromEmail(user.email)}
+        </span>
+        <RoleBadge role={user.role} />
+      </div>
+      <span className="text-xs text-muted-foreground truncate w-full text-left">
+        {user.email}
+      </span>
+    </div>
+  );
+}
+
+interface RoleStyle {
+  icon: React.ComponentType<{ className?: string }>;
+  bg: string;
+  text: string;
+  ring: string;
+  label: string;
+}
+
+/**
+ * Role → color/icon/label mapping. Centralized so any future surface
+ * (admin tools, audit log, etc.) can render the same pill consistently.
+ *
+ *   • ADMIN   → indigo + shield  (privilege)
+ *   • STAFF   → amber  + briefcase (mid-level academic)
+ *   • TEACHER → slate  + graduation-cap
+ *   • STUDENT / PARENT fall back to a neutral pill so unmapped roles
+ *     don't crash the banner.
+ */
+const ROLE_STYLES: Record<Role, RoleStyle> = {
+  // SUPER_ADMIN normally renders /platform's own banner, not this
+  // topbar — they're scoped to the school dashboard only when
+  // they've explicitly switched to "School view". The slate-900 chip
+  // makes that switch unmistakable.
+  SUPER_ADMIN: {
+    icon: ShieldCheck,
+    bg: "bg-slate-900",
+    text: "text-white",
+    ring: "ring-slate-800",
+    label: "PLATFORM",
+  },
+  ADMIN: {
+    icon: ShieldCheck,
+    bg: "bg-indigo-50 dark:bg-indigo-500/15",
+    text: "text-indigo-700 dark:text-indigo-300",
+    ring: "ring-indigo-200 dark:ring-indigo-500/30",
+    label: "ADMIN",
+  },
+  STAFF: {
+    icon: Briefcase,
+    bg: "bg-amber-50 dark:bg-amber-500/15",
+    text: "text-amber-800 dark:text-amber-300",
+    ring: "ring-amber-200 dark:ring-amber-500/30",
+    label: "STAFF",
+  },
+  TEACHER: {
+    icon: GraduationCap,
+    bg: "bg-slate-100 dark:bg-slate-500/20",
+    text: "text-slate-700 dark:text-slate-200",
+    ring: "ring-slate-200 dark:ring-slate-500/30",
+    label: "TEACHER",
+  },
+  STUDENT: {
+    icon: UserIcon,
+    bg: "bg-muted",
+    text: "text-muted-foreground",
+    ring: "ring-border",
+    label: "STUDENT",
+  },
+  PARENT: {
+    icon: UserIcon,
+    bg: "bg-muted",
+    text: "text-muted-foreground",
+    ring: "ring-border",
+    label: "PARENT",
+  },
+};
+
+function RoleBadge({ role }: { role: Role }) {
+  const style = ROLE_STYLES[role] ?? ROLE_STYLES.TEACHER;
+  const Icon = style.icon;
+  return (
+    <span
+      className={cn(
+        "inline-flex shrink-0 items-center gap-1 rounded-full px-1.5 py-0.5 text-[10px] font-semibold uppercase tracking-wider ring-1 ring-inset",
+        style.bg,
+        style.text,
+        style.ring,
+      )}
+      aria-label={`Role: ${style.label}`}
+    >
+      <Icon className="h-2.5 w-2.5" />
+      {style.label}
+    </span>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
 
 function IconButton({
   children,
@@ -240,22 +391,4 @@ function displayNameFromEmail(email: string): string {
     .filter(Boolean)
     .map((p) => p[0].toUpperCase() + p.slice(1))
     .join(" ");
-}
-
-/**
- * Maps the raw role enum to the user-facing context label shown in the
- * topbar pill and under the avatar. "Admin Panel" / "Teacher Panel"
- * reads as where-you-are rather than what-you-are, which lines up
- * better with the role-based routing.
- */
-function formatRole(role: string): string {
-  switch (role) {
-    case "ADMIN":
-      return "Admin Panel";
-    case "TEACHER":
-      return "Teacher Panel";
-    default:
-      // Title-case fallback — Student → "Student", Parent → "Parent".
-      return role.charAt(0) + role.slice(1).toLowerCase();
-  }
 }

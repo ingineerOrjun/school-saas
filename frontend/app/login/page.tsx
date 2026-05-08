@@ -1,7 +1,6 @@
 "use client";
 
 import * as React from "react";
-import { useRouter } from "next/navigation";
 import {
   ArrowRight,
   CalendarCheck,
@@ -72,7 +71,9 @@ type Mode = "signin" | "signup";
  * design — only the chrome was replaced.
  */
 export default function LoginPage() {
-  const router = useRouter();
+  // Note: no `useRouter` here. Successful login uses
+  // `window.location.assign` (hard navigation) so SPA state from any
+  // prior session is fully wiped before the dashboard mounts.
   const [mode, setMode] = React.useState<Mode>("signin");
   const [loading, setLoading] = React.useState(false);
   const [email, setEmail] = React.useState("");
@@ -96,7 +97,16 @@ export default function LoginPage() {
         result = await registerAdmin(email, password, schoolName);
         toast.success(`Workspace ready — welcome to ${result.school.name}`);
       }
-      router.push(landingFor(result));
+      // Hard navigation, NOT router.push. Two reasons:
+      //   1. SPA state from any prior session (in-flight queries,
+      //      cached components, contexts) gets fully reset — no risk
+      //      of stale "I was logged in as X" data leaking into the
+      //      new identity.
+      //   2. The dashboard layout's localStorage gate re-runs from a
+      //      fresh module load, so the role/identity pickup is
+      //      deterministic instead of racing whatever React state
+      //      happened to be around.
+      window.location.assign(landingFor(result));
     } catch (err) {
       const message =
         err instanceof ApiError

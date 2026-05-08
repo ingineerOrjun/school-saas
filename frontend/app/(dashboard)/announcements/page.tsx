@@ -25,6 +25,8 @@ import { EmptyState } from "@/components/ui/EmptyState";
 import { DualDate } from "@/components/calendar/DualDate";
 import { useAcademicSession } from "@/components/academic-session/AcademicSessionProvider";
 import { cn } from "@/lib/utils";
+import { FeatureGate } from "@/components/platform/FeatureGate";
+import { FeatureKey } from "@/lib/features";
 
 /**
  * /announcements — school-wide notice board.
@@ -33,8 +35,24 @@ import { cn } from "@/lib/utils";
  *   • WRITES — ADMIN only. The "Add Announcement" button + per-row
  *     delete are gated client-side; the backend re-enforces with
  *     `@Roles(Role.ADMIN)` so a hand-crafted POST 403s either way.
+ *
+ * Phase 5: gated behind the `announcements` feature flag. The
+ * default export wraps the view in a FeatureGate so direct URL
+ * navigation lands on a friendly "feature disabled" panel when
+ * the school's plan / override has it off. SUPER_ADMIN bypasses.
  */
 export default function AnnouncementsPage() {
+  return (
+    <FeatureGate
+      featureKey={FeatureKey.Announcements}
+      featureLabel="Announcements"
+    >
+      <AnnouncementsView />
+    </FeatureGate>
+  );
+}
+
+function AnnouncementsView() {
   const router = useRouter();
   const [list, setList] = React.useState<AnnouncementDto[] | null>(null);
   const [loading, setLoading] = React.useState(true);
@@ -287,7 +305,14 @@ function AnnouncementCard({
                 {announcement.title}
               </h2>
               <p className="mt-0.5 text-xs text-muted-foreground">
-                Posted {formatRelative(announcement.createdAt)} ·{" "}
+                {/* Relative phrase ("5m ago") for fresh items; for
+                    anything older than a week the relative phrase
+                    stays empty and we let the <DualDate /> carry the
+                    full calendar-aware date alone. */}
+                {(() => {
+                  const rel = formatRelative(announcement.createdAt);
+                  return rel ? <>Posted {rel} · </> : <>Posted </>;
+                })()}
                 <DualDate date={announcement.createdAt} />
               </p>
             </div>
@@ -507,17 +532,16 @@ function formatRelative(iso: string): string {
   if (hours < 24) return `${hours}h ago`;
   const days = Math.floor(hours / 24);
   if (days < 7) return `${days}d ago`;
-  return formatExact(iso);
+  // >7 days old: drop the relative phrase entirely. The sibling
+  // <DualDate /> renders the absolute date in the user's chosen
+  // calendar — duplicating it as a Western "Aug 15, 8:05 PM" string
+  // would bypass the preference and clutter the meta line.
+  return "";
 }
 
-function formatExact(iso: string): string {
-  const d = new Date(iso);
-  return d.toLocaleString(undefined, {
-    month: "short",
-    day: "numeric",
-    year:
-      d.getFullYear() !== new Date().getFullYear() ? "numeric" : undefined,
-    hour: "numeric",
-    minute: "2-digit",
-  });
-}
+// `formatExact` was removed in the dual-date pass: the JSX now pairs
+// the relative phrase with a sibling <DualDate />, which renders the
+// absolute date in the user's chosen calendar (B.S. / A.D. / Dual).
+// `formatRelative` returns an empty string for items older than a
+// week so the <DualDate /> stands alone — no redundant Western
+// datetime that would bypass the calendar preference.

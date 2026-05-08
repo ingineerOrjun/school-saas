@@ -34,6 +34,7 @@ import { useDashboardData } from "@/lib/use-dashboard-data";
 import { classesApi, type ClassWithSections } from "@/lib/classes";
 import type { StudentDto } from "@/lib/students";
 import { ApiError } from "@/lib/api";
+import { formatCurrencyShort } from "@/lib/currency";
 import { getStoredUser, type Role } from "@/lib/auth";
 import type {
   DashboardStats,
@@ -77,13 +78,11 @@ type StatConfig = {
   requiresRole?: Role[];
 };
 
-const currencyFmt = new Intl.NumberFormat("en-US", {
-  style: "currency",
-  currency: "USD",
-  maximumFractionDigits: 0,
-});
-const integerFmt = new Intl.NumberFormat("en-US");
-const deltaFmt = new Intl.NumberFormat("en-US", {
+// Currency goes through the centralized utility so the dashboard never
+// drifts from the rest of the app. Integers + percent formatters stay
+// local — they're not currency and have no per-school config.
+const integerFmt = new Intl.NumberFormat("en-IN");
+const deltaFmt = new Intl.NumberFormat("en-IN", {
   style: "percent",
   maximumFractionDigits: 1,
   signDisplay: "exceptZero",
@@ -127,7 +126,7 @@ const STAT_CONFIGS: StatConfig[] = [
     deltaKey: "feesDelta",
     label: "Fees Collected",
     icon: Wallet,
-    format: (v) => currencyFmt.format(v),
+    format: (v) => formatCurrencyShort(v),
     href: "/fees",
     gradient: "from-amber-500/10 via-orange-500/5 to-transparent",
     iconBg: "bg-amber-500/12 text-amber-600 ring-amber-500/20",
@@ -141,7 +140,7 @@ const STAT_CONFIGS: StatConfig[] = [
     deltaKey: "feesDelta",
     label: "General Credit",
     icon: PiggyBank,
-    format: (v) => currencyFmt.format(v),
+    format: (v) => formatCurrencyShort(v),
     href: "/fees",
     gradient: "from-violet-500/10 via-fuchsia-500/5 to-transparent",
     iconBg: "bg-violet-500/12 text-violet-600 ring-violet-500/20",
@@ -176,9 +175,35 @@ const QUICK_ACTIONS: QuickActionItem[] = [
     requiresRole: ["ADMIN"],
   },
   {
-    label: "Schedule an exam",
-    description: "Create exams and enter results",
-    href: "/exams",
+    // Pair-with-Enter-Marks: creating the exam comes first, so
+    // surface it directly in Quick Actions. Admin-only because the
+    // backend gates POST /exams on ADMIN + STAFF and we want the
+    // dashboard CTA to match (STAFF still gets the sidebar link).
+    label: "Create Exam",
+    description: "Set up a new exam with subjects and full marks",
+    href: "/exams/create",
+    icon: BookOpen,
+    requiresRole: ["ADMIN"],
+  },
+  {
+    // Promoted to the primary "exams" CTA: bulk grid is the default
+    // workflow now, so the dashboard sends admins straight there.
+    // The label includes "(Bulk)" so admins immediately understand
+    // it's the class-wide path; per-student edits live behind the
+    // "Individual" tab on the same page.
+    label: "Enter Marks (Bulk)",
+    description: "Type a column of marks for an entire class",
+    href: "/exams/marks",
+    icon: BookOpen,
+  },
+  {
+    // Symmetrical with the entry CTA — admins enter marks on the
+    // bulk page and view them on the ledger. The ledger page has
+    // its own exam + class pickers, so this is a one-click jump
+    // into the read flow.
+    label: "View Results",
+    description: "Class ledger — every student × every subject",
+    href: "/results/ledger",
     icon: BookOpen,
   },
   {
@@ -450,7 +475,13 @@ export function AdminDashboardView() {
           </div>
         </div>
 
-        {/* Right column — onboarding + quick actions */}
+        {/* Right column — onboarding (only while incomplete) +
+            quick actions. Once setup is fully complete the checklist
+            is just chrome — the admin already knows the system. We
+            hide it permanently rather than collapse-with-a-toggle
+            because there's nothing to act on; if a step is later
+            "un-done" (e.g., last admin demoted) the checklist
+            reappears automatically on the next refresh. */}
         <div className="flex flex-col gap-4 animate-fade-in-up [animation-delay:120ms]">
           {isLoading ? (
             <div className="glass rounded-xl p-5 space-y-3">
@@ -464,7 +495,7 @@ export function AdminDashboardView() {
                 </div>
               ))}
             </div>
-          ) : (
+          ) : onboarding.completed < onboarding.total ? (
             <OnboardingChecklist
               steps={onboarding.steps}
               completed={onboarding.completed}
@@ -472,7 +503,7 @@ export function AdminDashboardView() {
               progress={onboarding.progress}
               onStepAction={handleOnboardingStep}
             />
-          )}
+          ) : null}
 
           {(isReady || isEmpty) && (
             <QuickActionsCard items={visibleQuickActions} />
@@ -1012,3 +1043,8 @@ function csvEscape(value: string): string {
   }
   return s;
 }
+
+// (The school-wide attendance trend card that used to live here was
+// removed at the user's request — it didn't fit the dashboard's
+// rhythm. The chart still renders on /attendance/insights, scoped
+// to a class or section, where it has more room to breathe.)

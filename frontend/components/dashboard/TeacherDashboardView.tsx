@@ -16,6 +16,7 @@ import {
   Sparkles,
 } from "lucide-react";
 import { ApiError } from "@/lib/api";
+import { getStoredUser } from "@/lib/auth";
 import { Button } from "@/components/ui/Button";
 import { Skeleton } from "@/components/ui/Skeleton";
 import { Table, THead, TBody, Tr, Th, Td } from "@/components/ui/Table";
@@ -29,6 +30,13 @@ import {
   teachingAssignmentsApi,
   type TeachingAssignmentDto,
 } from "@/lib/teaching-assignments";
+import {
+  attendanceApi,
+  daysAgoISO,
+  todayISO,
+  type AttendanceTrend,
+} from "@/lib/attendance";
+import { Sparkline } from "@/components/charts/Sparkline";
 import { cn } from "@/lib/utils";
 
 /**
@@ -54,31 +62,59 @@ export function TeacherDashboardView() {
   const [loading, setLoading] = React.useState(true);
   const [refreshing, setRefreshing] = React.useState(false);
   const [error, setError] = React.useState<string | null>(null);
+  // Class-scoped attendance trend for the sparkline. Fetched
+  // alongside the summary so the dashboard renders in one pass.
+  // Falls back to null on error / no-assignment — the StatCard then
+  // simply omits the sparkline slot.
+  const [trend, setTrend] = React.useState<AttendanceTrend | null>(null);
 
   const load = React.useCallback(async (isRefresh: boolean) => {
     if (isRefresh) setRefreshing(true);
     else setLoading(true);
     setError(null);
     try {
-      // Two endpoints in parallel:
-      //   • /teachers/me/assignments → the source of truth for the
-      //     "am I assigned?" decision and the list itself
-      //   • /dashboard/teacher-summary → aggregate stats (today's
-      //     attendance, 30-day %, pending tasks, capped roster)
+      // GUARD: only call /teachers/me/assignments when the caller is
+      // actually a TEACHER. The endpoint is gated by @Roles(TEACHER)
+      // and 403s everyone else. With the current 401-only auto-logout
+      // policy, a 403 from this call doesn't log the user out — but
+      // we still avoid firing it for non-TEACHER cached users so the
+      // network panel stays clean.
+      const cachedUser = getStoredUser();
+      const isTeacher = cachedUser?.role === "TEACHER";
+
+      // Tolerate a 403 from listMine specifically — the call CAN 403
+      // legitimately (no Teacher profile linked, role mismatch on a
+      // stale token, etc.) and the right response is "render the
+      // empty hero," NOT propagate to the page-level error state and
+      // NOT log out. 401s still propagate to the catch below where
+      // they get turned into a /login redirect.
+      const safeListMine = async (): Promise<TeachingAssignmentDto[]> => {
+        try {
+          return await teachingAssignmentsApi.listMine();
+        } catch (err) {
+          if (err instanceof ApiError && err.status === 403) {
+            return [];
+          }
+          throw err;
+        }
+      };
+
       const [summary, assignments] = await Promise.all([
         dashboardApi.getTeacherSummary(),
-        teachingAssignmentsApi.listMine().catch((err) => {
-          // 403 here means "not a TEACHER row yet" — treat as "no
-          // assignments" so the empty hero renders cleanly instead of
-          // failing the whole page over a partial-setup state.
-          if (err instanceof ApiError && err.status === 403) return [];
-          throw err;
-        }),
+        isTeacher
+          ? safeListMine()
+          : Promise.resolve<TeachingAssignmentDto[]>([]),
       ]);
       setData(summary);
       setMyAssignments(assignments);
+      // Diagnostic — pair with the admin-side "Assignments (admin
+      // save result)" log to spot mismatches between "what was saved"
+      // and "what the teacher's dashboard reads back".
+      console.log("Assignments:", assignments);
     } catch (err) {
-      // 401 — token expired/invalid. Bounce to login.
+      // 401 — token expired/invalid. Global handler in api.ts already
+      // started the redirect; keep the early return so this view
+      // doesn't try to render with partial state.
       if (err instanceof ApiError && err.status === 401) {
         router.replace("/login");
         return;
@@ -194,6 +230,74 @@ export function TeacherDashboardView() {
     };
   }, [load]);
 
+  // Derived assignment list, built via useMemo so the reference
+  // is stable across renders that don't actually change the inputs.
+  // Computed BEFORE the early-return block below — it's a hook
+  // (`useMemo`) and React's Rules of Hooks forbid skipping any
+  // hook in any render. The previous structure had this derivation
+  // (and the trend `useEffect` that depends on it) AFTER the early
+  // returns, so the trend effect fired only on later renders →
+  // hook order changed between renders → React warning.
+  const liveAssignments = React.useMemo<TeacherDashboardAssignment[]>(() => {
+    if (!data || !myAssignments) return [];
+    const summaryCountById = new Map(
+      data.teacher.assignments.map((a) => [a.id, a.studentCount]),
+    );
+    return myAssignments.map((a) => ({
+      id: a.id,
+      classId: a.classId,
+      className: a.class.name,
+      sectionId: a.sectionId,
+      sectionName: a.section?.name ?? null,
+      subjectId: a.subjectId,
+      subjectName: a.subject?.name ?? null,
+      studentCount: summaryCountById.get(a.id) ?? 0,
+      attendanceQuery: a.sectionId
+        ? `sectionId=${a.sectionId}`
+        : `classId=${a.classId}`,
+    }));
+  }, [data, myAssignments]);
+  const primaryAssignment = liveAssignments[0] ?? null;
+
+  // Sparkline data keyed off the primary assignment's classId /
+  // sectionId. Effect re-runs when the assignment id changes (e.g.,
+  // admin re-assigns the teacher mid-session) so the sparkline
+  // tracks whichever class the hero CTA points at.
+  //
+  // POSITION: must run on every render (no conditional skip) — see
+  // the hook-order note on the useMemo above. Internally it short-
+  // circuits when there's no primary assignment yet, so loading /
+  // unassigned states cost nothing.
+  React.useEffect(() => {
+    if (!primaryAssignment) {
+      setTrend(null);
+      return;
+    }
+    let cancelled = false;
+    (async () => {
+      try {
+        const data = await attendanceApi.getTrend({
+          fromDate: daysAgoISO(13), // 14 days, generous enough to show ~10 school days
+          toDate: todayISO(),
+          sectionId: primaryAssignment.sectionId ?? undefined,
+          classId: primaryAssignment.sectionId
+            ? undefined
+            : primaryAssignment.classId,
+        });
+        if (!cancelled) setTrend(data);
+      } catch {
+        // Sparkline is decorative — silent fail keeps the rest of
+        // the dashboard usable when the trend endpoint hiccups.
+        if (!cancelled) setTrend(null);
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [primaryAssignment]);
+
+  // ---- Early-return states (rendered AFTER all hooks have run) ----
+
   if (loading) {
     return <TeacherDashboardSkeleton />;
   }
@@ -214,33 +318,18 @@ export function TeacherDashboardView() {
   // copy only when both arrays are empty (defensive — they should
   // always agree because the backend reads the same table).
   if (myAssignments.length === 0) {
-    return <UnassignedHero teacherName={data.teacher.name} />;
+    // Pass the same refresh + refreshing wires the assigned hero
+    // uses, so a teacher whose admin JUST assigned them isn't stuck
+    // waiting up to 45s for the next poll. They can hit "Check
+    // again" the moment they expect data.
+    return (
+      <UnassignedHero
+        teacherName={data.teacher.name}
+        onRefresh={() => load(true)}
+        refreshing={refreshing}
+      />
+    );
   }
-
-  // Build the rendered assignment list from the live endpoint, but
-  // merge in the per-row student counts the dashboard summary computed
-  // (the listMine endpoint doesn't include those — they're a dashboard
-  // concern, not a permissions one). Falls back to 0 for assignments
-  // that exist live but weren't in the summary's snapshot.
-  const summaryCountById = new Map(
-    data.teacher.assignments.map((a) => [a.id, a.studentCount]),
-  );
-  const liveAssignments: TeacherDashboardAssignment[] = myAssignments.map(
-    (a) => ({
-      id: a.id,
-      classId: a.classId,
-      className: a.class.name,
-      sectionId: a.sectionId,
-      sectionName: a.section?.name ?? null,
-      subjectId: a.subjectId,
-      subjectName: a.subject?.name ?? null,
-      studentCount: summaryCountById.get(a.id) ?? 0,
-      attendanceQuery: a.sectionId
-        ? `sectionId=${a.sectionId}`
-        : `classId=${a.classId}`,
-    }),
-  );
-  const primaryAssignment = liveAssignments[0] ?? null;
 
   // Hero label collapses across assignments:
   //   • 1 assignment → "Class 8 · A" (or just "Class 8" / w/ subject)
@@ -291,6 +380,22 @@ export function TeacherDashboardView() {
           subtitle={`${data.classAttendance30d.totalDays} attendance entries`}
           icon={ClipboardCheck}
           tint="indigo"
+          extra={
+            // Sparkline of the last ~14 days (only days with marks
+            // recorded show as data points; weekends / holidays
+            // become gaps). Hidden until the trend resolves so the
+            // card doesn't reflow under the user's eye.
+            trend && trend.daily.length >= 2 ? (
+              <Sparkline
+                values={trend.daily.map((d) => d.percentage)}
+                width={140}
+                height={28}
+                strokeClassName="text-indigo-500 dark:text-indigo-400"
+                filled
+                ariaLabel="Last 14 days attendance sparkline"
+              />
+            ) : null
+          }
         />
         <StatCard
           label="Students in scope"
@@ -585,12 +690,19 @@ function StatCard({
   subtitle,
   icon: Icon,
   tint,
+  extra,
 }: {
   label: string;
   value: string;
   subtitle: string;
   icon: React.ComponentType<{ className?: string }>;
   tint: Tint;
+  /**
+   * Optional slot rendered below the subtitle. Used for inline
+   * sparklines on stat cards that benefit from a trend visualization
+   * (e.g., "Last 30 days" gets a 7-day sparkline of recent days).
+   */
+  extra?: React.ReactNode;
 }) {
   const t = TINT_CLASSES[tint];
   return (
@@ -618,6 +730,7 @@ function StatCard({
             {value}
           </span>
           <span className="text-xs text-muted-foreground">{subtitle}</span>
+          {extra && <div className="mt-1">{extra}</div>}
         </div>
       </div>
     </div>
@@ -660,7 +773,11 @@ function PendingTasksCard({
       key: `exam:${exam.id}`,
       title: `Enter results for ${exam.name}`,
       description: "No marks have been recorded for your students yet.",
-      href: "/exams",
+      // Land on the unified marks page — defaults to the bulk grid,
+      // which is the right tool for "no marks yet" (whole class to
+      // grade). Teachers can still flip to the Individual tab from
+      // there if they need per-student edits.
+      href: "/exams/marks",
       cta: "Enter marks",
     });
   }
@@ -800,26 +917,69 @@ function AttendancePill({
 // Unassigned hero
 // ---------------------------------------------------------------------------
 
-function UnassignedHero({ teacherName }: { teacherName: string }) {
+function UnassignedHero({
+  teacherName,
+  onRefresh,
+  refreshing,
+}: {
+  teacherName: string;
+  onRefresh: () => void;
+  refreshing: boolean;
+}) {
+  // Auto-refresh aggressively while we're in the unassigned state.
+  // The normal dashboard polling runs every 45s once past the burst,
+  // which means a teacher whose admin just assigned them could wait
+  // up to 45s for the next check. While unassigned, we re-check
+  // every 7s — small enough to feel responsive, large enough not to
+  // hammer the API. Stops automatically the moment they get assigned
+  // (this whole component unmounts and the assigned hero takes over).
+  React.useEffect(() => {
+    const id = window.setInterval(() => {
+      onRefresh();
+    }, 7_000);
+    return () => window.clearInterval(id);
+  }, [onRefresh]);
+
   return (
     <div className="space-y-6">
-      <div className="rounded-2xl border border-amber-300/60 bg-amber-50 p-8 animate-fade-in-up">
+      <div className="rounded-2xl border border-amber-300/60 bg-amber-50 dark:bg-amber-500/10 p-8 animate-fade-in-up">
         <div className="flex items-start gap-4">
-          <div className="flex h-10 w-10 shrink-0 items-center justify-center rounded-full bg-amber-500/15 text-amber-700">
+          <div className="flex h-10 w-10 shrink-0 items-center justify-center rounded-full bg-amber-500/15 text-amber-700 dark:text-amber-400">
             <AlertCircle className="h-5 w-5" />
           </div>
-          <div className="space-y-2">
+          <div className="flex-1 space-y-2">
             <h1 className="text-2xl font-semibold tracking-tight text-foreground">
               Welcome, {teacherName}
             </h1>
+            <p className="text-base font-medium text-foreground">
+              You are not assigned to any class or subject yet.
+            </p>
             <p className="text-sm text-muted-foreground max-w-xl">
-              You&apos;re not assigned to a class yet. Once your school admin
-              assigns you a class (or section), you&apos;ll be able to mark
-              attendance, view your roster, and enter exam results from here.
+              Please contact your admin. Once they assign you a class
+              (or specific section / subject), you&apos;ll be able to mark
+              attendance, view your roster, and enter exam results from
+              this dashboard.
             </p>
-            <p className="text-sm text-muted-foreground">
-              Reach out to your admin to get set up.
+            <p className="text-xs text-muted-foreground">
+              This page rechecks automatically every few seconds, so the
+              moment your admin assigns you, the dashboard will load
+              itself.
             </p>
+            <div className="pt-3">
+              <Button
+                variant="outline"
+                size="sm"
+                onClick={onRefresh}
+                loading={refreshing}
+                leftIcon={
+                  !refreshing ? (
+                    <RefreshCcw className="h-3.5 w-3.5" />
+                  ) : undefined
+                }
+              >
+                Check again
+              </Button>
+            </div>
           </div>
         </div>
       </div>

@@ -1,8 +1,6 @@
 import {
   IsEmail,
-  IsOptional,
   IsString,
-  IsUUID,
   Matches,
   MaxLength,
   MinLength,
@@ -14,9 +12,15 @@ const PASSWORD_PATTERN = /^(?=.*[a-z])(?=.*[A-Z])(?=.*\d).+$/;
 
 /**
  * Payload for the "create teacher login in one step" flow used by the
- * Add Teacher dialog. The endpoint creates a User row (role=TEACHER) AND
- * a Teacher row in a single transaction, links them, and optionally
- * assigns a class/section.
+ * Add Teacher dialog. The endpoint creates a User row (role=TEACHER)
+ * AND a Teacher row in a single transaction and links them.
+ *
+ * Class/section assignment is NOT part of this DTO any more — the
+ * legacy `Teacher.classId/sectionId` columns were dropped, and the
+ * only path to assignments is the AssignmentsDialog grid (POST
+ * /teachers/:id/assignments/bulk). The login hard-guard rejects
+ * teacher logins until at least one assignment exists, so the admin
+ * UX is: create teacher → assign immediately → teacher signs in.
  */
 export class CreateTeacherWithUserDto {
   @IsString()
@@ -35,12 +39,4 @@ export class CreateTeacherWithUserDto {
       'Password must contain at least one uppercase letter, one lowercase letter, and one number.',
   })
   password!: string;
-
-  @IsOptional()
-  @IsUUID()
-  classId?: string | null;
-
-  @IsOptional()
-  @IsUUID()
-  sectionId?: string | null;
 }

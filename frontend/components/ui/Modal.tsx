@@ -97,19 +97,27 @@ export function Modal({
           "relative w-full bg-surface rounded-xl border border-border shadow-xl",
           closing ? "animate-scale-out" : "animate-scale-in",
           sizeClasses[size],
+          // Cap the panel at viewport height with a small breathing
+          // margin so its FOOTER (and any sticky-bottom child of the
+          // body) always stays on-screen. Tall content scrolls inside
+          // the body instead of pushing the modal off the page.
+          "max-h-[calc(100vh-2rem)] flex flex-col",
           className,
         )}
       >
         <button
           type="button"
           onClick={onClose}
-          className="absolute right-4 top-4 text-muted-foreground hover:text-foreground transition-colors focus-ring rounded-md p-1"
+          className="absolute right-4 top-4 z-10 text-muted-foreground hover:text-foreground transition-colors focus-ring rounded-md p-1"
           aria-label="Close"
         >
           <X className="h-4 w-4" />
         </button>
         {(title || description) && (
-          <div className="px-6 pt-6 pb-4 border-b border-border/70">
+          // shrink-0 so the header keeps its natural height even
+          // when the body is scrolling (otherwise flex would
+          // distribute height proportionally).
+          <div className="shrink-0 px-6 pt-6 pb-4 border-b border-border/70">
             {title && (
               <h2 className="text-lg font-semibold tracking-tight text-foreground">
                 {title}
@@ -122,9 +130,15 @@ export function Modal({
             )}
           </div>
         )}
-        <div className="px-6 py-5">{children}</div>
+        {/* min-h-0 + flex-1 + overflow-y-auto — the standard
+            "scrollable region inside a flex column" recipe. Without
+            min-h-0, the body would refuse to shrink below its
+            content size and overflow the panel. */}
+        <div className="flex-1 min-h-0 overflow-y-auto px-6 py-5">
+          {children}
+        </div>
         {footer && (
-          <div className="flex items-center justify-end gap-2 px-6 py-4 border-t border-border/70 bg-muted/30 rounded-b-xl">
+          <div className="shrink-0 flex items-center justify-end gap-2 px-6 py-4 border-t border-border/70 bg-muted/30 rounded-b-xl">
             {footer}
           </div>
         )}

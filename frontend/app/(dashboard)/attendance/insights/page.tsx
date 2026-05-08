@@ -18,11 +18,19 @@ import {
 import { toast } from "sonner";
 import { cn } from "@/lib/utils";
 import { ApiError } from "@/lib/api";
+import { useCalendarMode } from "@/components/calendar/CalendarProvider";
+import { formatByMode, type CalendarMode } from "@/lib/date";
+import { AttendanceTrendChart } from "@/components/charts/AttendanceTrendChart";
+import {
+  LowAttendanceBar,
+  type LowAttendanceBarItem,
+} from "@/components/charts/LowAttendanceBar";
 import {
   attendanceApi,
   daysAgoISO,
   todayISO,
   type AttendanceReport,
+  type AttendanceTrend,
   type ClassAttendanceReport,
   type SectionAttendanceReport,
   type StudentAttendanceReport,
@@ -414,6 +422,7 @@ function StudentReportView({ report }: { report: StudentAttendanceReport }) {
   const sectionLabel = report.student.section
     ? `${report.student.section.className} · ${report.student.section.name}`
     : "Unassigned";
+  const calendarMode = useCalendarMode();
   return (
     <div className="space-y-4 animate-fade-in-up">
       <div className="glass rounded-xl p-5">
@@ -427,7 +436,8 @@ function StudentReportView({ report }: { report: StudentAttendanceReport }) {
           {report.student.symbolNumber
             ? `#${report.student.symbolNumber} · `
             : ""}
-          {sectionLabel} · {formatRangeLabel(report.fromDate, report.toDate)}
+          {sectionLabel} ·{" "}
+          {formatRangeLabel(report.fromDate, report.toDate, calendarMode)}
         </p>
       </div>
       <StatsRow
@@ -447,6 +457,14 @@ function StudentReportView({ report }: { report: StudentAttendanceReport }) {
 
 function SectionReportView({ report }: { report: SectionAttendanceReport }) {
   const below = report.lowAttendanceCount;
+  const calendarMode = useCalendarMode();
+  const trend = useScopeTrend(report.fromDate, report.toDate, {
+    sectionId: report.section.id,
+  });
+  const lowItems = React.useMemo(
+    () => toLowAttendanceItems(report.students),
+    [report.students],
+  );
 
   return (
     <div className="space-y-4 animate-fade-in-up">
@@ -466,7 +484,7 @@ function SectionReportView({ report }: { report: SectionAttendanceReport }) {
           )}
         </div>
         <p className="mt-0.5 text-sm text-muted-foreground">
-          {formatRangeLabel(report.fromDate, report.toDate)} ·{" "}
+          {formatRangeLabel(report.fromDate, report.toDate, calendarMode)} ·{" "}
           {report.students.length}{" "}
           {report.students.length === 1 ? "student" : "students"}
         </p>
@@ -479,6 +497,34 @@ function SectionReportView({ report }: { report: SectionAttendanceReport }) {
         totalDays={report.totalDays}
         lowAttendanceCount={report.lowAttendanceCount}
       />
+
+      {/* Daily trend — surfaces dips and recoveries that the
+          aggregate "%" stat alone hides. Skipped silently when
+          the trend fetch fails (chart is decorative). */}
+      {trend && trend.daily.length > 0 && (
+        <div className="glass rounded-xl p-5">
+          <AttendanceTrendChart
+            data={trend.daily}
+            title={`Daily attendance — ${trend.scopeLabel}`}
+            height={240}
+          />
+        </div>
+      )}
+
+      {/* Low-attendance leaderboard — sorted ascending so the most
+          urgent rows lead. Threshold matches the StatsRow flag
+          (75%); items above the bar still appear (capped to 8) for
+          context but render in emerald rather than red. */}
+      {lowItems.length > 0 && (
+        <div className="glass rounded-xl p-5">
+          <LowAttendanceBar
+            items={lowItems}
+            threshold={LOW_ATTENDANCE_THRESHOLD}
+            limit={8}
+            title="Lowest attendance — top 8"
+          />
+        </div>
+      )}
 
       {report.students.length === 0 ? (
         <div className="glass rounded-xl">
@@ -501,6 +547,14 @@ function SectionReportView({ report }: { report: SectionAttendanceReport }) {
 
 function ClassReportView({ report }: { report: ClassAttendanceReport }) {
   const below = report.lowAttendanceCount;
+  const calendarMode = useCalendarMode();
+  const trend = useScopeTrend(report.fromDate, report.toDate, {
+    classId: report.class.id,
+  });
+  const lowItems = React.useMemo(
+    () => toLowAttendanceItems(report.students),
+    [report.students],
+  );
 
   return (
     <div className="space-y-4 animate-fade-in-up">
@@ -520,7 +574,7 @@ function ClassReportView({ report }: { report: ClassAttendanceReport }) {
           )}
         </div>
         <p className="mt-0.5 text-sm text-muted-foreground">
-          {formatRangeLabel(report.fromDate, report.toDate)} ·{" "}
+          {formatRangeLabel(report.fromDate, report.toDate, calendarMode)} ·{" "}
           {report.students.length}{" "}
           {report.students.length === 1 ? "student" : "students"} · no section
         </p>
@@ -533,6 +587,29 @@ function ClassReportView({ report }: { report: ClassAttendanceReport }) {
         totalDays={report.totalDays}
         lowAttendanceCount={report.lowAttendanceCount}
       />
+
+      {/* Same chart pair as the section view — see SectionReportView
+          for the rationale comments. Class scope here covers
+          students linked directly without a section. */}
+      {trend && trend.daily.length > 0 && (
+        <div className="glass rounded-xl p-5">
+          <AttendanceTrendChart
+            data={trend.daily}
+            title={`Daily attendance — ${trend.scopeLabel}`}
+            height={240}
+          />
+        </div>
+      )}
+      {lowItems.length > 0 && (
+        <div className="glass rounded-xl p-5">
+          <LowAttendanceBar
+            items={lowItems}
+            threshold={LOW_ATTENDANCE_THRESHOLD}
+            limit={8}
+            title="Lowest attendance — top 8"
+          />
+        </div>
+      )}
 
       {report.students.length === 0 ? (
         <div className="glass rounded-xl">
@@ -1132,17 +1209,81 @@ function Td({
   );
 }
 
-function formatRangeLabel(from: string, to: string): string {
-  const a = new Date(from);
-  const b = new Date(to);
-  const fmt = (d: Date) =>
-    d.toLocaleDateString(undefined, {
-      month: "short",
-      day: "numeric",
-      year:
-        a.getFullYear() === b.getFullYear() && a.getFullYear() === new Date().getFullYear()
-          ? undefined
-          : "numeric",
-    });
-  return `${fmt(a)} — ${fmt(b)}`;
+/**
+ * Range label like "2081-04-17 — 2081-05-15", routed through
+ * `formatByMode` so the user's calendar preference is honored.
+ *
+ * Tradeoff vs. the previous Western-only "Aug 1 — Aug 30" rendering:
+ * we lose the year-omission shorthand (formatByMode always returns
+ * full YYYY-MM-DD), but we gain consistency with every other date
+ * surface in the app — and the spec mandates "ALWAYS use displayDate,
+ * NEVER use toLocaleDateString."
+ */
+function formatRangeLabel(
+  from: string,
+  to: string,
+  mode: CalendarMode,
+): string {
+  return `${formatByMode(from, mode)} — ${formatByMode(to, mode)}`;
+}
+
+/**
+ * Fetch the attendance trend for a (scope × date range). Used by the
+ * Class / Section views to render the line chart above the existing
+ * stats. Returns null until the request resolves so callers can skip
+ * the chart while loading.
+ */
+function useScopeTrend(
+  fromDate: string,
+  toDate: string,
+  scope: { sectionId?: string; classId?: string },
+): AttendanceTrend | null {
+  const [trend, setTrend] = React.useState<AttendanceTrend | null>(null);
+
+  // Stable scope key so the effect re-fires only when the scope
+  // identity actually changes (not on every render).
+  const scopeKey = `${scope.sectionId ?? ""}|${scope.classId ?? ""}`;
+
+  React.useEffect(() => {
+    let cancelled = false;
+    (async () => {
+      try {
+        const data = await attendanceApi.getTrend({
+          fromDate,
+          toDate,
+          sectionId: scope.sectionId,
+          classId: scope.sectionId ? undefined : scope.classId,
+        });
+        if (!cancelled) setTrend(data);
+      } catch {
+        // Insights charts are decorative — silent fail keeps the
+        // rest of the page usable.
+        if (!cancelled) setTrend(null);
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [fromDate, toDate, scopeKey]);
+
+  return trend;
+}
+
+/**
+ * Map StudentReportRow[] → LowAttendanceBarItem[] for the chart.
+ * Filters out rows with no recorded data (percentage === null) since
+ * the bar chart needs a numeric value to plot.
+ */
+function toLowAttendanceItems(
+  rows: StudentReportRow[],
+): LowAttendanceBarItem[] {
+  return rows
+    .filter((r) => r.percentage !== null)
+    .map((r) => ({
+      studentId: r.studentId,
+      name: `${r.firstName} ${r.lastName}`,
+      percentage: r.percentage!,
+      symbolNumber: r.symbolNumber,
+    }));
 }

@@ -66,6 +66,23 @@ export class TeacherController {
     return this.teachers.findOne(id, user.schoolId);
   }
 
+  /**
+   * Compact assignment counts (`total / classes / sections / subjects`)
+   * for one teacher. Used by the admin UI to render "3 Classes · 5
+   * Subjects" without pulling the full row payload. Same counts are
+   * embedded in the list/findOne responses; this endpoint is here for
+   * any caller that wants ONLY the summary.
+   */
+  @Get(':id/assignment-summary')
+  @UseGuards(RolesGuard)
+  @Roles(Role.ADMIN, Role.STAFF)
+  assignmentSummary(
+    @Param('id', ParseUUIDPipe) id: string,
+    @CurrentUser() user: AuthenticatedUser,
+  ) {
+    return this.teachers.getAssignmentSummary(id, user.schoolId);
+  }
+
   @Patch(':id')
   update(
     @Param('id', ParseUUIDPipe) id: string,

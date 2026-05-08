@@ -1,5 +1,6 @@
 import {
   ConflictException,
+  ForbiddenException,
   Injectable,
   UnauthorizedException,
 } from '@nestjs/common';
@@ -8,6 +9,7 @@ import { Role, School, User } from '@prisma/client';
 import { randomBytes } from 'crypto';
 import { HashingService } from '../common/hashing/hashing.service';
 import { PrismaService } from '../database/prisma.service';
+import { PlatformService } from '../platform/platform.service';
 import { LoginDto } from './dto/login.dto';
 import { RegisterAdminDto } from './dto/register-admin.dto';
 import type { JwtPayload } from './types/jwt-payload';
@@ -119,10 +121,26 @@ export class AuthService {
 
     const { school, ...userWithoutSchool } = user;
 
+    // Tenant gate: a SUSPENDED or EXPIRED school blocks ALL of its
+    // users from logging in (including the school's own ADMIN). The
+    // SUPER_ADMIN role is exempt — platform owners aren't tied to a
+    // tenant and the gate is for tenants only. The platform layer
+    // owns the only path that flips a school to either status, so
+    // this enforcement is the corresponding read-side check.
+    if (user.role !== Role.SUPER_ADMIN) {
+      PlatformService.assertSchoolCanLogin(school.status);
+    }
+
     // For TEACHER users, derive the landing context from
-    // TeachingAssignment — NOT the legacy Teacher.classId column,
-    // which doesn't update when admins add new-style assignments.
-    // First assignment by createdAt is the "primary" landing class.
+    // TeachingAssignment (the only source of truth — the legacy
+    // Teacher.classId/sectionId columns were dropped). First
+    // assignment by createdAt is the "primary" landing class.
+    //
+    // HARD GUARD: a TEACHER with zero TeachingAssignment rows is
+    // blocked at the door with a 403. Admins must assign at least one
+    // class/subject before the teacher can sign in. This eliminates
+    // the "logged in but stranded with no permissions" state and
+    // matches the spec's stable-by-construction requirement.
     let teacher: TeacherContext | null = null;
     if (user.role === Role.TEACHER) {
       const t = await this.prisma.teacher.findFirst({
@@ -136,10 +154,15 @@ export class AuthService {
         },
       });
       const first = t?.assignments[0] ?? null;
+      if (!first) {
+        throw new ForbiddenException(
+          'No class/subject assigned. Contact admin.',
+        );
+      }
       teacher = {
-        hasAssignments: !!first,
-        classId: first?.classId ?? null,
-        sectionId: first?.sectionId ?? null,
+        hasAssignments: true,
+        classId: first.classId,
+        sectionId: first.sectionId,
       };
     }
 

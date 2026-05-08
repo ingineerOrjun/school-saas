@@ -32,24 +32,52 @@ export class UserService {
    * order stable across reloads.
    */
   async list(schoolId: string): Promise<UserListRow[]> {
+    // Hide orphan TEACHER users — those whose Teacher profile was
+    // deleted on its own (before the cascade-via-User fix landed)
+    // and now sit in the DB as dead logins:
+    //   • role = TEACHER
+    //   • teacher relation = null
+    //   • can't actually sign in (login hard-guard rejects them)
+    //
+    // Surfacing them in Settings → Users & roles caused real
+    // confusion ("I deleted that teacher already, why are they
+    // still here?"). We pull the relation, then filter in JS so
+    // the query stays portable; with a school's user count this
+    // is in the tens-to-hundreds range, the post-filter is free.
+    //
+    // Going forward `TeacherService.remove()` deletes via the User
+    // row (which cascade-deletes the Teacher), so no NEW orphans
+    // are created. This filter just cleans up the historical mess.
     const rows = await this.prisma.user.findMany({
-      where: { schoolId },
+      where: {
+        schoolId,
+        // Platform-tier rows (SUPER_ADMIN) are scoped to a school
+        // for FK reasons but never appear in school user-management.
+        // Filtering at the read path is sufficient because no school-
+        // side write path can create one (registration only mints
+        // ADMIN; the user-create endpoint constrains role to
+        // ADMIN/STAFF/TEACHER).
+        role: { not: Role.SUPER_ADMIN },
+      },
       select: {
         id: true,
         email: true,
         role: true,
         createdAt: true,
         updatedAt: true,
+        teacher: { select: { id: true } },
       },
       orderBy: [{ role: 'asc' }, { createdAt: 'asc' }],
     });
-    return rows.map((r) => ({
-      id: r.id,
-      email: r.email,
-      role: r.role,
-      createdAt: r.createdAt.toISOString(),
-      updatedAt: r.updatedAt.toISOString(),
-    }));
+    return rows
+      .filter((r) => r.role !== Role.TEACHER || r.teacher !== null)
+      .map((r) => ({
+        id: r.id,
+        email: r.email,
+        role: r.role,
+        createdAt: r.createdAt.toISOString(),
+        updatedAt: r.updatedAt.toISOString(),
+      }));
   }
 
   /**

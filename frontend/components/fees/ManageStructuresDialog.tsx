@@ -4,6 +4,7 @@ import * as React from "react";
 import { Loader2, Plus, Wallet } from "lucide-react";
 import { toast } from "sonner";
 import { ApiError } from "@/lib/api";
+import { formatCurrency } from "@/lib/currency";
 import {
   feesApi,
   type FeeStructureDto,
@@ -228,9 +229,5 @@ export function ManageStructuresDialog({
   );
 }
 
-function formatMoney(n: number): string {
-  return n.toLocaleString(undefined, {
-    minimumFractionDigits: 0,
-    maximumFractionDigits: 2,
-  });
-}
+// Centralized via `lib/currency.formatCurrency`.
+const formatMoney = formatCurrency;

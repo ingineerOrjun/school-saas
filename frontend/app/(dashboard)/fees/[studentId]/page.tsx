@@ -15,6 +15,7 @@ import {
 import { toast } from "sonner";
 import { cn } from "@/lib/utils";
 import { ApiError } from "@/lib/api";
+import { formatCurrency } from "@/lib/currency";
 import {
   feesApi,
   type StudentFeesReport,
@@ -494,9 +495,6 @@ function Td({
   return <td className={cn("px-4 py-3 align-middle", className)}>{children}</td>;
 }
 
-function formatMoney(n: number): string {
-  return n.toLocaleString(undefined, {
-    minimumFractionDigits: 0,
-    maximumFractionDigits: 2,
-  });
-}
+// Centralized via `lib/currency.formatCurrency`. See `lib/currency.ts`
+// for the rationale (single source of truth, no hard-coded symbols).
+const formatMoney = formatCurrency;

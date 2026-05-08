@@ -1,6 +1,8 @@
 import {
   BadRequestException,
+  ConflictException,
   Injectable,
+  Logger,
   NotFoundException,
 } from '@nestjs/common';
 import { AttendanceStatus, Prisma } from '@prisma/client';
@@ -16,12 +18,62 @@ export interface AttendanceRoster {
   status: AttendanceStatus | null;
 }
 
+/**
+ * Wrapper for the roster endpoint. Adds a `version` string so
+ * frontend caches can detect when their stored copy has drifted from
+ * the server.
+ *
+ * Version semantics: the ISO timestamp of the most recently-touched
+ * student in the roster (`max(student.updatedAt)`). New enrollments,
+ * profile edits, and section transfers all bump this. Deletions are
+ * NOT directly captured — but in practice deletions tend to come
+ * paired with edits elsewhere, AND the next online fetch always
+ * replaces the cache regardless. The version is a hint to clients,
+ * not a perfect oracle.
+ */
+export interface RosterResponse {
+  students: AttendanceRoster[];
+  /** ISO timestamp — max(updatedAt) across queried students, or
+   *  the unix epoch when the roster is empty (so clients can still
+   *  compare strings without a special-case). */
+  version: string;
+}
+
 export interface ReportSummary {
   totalDays: number;
   presentDays: number;
   absentDays: number;
   /** Null when `totalDays` is 0 (no data to compute over). */
   percentage: number | null;
+}
+
+/**
+ * One bucket in an attendance trend series — the per-day breakdown
+ * the dashboard charts plot. `percentage` is null on days with no
+ * recorded marks (weekends, holidays) so the chart can show gaps
+ * instead of a misleading 0%.
+ */
+export interface TrendDayBucket {
+  /** YYYY-MM-DD. */
+  date: string;
+  presentCount: number;
+  absentCount: number;
+  /** presentCount + absentCount. */
+  totalCount: number;
+  /** 0..100, or null when there were no marks that day. */
+  percentage: number | null;
+}
+
+export interface AttendanceTrend {
+  fromDate: string;
+  toDate: string;
+  /**
+   * Scope label rendered in chart titles. "School" when no scope
+   * was specified; the class / section name otherwise.
+   */
+  scopeLabel: string;
+  daily: TrendDayBucket[];
+  totals: ReportSummary;
 }
 
 export interface StudentReportRow extends ReportSummary {
@@ -75,6 +127,8 @@ export type AttendanceReport =
 
 @Injectable()
 export class AttendanceService {
+  private readonly logger = new Logger(AttendanceService.name);
+
   constructor(
     private readonly prisma: PrismaService,
     private readonly sessions: AcademicSessionService,
@@ -97,7 +151,7 @@ export class AttendanceService {
     scope: { sectionId?: string; classId?: string },
     schoolId: string,
     sessionId?: string,
-  ): Promise<AttendanceRoster[]> {
+  ): Promise<RosterResponse> {
     let studentWhere: Prisma.StudentWhereInput;
 
     if (scope.sectionId) {
@@ -135,10 +189,25 @@ export class AttendanceService {
     const students = await this.prisma.student.findMany({
       where: studentWhere,
       orderBy: [{ firstName: 'asc' }, { lastName: 'asc' }],
-      select: { id: true, firstName: true, lastName: true },
+      // updatedAt is read purely to derive the response's `version` —
+      // not exposed to clients in the row data itself.
+      select: {
+        id: true,
+        firstName: true,
+        lastName: true,
+        updatedAt: true,
+      },
     });
 
-    if (students.length === 0) return [];
+    // Compose `version` once. Even when the roster is empty we return
+    // a string (the unix epoch) so clients can do a uniform string
+    // compare — null/undefined would force a special case at every
+    // call site.
+    const version = computeRosterVersion(students);
+
+    if (students.length === 0) {
+      return { students: [], version };
+    }
 
     // Strict-default session filter — only show attendance attributed
     // to the active session unless the caller explicitly requested
@@ -161,21 +230,34 @@ export class AttendanceService {
       records.map((r) => [r.studentId, r.status]),
     );
 
-    return students.map((s) => ({
-      studentId: s.id,
-      firstName: s.firstName,
-      lastName: s.lastName,
-      status: statusByStudent.get(s.id) ?? null,
-    }));
+    return {
+      students: students.map((s) => ({
+        studentId: s.id,
+        firstName: s.firstName,
+        lastName: s.lastName,
+        status: statusByStudent.get(s.id) ?? null,
+      })),
+      version,
+    };
   }
 
   /**
    * Bulk upsert attendance records. Per (studentId, date) the unique index
    * guarantees one row — conflicts update, absences create.
+   *
+   * Optimistic concurrency: when `lastKnownVersion` is provided (sent
+   * by the offline sync engine via the `X-Last-Known-Version` header),
+   * we compare it against `max(student.updatedAt)` for the affected
+   * students. If anything has been edited since the client's snapshot
+   * (a student joined / left / was renamed), we throw 409 so the
+   * client can flag the queue item as a conflict instead of silently
+   * applying potentially-stale marks.
    */
   async mark(
     dto: MarkAttendanceDto,
     schoolId: string,
+    lastKnownVersion?: string,
+    deviceId?: string,
   ): Promise<{ marked: number; date: string }> {
     const date = parseDate(dto.date);
     const studentIds = [...new Set(dto.entries.map((e) => e.studentId))];
@@ -186,14 +268,37 @@ export class AttendanceService {
       );
     }
 
-    // Verify every student in the request belongs to the caller's school.
-    const owned = await this.prisma.student.count({
+    // Verify every student in the request belongs to the caller's
+    // school AND, when the caller supplied a version stamp, gather
+    // their current `updatedAt` for the conflict check below.
+    const owners = await this.prisma.student.findMany({
       where: { id: { in: studentIds }, schoolId },
+      select: { id: true, updatedAt: true },
     });
-    if (owned !== studentIds.length) {
+    if (owners.length !== studentIds.length) {
       throw new BadRequestException(
         'One or more students do not belong to this school.',
       );
+    }
+
+    // Optimistic-concurrency guard. Skip when the caller didn't send a
+    // version (online flows that haven't read a roster yet) or when
+    // the parsed version is malformed (treat as not-supplied — better
+    // to allow the write than reject on a header parse error).
+    if (lastKnownVersion) {
+      const lastKnownMs = Date.parse(lastKnownVersion);
+      if (!Number.isNaN(lastKnownMs)) {
+        let currentVersionMs = 0;
+        for (const o of owners) {
+          const ms = o.updatedAt.getTime();
+          if (ms > currentVersionMs) currentVersionMs = ms;
+        }
+        if (currentVersionMs > lastKnownMs) {
+          throw new ConflictException(
+            'Roster changed since you went offline. Review and re-mark.',
+          );
+        }
+      }
     }
 
     // STRICT — every new attendance row must belong to the active
@@ -219,6 +324,16 @@ export class AttendanceService {
           select: { id: true },
         }),
       ),
+    );
+
+    // Audit log — surfaces the originating device so multi-device
+    // edits to the same roster can be triaged from the server log
+    // alone. Falls back to "(unknown)" when the client didn't send
+    // a header (older builds, direct API calls from curl, etc.).
+    this.logger.log(
+      `[mark] ${results.length} record(s) on ${dto.date} from ${
+        deviceId ? `Device-${deviceId.replace(/-/g, '').slice(0, 8)}` : '(unknown)'
+      } · schoolId=${schoolId}`,
     );
 
     return { marked: results.length, date: dto.date };
@@ -541,6 +656,148 @@ export class AttendanceService {
       ...summarize(totalPresent, totalAbsent),
     };
   }
+
+  /**
+   * Daily attendance series for a date range. Powers the dashboard
+   * charts:
+   *   • Admin (no scope)  — school-wide trend.
+   *   • Class / section   — narrowed to that roster.
+   *
+   * Buckets only include days with at least one recorded mark. Days
+   * with no data (weekends, holidays, mark-not-taken) are dropped
+   * from the series so the chart shows real signal — adding zero-
+   * day buckets would make the line collapse repeatedly. The chart
+   * connects across gaps; client decides whether to show that as a
+   * dotted segment or just continuous.
+   */
+  async getTrend(
+    query: { fromDate: string; toDate: string; sectionId?: string; classId?: string },
+    schoolId: string,
+    sessionId?: string,
+  ): Promise<AttendanceTrend> {
+    // Resolve scope. Empty scope → school-wide aggregate.
+    let studentWhere: Prisma.StudentWhereInput = { schoolId };
+    let scopeLabel = 'School';
+    if (query.sectionId) {
+      const section = await this.prisma.section.findFirst({
+        where: { id: query.sectionId, class: { schoolId } },
+        select: {
+          id: true,
+          name: true,
+          class: { select: { name: true } },
+        },
+      });
+      if (!section) {
+        throw new NotFoundException('Section not found.');
+      }
+      studentWhere = { ...studentWhere, sectionId: query.sectionId };
+      scopeLabel = `${section.class.name} · ${section.name}`;
+    } else if (query.classId) {
+      const klass = await this.prisma.class.findFirst({
+        where: { id: query.classId, schoolId },
+        select: { id: true, name: true },
+      });
+      if (!klass) {
+        throw new NotFoundException('Class not found.');
+      }
+      // Whole-class trend covers BOTH directly-linked and sectioned
+      // students under the class — same shape as the class ledger
+      // so the chart matches the report numbers.
+      studentWhere = {
+        ...studentWhere,
+        OR: [
+          { classId: query.classId, sectionId: null },
+          { section: { classId: query.classId } },
+        ],
+      };
+      scopeLabel = klass.name;
+    }
+
+    const students = await this.prisma.student.findMany({
+      where: studentWhere,
+      select: { id: true },
+    });
+
+    if (students.length === 0) {
+      return {
+        fromDate: query.fromDate,
+        toDate: query.toDate,
+        scopeLabel,
+        daily: [],
+        totals: {
+          totalDays: 0,
+          presentDays: 0,
+          absentDays: 0,
+          percentage: null,
+        },
+      };
+    }
+
+    const fromDate = parseDate(query.fromDate);
+    const toDate = parseDate(query.toDate);
+    const sessionFilter = await this.sessions.resolveReadFilter(
+      schoolId,
+      sessionId,
+    );
+
+    const records = await this.prisma.attendance.findMany({
+      where: {
+        studentId: { in: students.map((s) => s.id) },
+        date: { gte: fromDate, lte: toDate },
+        ...sessionFilter,
+      },
+      select: { date: true, status: true },
+    });
+
+    // Bucket by ISO date. Map insertion order doesn't matter — we
+    // sort at the end.
+    const byDate = new Map<string, { present: number; absent: number }>();
+    for (const r of records) {
+      const key = r.date.toISOString().slice(0, 10);
+      const bucket = byDate.get(key) ?? { present: 0, absent: 0 };
+      if (r.status === AttendanceStatus.PRESENT) bucket.present += 1;
+      else bucket.absent += 1;
+      byDate.set(key, bucket);
+    }
+
+    const daily: TrendDayBucket[] = Array.from(byDate.entries())
+      .sort(([a], [b]) => a.localeCompare(b))
+      .map(([date, c]) => {
+        const total = c.present + c.absent;
+        return {
+          date,
+          presentCount: c.present,
+          absentCount: c.absent,
+          totalCount: total,
+          percentage: total > 0 ? round1((c.present / total) * 100) : null,
+        };
+      });
+
+    let presentDays = 0;
+    let absentDays = 0;
+    for (const d of daily) {
+      presentDays += d.presentCount;
+      absentDays += d.absentCount;
+    }
+    const totalDays = presentDays + absentDays;
+
+    return {
+      fromDate: query.fromDate,
+      toDate: query.toDate,
+      scopeLabel,
+      daily,
+      totals: {
+        presentDays,
+        absentDays,
+        totalDays,
+        percentage: totalDays > 0 ? round1((presentDays / totalDays) * 100) : null,
+      },
+    };
+  }
+}
+
+function round1(n: number): number {
+  return Math.round(n * 10) / 10;
 }
 
 function countFor(
@@ -595,4 +852,23 @@ function countBelowThreshold(rows: StudentReportRow[]): number {
  */
 function parseDate(iso: string): Date {
   return new Date(`${iso}T00:00:00.000Z`);
+}
+
+/**
+ * Roster version derivation. Returns max(updatedAt) across the queried
+ * students as an ISO string — clients use it to detect drift between
+ * a cached snapshot and the live roster. Empty roster → unix epoch
+ * (lexicographically smaller than any real timestamp), so a freshly-
+ * empty class compares cleanly against later snapshots that have
+ * students.
+ */
+function computeRosterVersion(
+  students: ReadonlyArray<{ updatedAt: Date }>,
+): string {
+  if (students.length === 0) return new Date(0).toISOString();
+  let latest = students[0].updatedAt;
+  for (const s of students) {
+    if (s.updatedAt > latest) latest = s.updatedAt;
+  }
+  return latest.toISOString();
 }

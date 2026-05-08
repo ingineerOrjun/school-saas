@@ -11,6 +11,8 @@ import {
   UserPlus,
 } from "lucide-react";
 import { ApiError } from "@/lib/api";
+import { useCalendarMode } from "@/components/calendar/CalendarProvider";
+import { formatByMode, type CalendarMode } from "@/lib/date";
 import {
   announcementsApi,
   type AnnouncementDto,
@@ -358,6 +360,9 @@ function FeedRow({
   onNavigate: () => void;
 }) {
   const Icon = item.icon;
+  // Read calendar preference once per row render so the absolute-date
+  // fallback (rows older than a week) honors the topbar dropdown.
+  const calendarMode = useCalendarMode();
   return (
     <li>
       <Link
@@ -383,7 +388,7 @@ function FeedRow({
             </p>
           )}
           <p className="mt-1 text-[11px] text-muted-foreground/80 tabular-nums">
-            {formatRelative(item.timestamp)}
+            {formatRelative(item.timestamp, calendarMode)}
           </p>
         </div>
       </Link>
@@ -396,7 +401,13 @@ function FeedRow({
 // "5m ago" / "3h ago" wording stays consistent across surfaces.
 // ---------------------------------------------------------------------------
 
-function formatRelative(iso: string): string {
+/**
+ * Same shape as the table-side helper: relative wording for fresh
+ * timestamps, calendar-aware absolute date (via `formatByMode`) for
+ * anything older than a week. Notifications fall back to the absolute
+ * date in the user's preferred calendar (B.S. / A.D. / Dual).
+ */
+function formatRelative(iso: string, mode: CalendarMode): string {
   const d = new Date(iso);
   const now = Date.now();
   const diffMs = now - d.getTime();
@@ -408,9 +419,5 @@ function formatRelative(iso: string): string {
   if (hours < 24) return `${hours}h ago`;
   const days = Math.floor(hours / 24);
   if (days < 7) return `${days}d ago`;
-  return d.toLocaleDateString(undefined, {
-    month: "short",
-    day: "numeric",
-    year: d.getFullYear() !== new Date().getFullYear() ? "numeric" : undefined,
-  });
+  return formatByMode(iso, mode);
 }

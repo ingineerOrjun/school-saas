@@ -9,6 +9,7 @@ import { AcademicSessionService } from '../academic-session/academic-session.ser
 import { GradingService } from '../grading/grading.service';
 import { ExamService } from './exam.service';
 import { BulkSaveResultsDto } from './dto/bulk-save-results.dto';
+import { GridSaveResultsDto } from './dto/grid-save-results.dto';
 import { SaveResultsDto } from './dto/save-results.dto';
 
 export interface ResultRow {
@@ -94,6 +95,38 @@ export interface ClassLedger {
   students: LedgerStudentRow[];
   /** ISO timestamp when this ledger was generated. */
   generatedAt: string;
+}
+
+/**
+ * Payload for the marks-entry grid (`/exams/marks-entry`). Carries
+ * every piece of context the grid needs in one shot:
+ *   • exam / class / section / subject metadata (no follow-up calls)
+ *   • full roster of the (class, section) — alphabetized within the
+ *     symbol-number-first ordering
+ *   • each student's existing result for this (exam, subject), if any
+ *
+ * `subject.fullMarks` is the displayable max — for a theory-only
+ * subject this equals theoryFullMarks. `subject.hasPractical` lets the
+ * UI render a "use single-student entry" callout for subjects the grid
+ * can't grade.
+ */
+export interface GridRosterPayload {
+  exam: { id: string; name: string };
+  class: { id: string; name: string };
+  section: { id: string; name: string } | null;
+  subject: {
+    id: string;
+    name: string;
+    fullMarks: number;
+    hasPractical: boolean;
+  };
+  students: Array<{
+    id: string;
+    firstName: string;
+    lastName: string;
+    symbolNumber: string | null;
+    existing: { obtainedMarks: number | null; absent: boolean } | null;
+  }>;
 }
 
 /** Richer report for printable marksheets — includes school & roster info. */
@@ -426,6 +459,363 @@ export class ResultService {
     );
 
     return { successCount: dto.entries.length };
+  }
+
+  // ===========================================================================
+  // Marks-entry GRID (`/exams/marks-entry`)
+  // ---------------------------------------------------------------------------
+  // Simpler shape than the bulk-save above: one number per row +
+  // optional "absent" flag. Designed for the fast grid UI where a
+  // teacher just types down a column and tabs through students.
+  // Coexists with — does not replace — the bulk-save / per-student
+  // endpoints; it's an additional fast mode.
+  // ===========================================================================
+
+  /**
+   * Roster + existing-marks payload for the grid UI. Single round-trip
+   * so the page can render the entire grid (students + their current
+   * marks) with one call after the teacher picks (exam, class, section,
+   * subject).
+   *
+   *   • Authorization: enforced upstream (controller calls
+   *     `assertBulkMarksAccess`). Empty roster + no-marks for
+   *     teachers without the matching assignment is the expected
+   *     "you can't grade this" state — but that path doesn't get
+   *     here because the guard 403s first.
+   *
+   *   • Subject scope: only theory-only subjects (practicalFullMarks
+   *     = 0) are accepted. Subjects with a practical component need
+   *     the per-student endpoint that exposes both inputs. We surface
+   *     that as a 400 so the UI can render a clean "use single-entry"
+   *     callout instead of silently mis-grading the row.
+   */
+  async getGridRoster(
+    input: {
+      examId: string;
+      classId: string;
+      sectionId: string | null;
+      subjectId: string;
+    },
+    schoolId: string,
+  ): Promise<GridRosterPayload> {
+    // 1. Tenant guards (cheapest first).
+    const exam = await this.exams.assertInSchool(input.examId, schoolId);
+
+    const klass = await this.prisma.class.findFirst({
+      where: { id: input.classId, schoolId },
+      select: { id: true, name: true },
+    });
+    if (!klass) {
+      throw new BadRequestException('Class does not belong to this school.');
+    }
+
+    let section: { id: string; name: string } | null = null;
+    if (input.sectionId) {
+      const found = await this.prisma.section.findFirst({
+        where: { id: input.sectionId, classId: input.classId },
+        select: { id: true, name: true },
+      });
+      if (!found) {
+        throw new BadRequestException(
+          'Section does not belong to the given class.',
+        );
+      }
+      section = found;
+    }
+
+    // 2. Subject lookup + theory-only check.
+    const subject = await this.prisma.examSubject.findFirst({
+      where: { id: input.subjectId, examId: exam.id },
+      select: {
+        id: true,
+        name: true,
+        theoryFullMarks: true,
+        practicalFullMarks: true,
+      },
+    });
+    if (!subject) {
+      throw new BadRequestException(
+        'Subject does not belong to the given exam.',
+      );
+    }
+
+    // 3. Roster + existing results. The (class, section) scope rule
+    //    matches BulkSave: section set → that section; section null →
+    //    students linked DIRECTLY to the class with no section.
+    const studentWhere = input.sectionId
+      ? { sectionId: input.sectionId, schoolId }
+      : { classId: input.classId, sectionId: null, schoolId };
+
+    const students = await this.prisma.student.findMany({
+      where: studentWhere,
+      select: {
+        id: true,
+        firstName: true,
+        lastName: true,
+        symbolNumber: true,
+      },
+      // Symbol number first (matches official Nepal-style ordering),
+      // then by name for students without one.
+      orderBy: [
+        { symbolNumber: 'asc' },
+        { firstName: 'asc' },
+        { lastName: 'asc' },
+      ],
+    });
+
+    if (students.length === 0) {
+      return {
+        exam: { id: exam.id, name: exam.name },
+        class: klass,
+        section,
+        subject: {
+          id: subject.id,
+          name: subject.name,
+          fullMarks: subject.theoryFullMarks,
+          hasPractical: subject.practicalFullMarks > 0,
+        },
+        students: [],
+      };
+    }
+
+    // Single round-trip for the existing results across the whole
+    // roster. Indexed by studentId so the projection step is O(1).
+    const existing = await this.prisma.result.findMany({
+      where: {
+        examId: exam.id,
+        subjectId: subject.id,
+        studentId: { in: students.map((s) => s.id) },
+      },
+      select: {
+        studentId: true,
+        theoryMarks: true,
+        practicalMarks: true,
+        absent: true,
+      },
+    });
+    const byStudent = new Map(existing.map((r) => [r.studentId, r]));
+
+    return {
+      exam: { id: exam.id, name: exam.name },
+      class: klass,
+      section,
+      subject: {
+        id: subject.id,
+        name: subject.name,
+        // For grid mode, the displayable max is theory full marks (the
+        // grid only supports theory-only subjects). The flag below
+        // surfaces the practical-component case to the UI so it can
+        // gently steer the teacher to the per-student form.
+        fullMarks: subject.theoryFullMarks,
+        hasPractical: subject.practicalFullMarks > 0,
+      },
+      students: students.map((s) => {
+        const r = byStudent.get(s.id) ?? null;
+        return {
+          id: s.id,
+          firstName: s.firstName,
+          lastName: s.lastName,
+          symbolNumber: s.symbolNumber,
+          existing: r
+            ? {
+                obtainedMarks: r.absent ? null : r.theoryMarks,
+                absent: r.absent,
+              }
+            : null,
+        };
+      }),
+    };
+  }
+
+  /**
+   * Grid save — write the whole class for one subject in a single
+   * transaction. Each row is upserted by `(studentId, subjectId)`.
+   *
+   * Mapping from the grid shape onto the Result table:
+   *   • obtainedMarks → theoryMarks (the only writable component;
+   *     practicalMarks stays at its existing value on update, or 0
+   *     on insert).
+   *   • absent = true → forces theoryMarks/practicalMarks to 0 and
+   *     letter grade to NG, regardless of obtainedMarks.
+   *   • obtainedMarks null AND absent false → row is SKIPPED. The
+   *     grid leaves "I haven't decided yet" cells alone instead of
+   *     auto-zeroing them.
+   *
+   * Validations (in order):
+   *   1. Tenant guards (exam, class, section, subject under exam).
+   *   2. Subject must be theory-only — grid mode doesn't support a
+   *      practical component (it's a one-number-per-row grid).
+   *   3. No duplicate studentIds in the payload.
+   *   4. Every studentId is in the (class, section) scope.
+   *   5. Per-row mark range check (0..theoryFullMarks).
+   *
+   * Authorization (ADMIN/STAFF bypass; TEACHER must own the matching
+   * assignment) is enforced upstream by the controller via
+   * `assertBulkMarksAccess`.
+   */
+  async gridSave(
+    dto: GridSaveResultsDto,
+    schoolId: string,
+    userId: string,
+  ): Promise<{ success: true; updatedCount: number }> {
+    // 1. Tenant guards.
+    const exam = await this.exams.assertInSchool(dto.examId, schoolId);
+    await this.sessions.assertSessionUnlocked(exam.sessionId);
+
+    const klass = await this.prisma.class.findFirst({
+      where: { id: dto.classId, schoolId },
+      select: { id: true },
+    });
+    if (!klass) {
+      throw new BadRequestException('Class does not belong to this school.');
+    }
+
+    if (dto.sectionId) {
+      const section = await this.prisma.section.findFirst({
+        where: { id: dto.sectionId, classId: dto.classId },
+        select: { id: true },
+      });
+      if (!section) {
+        throw new BadRequestException(
+          'Section does not belong to the given class.',
+        );
+      }
+    }
+
+    const subject = await this.prisma.examSubject.findFirst({
+      where: { id: dto.subjectId, examId: exam.id },
+      select: {
+        id: true,
+        name: true,
+        theoryFullMarks: true,
+        practicalFullMarks: true,
+      },
+    });
+    if (!subject) {
+      throw new BadRequestException(
+        'Subject does not belong to the given exam.',
+      );
+    }
+    // 2. Theory-only check. The grid is intentionally a one-number-
+    // per-row UI; a subject with a practical component can't be
+    // round-tripped through it without losing data.
+    if (subject.practicalFullMarks > 0) {
+      throw new BadRequestException(
+        `"${subject.name}" has a practical component — use the single-student form for subjects with both theory and practical marks.`,
+      );
+    }
+
+    // 3. No duplicates — multiple entries for the same student would
+    // both upsert the same composite key non-deterministically.
+    const allStudentIds = dto.marks.map((m) => m.studentId);
+    const uniqueIds = [...new Set(allStudentIds)];
+    if (uniqueIds.length !== allStudentIds.length) {
+      throw new BadRequestException(
+        'Duplicate studentId entries in the request.',
+      );
+    }
+
+    // 4. Every student must be in the (class, section) scope. Same
+    // pattern as bulkSave — a single COUNT proves all-or-nothing.
+    const expectedScope = dto.sectionId
+      ? { sectionId: dto.sectionId }
+      : { classId: dto.classId, sectionId: null };
+    const validCount = await this.prisma.student.count({
+      where: {
+        id: { in: uniqueIds },
+        schoolId,
+        ...expectedScope,
+      },
+    });
+    if (validCount !== uniqueIds.length) {
+      throw new BadRequestException(
+        'One or more students are not in the given class/section.',
+      );
+    }
+
+    // Filter out "blank, not absent" rows BEFORE the transaction so
+    // the count we return reflects rows actually written.
+    const writable = dto.marks.filter(
+      (m) => m.absent === true || (m.obtainedMarks !== null && m.obtainedMarks !== undefined),
+    );
+    if (writable.length === 0) {
+      return { success: true, updatedCount: 0 };
+    }
+
+    const sessionId = exam.sessionId ?? null;
+
+    // 5. Validate ranges + upsert atomically.
+    await this.prisma.$transaction(
+      writable.map((entry) => {
+        const isAbsent = entry.absent === true;
+        // Range-check non-absent rows. We still allow
+        // `obtainedMarks > 0` even when absent is true at the DTO
+        // layer — the service force-zeros it below.
+        if (!isAbsent) {
+          const m = entry.obtainedMarks!;
+          if (m < 0 || m > subject.theoryFullMarks) {
+            throw new BadRequestException(
+              `Marks for "${subject.name}" must be between 0 and ${subject.theoryFullMarks}.`,
+            );
+          }
+        }
+
+        const theoryMarks = isAbsent ? 0 : entry.obtainedMarks!;
+        // Practical stays at 0 on insert; on update we leave the
+        // existing column alone (Prisma's upsert update.set only
+        // touches the fields we name).
+        const practicalMarks = 0;
+
+        const { percentage, letterGrade, gradePoint } = isAbsent
+          ? { percentage: 0, letterGrade: LetterGrade.NG, gradePoint: 0 }
+          : gradeWithSplit(
+              this.grading,
+              theoryMarks,
+              subject.theoryFullMarks,
+              practicalMarks,
+              subject.practicalFullMarks,
+            );
+
+        return this.prisma.result.upsert({
+          where: {
+            studentId_subjectId: {
+              studentId: entry.studentId,
+              subjectId: subject.id,
+            },
+          },
+          create: {
+            examId: exam.id,
+            studentId: entry.studentId,
+            subjectId: subject.id,
+            theoryMarks,
+            practicalMarks,
+            percentage,
+            letterGrade,
+            gradePoint,
+            absent: isAbsent,
+            createdById: userId,
+            updatedById: userId,
+            sessionId,
+          },
+          update: {
+            theoryMarks,
+            // Preserve the existing practical mark on update — bulk
+            // grid only owns the theory column. (For absent rows we
+            // DO want to zero practical too, since "absent" means
+            // "didn't appear for any component".)
+            ...(isAbsent ? { practicalMarks: 0 } : {}),
+            percentage,
+            letterGrade,
+            gradePoint,
+            absent: isAbsent,
+            updatedById: userId,
+          },
+          select: { id: true },
+        });
+      }),
+    );
+
+    return { success: true, updatedCount: writable.length };
   }
 
   async getStudentReport(

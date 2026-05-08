@@ -1,9 +1,11 @@
 "use client";
 
 import * as React from "react";
-import { AlertTriangle, BookOpen, Edit2, Loader2, Trash2 } from "lucide-react";
+import { BookOpen, Edit2, Loader2, Trash2 } from "lucide-react";
 import { cn } from "@/lib/utils";
 import type { TeacherDto } from "@/lib/teachers";
+import { useCalendarMode } from "@/components/calendar/CalendarProvider";
+import { formatByMode, type CalendarMode } from "@/lib/date";
 
 export interface TeacherTableProps {
   teachers: TeacherDto[];
@@ -29,6 +31,10 @@ export function TeacherTable({
   highlightIds,
   removingIds,
 }: TeacherTableProps) {
+  // Read the user's calendar preference once per render and thread it
+  // into formatRelative below so the "Added" column respects the
+  // topbar dropdown (B.S. / A.D. / Dual).
+  const calendarMode = useCalendarMode();
   return (
     <div className="glass rounded-xl overflow-hidden animate-fade-in">
       <div className="overflow-x-auto">
@@ -36,10 +42,14 @@ export function TeacherTable({
           <thead>
             <tr className="bg-muted/30">
               <Th className="rounded-tl-xl">Teacher</Th>
-              <Th>Assignment</Th>
-              <Th>Login</Th>
+              <Th>Assignments</Th>
               <Th>Added</Th>
-              <Th className="text-right rounded-tr-xl">Actions</Th>
+              {/* Min-width keeps the labeled action cluster from
+                  collapsing on narrower viewports — the buttons stay
+                  on one line all the way down to ~tablet width. */}
+              <Th className="text-right rounded-tr-xl w-[260px] min-w-[260px]">
+                Actions
+              </Th>
             </tr>
           </thead>
           <tbody>
@@ -91,32 +101,10 @@ export function TeacherTable({
                     </div>
                   </Td>
                   <Td className="border-t border-border/50">
-                    <AssignmentPill teacher={t} />
-                  </Td>
-                  <Td className="border-t border-border/50">
-                    {t.userId ? (
-                      <span className="inline-flex items-center gap-1 rounded-full bg-success/10 px-2 py-0.5 text-xs font-medium text-success">
-                        <span className="h-1.5 w-1.5 rounded-full bg-success" />
-                        Active
-                      </span>
-                    ) : (
-                      // Amber instead of muted: a no-account row CAN'T
-                      // see assignments — that's a defect from the
-                      // teacher's POV, not a benign "not yet" state.
-                      // The tooltip + warning icon make the implication
-                      // explicit so admins don't add assignments to
-                      // orphan rows by accident.
-                      <span
-                        className="inline-flex items-center gap-1 rounded-full bg-amber-50 px-2 py-0.5 text-xs font-medium text-amber-800 ring-1 ring-inset ring-amber-200"
-                        title="Without a login account, this teacher can't see assignments on their dashboard. Use 'Add teacher' to recreate with an email + password."
-                      >
-                        <AlertTriangle className="h-3 w-3" />
-                        No account
-                      </span>
-                    )}
+                    <AssignmentsCell counts={t.assignmentCounts} />
                   </Td>
                   <Td className="border-t border-border/50 text-muted-foreground">
-                    {isPending ? "—" : formatRelative(t.createdAt)}
+                    {isPending ? "—" : formatRelative(t.createdAt, calendarMode)}
                   </Td>
                   <Td
                     className={cn(
@@ -127,21 +115,29 @@ export function TeacherTable({
                     {isPending ? (
                       <span className="text-xs text-muted-foreground">—</span>
                     ) : (
-                      <div className="inline-flex items-center gap-1">
+                      // Labeled action cluster — primary actions
+                      // (Assign, Edit) get visible text + icon so an
+                      // admin glancing at the row instantly knows
+                      // what each button does. Delete stays
+                      // icon-only with a destructive hover so it
+                      // doesn't compete visually with the primary
+                      // actions but is still a clear, recognizable
+                      // affordance.
+                      <div className="inline-flex items-center justify-end gap-1.5">
                         {onManageAssignments && (
-                          <IconButton
-                            label={`Manage assignments for ${t.name}`}
+                          <ActionButton
+                            label="Assign"
+                            ariaLabel={`Manage assignments for ${t.name}`}
+                            icon={<BookOpen className="h-3.5 w-3.5" />}
                             onClick={() => onManageAssignments(t)}
-                          >
-                            <BookOpen className="h-4 w-4" />
-                          </IconButton>
+                          />
                         )}
-                        <IconButton
-                          label={`Edit ${t.name}`}
+                        <ActionButton
+                          label="Edit"
+                          ariaLabel={`Edit ${t.name}`}
+                          icon={<Edit2 className="h-3.5 w-3.5" />}
                           onClick={() => onEdit(t)}
-                        >
-                          <Edit2 className="h-4 w-4" />
-                        </IconButton>
+                        />
                         <IconButton
                           label={`Delete ${t.name}`}
                           onClick={() => onDelete(t)}
@@ -190,6 +186,41 @@ function Td({
 }) {
   return (
     <td className={cn("px-4 py-3 align-middle", className)}>{children}</td>
+  );
+}
+
+/**
+ * Labeled action — icon + visible text. Used for the primary row
+ * actions (Assign, Edit) so admins can immediately read what each
+ * button does without hovering for a tooltip. Sized small enough
+ * that three of these + a delete icon fit cleanly on one line in a
+ * 260-px-min actions column.
+ */
+function ActionButton({
+  label,
+  ariaLabel,
+  icon,
+  onClick,
+}: {
+  label: string;
+  ariaLabel: string;
+  icon: React.ReactNode;
+  onClick: () => void;
+}) {
+  return (
+    <button
+      type="button"
+      aria-label={ariaLabel}
+      onClick={onClick}
+      title={ariaLabel}
+      className={cn(
+        "inline-flex h-8 items-center gap-1.5 rounded-md border border-border bg-surface px-2.5 text-xs font-medium text-foreground",
+        "transition-all duration-150 hover:-translate-y-px hover:border-emerald-300 hover:bg-emerald-500/10 hover:text-emerald-700 dark:hover:text-emerald-400 focus-ring",
+      )}
+    >
+      {icon}
+      {label}
+    </button>
   );
 }
 
@@ -244,33 +275,48 @@ function paletteFor(id: string): string {
 }
 
 /**
- * Compact assignment chip:
- *   • Section set    → "Class 5 · A"   (indigo — the most specific)
- *   • Class only     → "Class 5"        (sky — class-wide)
- *   • Unassigned     → "Unassigned"     (muted — read-only teacher)
+ * Compact assignment summary for the table.
  *
- * The chip color tracks specificity so admins can scan a list of
- * teachers and see who's narrowly scoped vs. who runs a whole class
- * vs. who's not yet set up.
+ *   • 0 assignments → red "Unassigned" pill (action-needed signal —
+ *     a teacher with no assignments can't even log in)
+ *   • > 0           → "X Class · Y Subject" (singular/plural aware,
+ *     section count tucked into a tooltip so the chip stays compact)
+ *
+ * Replaces the legacy single-class AssignmentPill — the legacy
+ * `Teacher.classId/sectionId` columns were dropped in 20260511.
  */
-function AssignmentPill({ teacher }: { teacher: TeacherDto }) {
-  if (teacher.section) {
+function AssignmentsCell({
+  counts,
+}: {
+  counts: TeacherDto["assignmentCounts"];
+}) {
+  if (counts.total === 0) {
     return (
-      <span className="inline-flex items-center gap-1 rounded-full bg-indigo-50 px-2 py-0.5 text-xs font-medium text-indigo-700">
-        {teacher.section.class.name} · {teacher.section.name}
+      <span
+        className="inline-flex items-center gap-1.5 rounded-full bg-destructive/10 px-2.5 py-0.5 text-xs font-medium text-destructive ring-1 ring-inset ring-destructive/30"
+        title="This teacher has no assignments yet — they can't sign in until you assign at least one class."
+      >
+        <span className="h-1.5 w-1.5 rounded-full bg-destructive" />
+        Unassigned
       </span>
     );
   }
-  if (teacher.class) {
-    return (
-      <span className="inline-flex items-center gap-1 rounded-full bg-sky-50 px-2 py-0.5 text-xs font-medium text-sky-700">
-        {teacher.class.name}
-      </span>
-    );
-  }
+
+  const classLabel = `${counts.classes} ${counts.classes === 1 ? "Class" : "Classes"}`;
+  const subjectLabel = `${counts.subjects} ${counts.subjects === 1 ? "Subject" : "Subjects"}`;
+  const tooltip =
+    counts.sections > 0
+      ? `${counts.total} assignment${counts.total === 1 ? "" : "s"} across ${counts.sections} specific section${counts.sections === 1 ? "" : "s"}`
+      : `${counts.total} assignment${counts.total === 1 ? "" : "s"}`;
+
   return (
-    <span className="inline-flex items-center rounded-full bg-muted/70 px-2 py-0.5 text-xs font-medium text-muted-foreground">
-      Unassigned
+    <span
+      className="inline-flex items-center gap-1.5 rounded-full bg-emerald-50 px-2.5 py-0.5 text-xs font-medium text-emerald-800 ring-1 ring-inset ring-emerald-200 dark:bg-emerald-500/10 dark:text-emerald-300"
+      title={tooltip}
+    >
+      <span className="tabular-nums">{classLabel}</span>
+      <span className="text-emerald-700/60 dark:text-emerald-400/60">·</span>
+      <span className="tabular-nums">{subjectLabel}</span>
     </span>
   );
 }
@@ -295,7 +341,16 @@ function Avatar({ name, id }: { name: string; id: string }) {
   );
 }
 
-function formatRelative(iso: string): string {
+/**
+ * Relative time for recent rows ("3m ago", "2d ago"), absolute date
+ * for everything older than a week. The absolute fallback routes
+ * through `formatByMode` so the "Added" column respects the user's
+ * calendar preference (B.S. / A.D. / Dual).
+ *
+ * Relative units are universal — minutes/hours/days mean the same
+ * thing in either calendar — so only the absolute path needs the mode.
+ */
+function formatRelative(iso: string, mode: CalendarMode): string {
   const d = new Date(iso);
   const now = Date.now();
   const diffMs = now - d.getTime();
@@ -306,9 +361,5 @@ function formatRelative(iso: string): string {
   if (hours < 24) return `${hours}h ago`;
   const days = Math.floor(hours / 24);
   if (days < 7) return `${days}d ago`;
-  return d.toLocaleDateString(undefined, {
-    month: "short",
-    day: "numeric",
-    year: d.getFullYear() !== new Date().getFullYear() ? "numeric" : undefined,
-  });
+  return formatByMode(iso, mode);
 }

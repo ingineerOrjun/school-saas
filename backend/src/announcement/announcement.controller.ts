@@ -17,6 +17,9 @@ import { Roles } from '../common/decorators/roles.decorator';
 import { JwtAuthGuard } from '../auth/guards/jwt-auth.guard';
 import { RolesGuard } from '../auth/guards/roles.guard';
 import type { AuthenticatedUser } from '../auth/jwt.strategy';
+import { FeatureKey } from '../feature-flags/feature-catalog';
+import { FeatureFlagsGuard } from '../feature-flags/feature-flags.guard';
+import { RequireFeature } from '../feature-flags/require-feature.decorator';
 import { AnnouncementService } from './announcement.service';
 import { CreateAnnouncementDto } from './dto/create-announcement.dto';
 
@@ -25,11 +28,18 @@ import { CreateAnnouncementDto } from './dto/create-announcement.dto';
  *   • READ (GET)            — any authenticated user (teachers + admins).
  *   • WRITE (POST / DELETE) — ADMIN only via `@Roles(Role.ADMIN)`.
  *
+ * Phase 5: gated behind the `announcements` feature flag. The flag
+ * is on by default for every school (legacy schools keep working
+ * unchanged) but the platform owner can disable it per-tenant.
+ * SUPER_ADMIN bypasses the gate, so platform inspections still see
+ * everything.
+ *
  * RolesGuard is attached at the controller level so individual routes
  * just opt-in to the admin restriction by adding `@Roles(...)`.
  */
 @Controller('announcements')
-@UseGuards(JwtAuthGuard, RolesGuard)
+@UseGuards(JwtAuthGuard, RolesGuard, FeatureFlagsGuard)
+@RequireFeature(FeatureKey.Announcements)
 export class AnnouncementController {
   constructor(private readonly announcements: AnnouncementService) {}
 

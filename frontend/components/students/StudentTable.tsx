@@ -4,6 +4,7 @@ import * as React from "react";
 import { Edit2, Loader2, Trash2 } from "lucide-react";
 import type { ClassWithSections } from "@/lib/classes";
 import type { StudentDto } from "@/lib/students";
+import { formatByMode, type CalendarMode } from "@/lib/date";
 import { cn } from "@/lib/utils";
 import {
   SectionSelect,
@@ -314,7 +315,18 @@ function Avatar({
   );
 }
 
-function formatRelative(iso: string): string {
+/**
+ * Relative wording for recent timestamps, calendar-aware absolute
+ * date (via `formatByMode`) for anything older than a week. Mirrors
+ * `TeacherTable`'s `formatRelative` so both tables behave identically.
+ *
+ * Currently unused at the StudentTable call-sites — kept here for
+ * parity in case a future "Added" / "Last updated" column wants it.
+ * Pass `useCalendarMode()` from the calling component as `mode` so
+ * the helper honors the topbar dropdown.
+ */
+// eslint-disable-next-line @typescript-eslint/no-unused-vars
+function formatRelative(iso: string, mode: CalendarMode): string {
   const d = new Date(iso);
   const now = Date.now();
   const diffMs = now - d.getTime();
@@ -325,9 +337,5 @@ function formatRelative(iso: string): string {
   if (hours < 24) return `${hours}h ago`;
   const days = Math.floor(hours / 24);
   if (days < 7) return `${days}d ago`;
-  return d.toLocaleDateString(undefined, {
-    month: "short",
-    day: "numeric",
-    year: d.getFullYear() !== new Date().getFullYear() ? "numeric" : undefined,
-  });
+  return formatByMode(iso, mode);
 }

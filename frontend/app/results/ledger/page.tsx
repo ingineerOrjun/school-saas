@@ -5,6 +5,7 @@ import Link from "next/link";
 import { useRouter, useSearchParams } from "next/navigation";
 import {
   ArrowLeft,
+  PencilLine,
   Printer,
   Download,
   Loader2,
@@ -16,6 +17,8 @@ import { toast } from "sonner";
 import { cn } from "@/lib/utils";
 import { ApiError } from "@/lib/api";
 import { getToken, getStoredSchool } from "@/lib/auth";
+import { useCalendarMode } from "@/components/calendar/CalendarProvider";
+import { formatByMode } from "@/lib/date";
 import { DocumentLogo } from "@/components/documents/DocumentLogo";
 import {
   examsApi,
@@ -168,6 +171,29 @@ export default function LedgerPage() {
               loading={loadingMeta}
               onChange={setClassId}
             />
+            {/* Jump to the marks-entry grid for this exam. The grid
+                lets the admin pick subject + section once they're
+                there — we can't pre-fill those without forcing a
+                specific subject — so we just hand off the examId
+                and let them complete the picker on the bulk page.
+                Hidden in print output via .no-print. */}
+            <Link
+              href={examId ? `/exams/marks?examId=${examId}` : "/exams/marks"}
+              className={cn(
+                "no-print inline-flex h-9 items-center gap-1.5 rounded-md border border-border bg-surface px-3 text-sm font-medium text-foreground",
+                "transition-all hover:border-emerald-300 hover:bg-emerald-500/10 hover:text-emerald-700",
+                "focus-ring",
+                !examId && "opacity-60 pointer-events-none",
+              )}
+              title={
+                examId
+                  ? "Open the marks-entry grid to edit marks for this exam"
+                  : "Pick an exam first"
+              }
+            >
+              <PencilLine className="h-4 w-4" />
+              Edit marks
+            </Link>
             <Button
               type="button"
               onClick={() => window.print()}
@@ -351,7 +377,12 @@ function SheetHeader({
   ledger: ClassLedger;
   schoolName: string;
 }) {
-  const issued = formatDate(ledger.generatedAt);
+  // Issued-date label respects the topbar calendar dropdown — admins
+  // who switch to B.S. or Dual see the printed sheet flip to match.
+  // Print-time HTML uses whatever the rendered DOM has, so toggling
+  // before "Print" is the way to override the saved preference.
+  const calendarMode = useCalendarMode();
+  const issued = formatByMode(ledger.generatedAt, calendarMode);
   // Prefer the payload's school name (always fresh) over the
   // localStorage cached one passed as a prop. Logo comes from the
   // payload too — null when no upload yet.
@@ -425,7 +456,26 @@ function LedgerTable({ ledger }: { ledger: ClassLedger }) {
               <Td className="text-left font-mono text-slate-700">
                 {s.symbolNumber ?? "—"}
               </Td>
-              <Td className="text-left font-medium">{s.name}</Td>
+              <Td className="text-left font-medium">
+                {/* Click-through to the per-student marksheet. Opens
+                    in a new tab so the admin doesn't lose their
+                    place in the ledger when reviewing individuals.
+                    The link is hidden in the printed output via
+                    .no-print styling — print-mode shows just the
+                    name in plain text. */}
+                <Link
+                  href={`/marksheet/${ledger.exam.id}/${s.id}`}
+                  target="_blank"
+                  rel="noopener noreferrer"
+                  className="no-print text-slate-900 hover:text-primary hover:underline focus-ring rounded-sm"
+                  title="Open marksheet in new tab"
+                >
+                  {s.name}
+                </Link>
+                {/* Print-only fallback — plain name without the
+                    underline / link styling. */}
+                <span className="hidden print:inline">{s.name}</span>
+              </Td>
               {s.results.map((cell) => (
                 <Td key={cell.subjectId} className="text-center">
                   <GradeCell grade={cell.grade} />
@@ -626,10 +676,7 @@ function SignatureLine({
   );
 }
 
-function formatDate(iso: string): string {
-  return new Date(iso).toLocaleDateString(undefined, {
-    year: "numeric",
-    month: "short",
-    day: "numeric",
-  });
-}
+// `formatDate` removed: the live "issued" line is now formatted via
+// `formatByMode` so it honors the user's calendar preference (B.S. /
+// A.D. / Dual). Adding back a Western-only formatter would silently
+// bypass the topbar dropdown — keep the single `formatByMode` path.

@@ -7,6 +7,7 @@ import {
   BookOpen,
   Building2,
   CalendarRange,
+  CloudOff,
   GraduationCap,
   Image as ImageIcon,
   Loader2,
@@ -72,12 +73,43 @@ export default function SettingsPage() {
       <Header />
       <SchoolProfileSection />
       <AcademicSessionsLink />
+      <OfflineQueueLink />
       {/* Subjects catalog must exist before AssignmentsDialog can offer
           subject-scoped TeachingAssignments. Putting it before Users
           surfaces it during the natural admin onboarding flow. */}
       <SubjectsSection />
       <UsersSection currentUserId={getStoredUser()?.id ?? null} />
     </div>
+  );
+}
+
+/**
+ * Pointer card to the offline-queue inspector. Same pattern as the
+ * sessions link — diagnostic surface deserves its own page rather
+ * than a cramped inline panel here.
+ */
+function OfflineQueueLink() {
+  return (
+    <Link
+      href="/settings/offline"
+      className="block rounded-xl border border-border bg-surface p-6 hover:border-primary/40 hover:bg-muted/40 transition-colors focus-ring animate-fade-in-up"
+    >
+      <div className="flex items-center gap-3">
+        <span className="flex h-9 w-9 items-center justify-center rounded-md bg-primary/10 text-primary">
+          <CloudOff className="h-5 w-5" />
+        </span>
+        <div className="flex-1 min-w-0">
+          <h2 className="text-md font-semibold tracking-tight text-foreground">
+            Offline queue
+          </h2>
+          <p className="text-sm text-muted-foreground">
+            Inspect attendance writes pending sync, retry failed items,
+            and clean up stuck rows. Useful after extended offline use.
+          </p>
+        </div>
+        <span className="text-xs text-muted-foreground">Open →</span>
+      </div>
+    </Link>
   );
 }
 
@@ -156,6 +188,10 @@ function AccessDenied() {
 function SchoolProfileSection() {
   const [school, setSchool] = React.useState<SchoolDto | null>(null);
   const [name, setName] = React.useState("");
+  // address/phone surface on receipts. They're optional — the receipt
+  // layout collapses gracefully when null, but cheap to fill in once.
+  const [address, setAddress] = React.useState("");
+  const [phone, setPhone] = React.useState("");
   const [loading, setLoading] = React.useState(true);
   const [saving, setSaving] = React.useState(false);
 
@@ -167,6 +203,8 @@ function SchoolProfileSection() {
         if (!cancelled) {
           setSchool(s);
           setName(s.name);
+          setAddress(s.address ?? "");
+          setPhone(s.phone ?? "");
         }
       } catch (err) {
         toast.error(
@@ -181,21 +219,54 @@ function SchoolProfileSection() {
     };
   }, []);
 
-  const dirty = !!school && name.trim() !== school.name;
+  // Dirty if ANY of the editable fields drifted from what's persisted.
+  // Trimmed compares so leading/trailing whitespace isn't treated as a
+  // change worth a network call.
+  const dirty =
+    !!school &&
+    (name.trim() !== school.name ||
+      address.trim() !== (school.address ?? "") ||
+      phone.trim() !== (school.phone ?? ""));
+
+  const handleReset = () => {
+    if (!school) return;
+    setName(school.name);
+    setAddress(school.address ?? "");
+    setPhone(school.phone ?? "");
+  };
 
   const handleSave = async (e: React.FormEvent) => {
     e.preventDefault();
-    if (!dirty) return;
-    const trimmed = name.trim();
-    if (!trimmed) {
+    if (!dirty || !school) return;
+    const trimmedName = name.trim();
+    if (!trimmedName) {
       toast.error("School name can't be empty.");
       return;
     }
     setSaving(true);
     try {
-      const updated = await schoolApi.update({ name: trimmed });
+      // Send only the fields that drifted — keeps the audit log clean
+      // and dodges accidentally clearing a value the user didn't touch.
+      const patch: {
+        name?: string;
+        address?: string | null;
+        phone?: string | null;
+      } = {};
+      if (trimmedName !== school.name) patch.name = trimmedName;
+      const trimmedAddress = address.trim();
+      if (trimmedAddress !== (school.address ?? "")) {
+        patch.address = trimmedAddress; // backend treats "" as clear
+      }
+      const trimmedPhone = phone.trim();
+      if (trimmedPhone !== (school.phone ?? "")) {
+        patch.phone = trimmedPhone;
+      }
+
+      const updated = await schoolApi.update(patch);
       setSchool(updated);
       setName(updated.name);
+      setAddress(updated.address ?? "");
+      setPhone(updated.phone ?? "");
       toast.success("Saved successfully");
       // Sidebar greeting reads from the cached user — bump the cached
       // school name in localStorage so other pages pick it up too.
@@ -232,8 +303,8 @@ function SchoolProfileSection() {
             School profile
           </h2>
           <p className="text-sm text-muted-foreground">
-            The display name printed on receipts, marksheets, and the
-            workspace greeting.
+            Identity printed on receipts, marksheets, and the workspace
+            greeting. Address and phone show on receipts when set.
           </p>
         </div>
       </div>
@@ -264,11 +335,47 @@ function SchoolProfileSection() {
                   : undefined
               }
             />
+
+            {/* Address — multi-line, since real addresses span 2-3 lines.
+                Plain <textarea> styled to match the Input primitive (no
+                Textarea component in the design system yet). */}
+            <div className="flex flex-col gap-1.5">
+              <label
+                htmlFor="school-address"
+                className="text-sm font-medium text-foreground"
+              >
+                Address
+              </label>
+              <textarea
+                id="school-address"
+                value={address}
+                onChange={(e) => setAddress(e.target.value)}
+                maxLength={240}
+                disabled={saving}
+                rows={2}
+                placeholder="Street, City, Postal code"
+                className="w-full rounded-md border border-border bg-surface px-3 py-2 text-sm text-foreground placeholder:text-muted-foreground/60 transition-shadow duration-150 focus:outline-none focus:border-primary focus:ring-2 focus:ring-primary/30 disabled:opacity-50 disabled:cursor-not-allowed disabled:bg-muted"
+              />
+              <p className="text-xs text-muted-foreground">
+                Optional. Leave blank to omit from printed receipts.
+              </p>
+            </div>
+
+            <Input
+              label="Phone"
+              value={phone}
+              onChange={(e) => setPhone(e.target.value)}
+              maxLength={40}
+              disabled={saving}
+              placeholder="e.g. +977-1-4123456"
+              hint="Optional. Format is admin-controlled — country code, hyphens, etc."
+            />
+
             <div className="flex items-center gap-2">
               {/* Disabled only while a save is in flight — never stuck
                   on a dirty/clean check. handleSave is itself a no-op
-                  when there's nothing to save (early return on !dirty),
-                  so an extra click is harmless. */}
+                  when there's nothing to save, so an extra click is
+                  harmless. */}
               <Button
                 type="submit"
                 loading={saving}
@@ -281,7 +388,7 @@ function SchoolProfileSection() {
                 <Button
                   type="button"
                   variant="ghost"
-                  onClick={() => school && setName(school.name)}
+                  onClick={handleReset}
                 >
                   Discard
                 </Button>
@@ -826,7 +933,12 @@ function UserAvatar({ email, role }: { email: string; role: Role }) {
 }
 
 function RoleBadge({ role }: { role: Role }) {
+  // SUPER_ADMIN never appears here — the user-management list filters
+  // platform-tier rows out (see UserService.list). The entry exists
+  // for type exhaustiveness only; if a SUPER_ADMIN somehow leaks
+  // through, it renders neutrally rather than throwing.
   const labels: Record<Role, string> = {
+    SUPER_ADMIN: "Platform owner",
     ADMIN: "Admin",
     STAFF: "Staff",
     TEACHER: "Teacher",
@@ -834,6 +946,7 @@ function RoleBadge({ role }: { role: Role }) {
     PARENT: "Parent",
   };
   const tones: Record<Role, string> = {
+    SUPER_ADMIN: "bg-slate-900 text-white",
     ADMIN: "bg-primary/10 text-primary",
     // STAFF — calmer indigo tone so it reads as "admin-adjacent"
     // without being mistaken for full admin.
@@ -854,11 +967,7 @@ function RoleBadge({ role }: { role: Role }) {
   );
 }
 
-function formatDate(iso: string): string {
-  const d = new Date(iso);
-  return d.toLocaleDateString(undefined, {
-    year: "numeric",
-    month: "short",
-    day: "numeric",
-  });
-}
+// Dead `formatDate` removed: the page renders dates via <DualDate />,
+// which routes through `formatByMode` and honors the user's calendar
+// preference. Adding back a Western-only formatter here would bypass
+// that — keep the single `<DualDate>` path.

@@ -3,6 +3,7 @@ import {
   Controller,
   ForbiddenException,
   Get,
+  Headers,
   HttpCode,
   HttpStatus,
   Post,
@@ -54,6 +55,30 @@ export class AttendanceController {
   async mark(
     @Body() dto: MarkAttendanceDto,
     @CurrentUser() user: AuthenticatedUser,
+    /**
+     * Optional optimistic-concurrency token sent by the offline sync
+     * engine. When the queued payload was created, the client cached
+     * the roster's `version` (max(student.updatedAt)). If the live
+     * value has moved past that, someone edited the underlying data
+     * while this client was offline — the service throws 409 so the
+     * frontend can flag the queue item as a conflict instead of
+     * silently overwriting fresher data.
+     *
+     * Header rather than body so it doesn't pollute the DTO across
+     * every feature that wants conflict detection — same X-Last-
+     * Known-Version contract works for marks, exams, fees, etc.
+     * Omitted by online callers (no offline cache to compare to).
+     */
+    @Headers('x-last-known-version') lastKnownVersion?: string,
+    /**
+     * Per-device identifier set by the frontend on every authed
+     * request (`api.ts`) and on every offline-queue item
+     * (`offline-queue.ts`). Logged with the write so multi-device
+     * audit trails ("Attendance updated from Device-abc12345") work
+     * out of the box — even when the queue drained on a different
+     * device than the one that originally captured the toggle.
+     */
+    @Headers('x-device-id') deviceId?: string,
   ) {
     // Past-date guard: teachers can only mark attendance for TODAY (or
     // forward). Editing yesterday's roster is reserved for admins so
@@ -71,7 +96,7 @@ export class AttendanceController {
       user,
       dto.entries.map((e) => e.studentId),
     );
-    return this.attendance.mark(dto, user.schoolId);
+    return this.attendance.mark(dto, user.schoolId, lastKnownVersion, deviceId);
   }
 
   @Get('report')
@@ -89,6 +114,43 @@ export class AttendanceController {
       });
     }
     return this.attendance.getReport(query, user.schoolId, sessionId);
+  }
+
+  /**
+   * Daily attendance trend series for dashboard charts. Same scope
+   * options as `report` but returns per-day buckets instead of an
+   * aggregate. Empty/null `sectionId` + `classId` → school-wide
+   * trend (admin dashboards).
+   *
+   * Scope check policy:
+   *   • School-wide is admin / staff territory — TEACHER role gets
+   *     403 from `assertClassAccess` since they can't act on data
+   *     outside their assigned classes.
+   *   • Scoped requests pass through `assertClassAccess` so a
+   *     TEACHER hitting their own class still works.
+   */
+  @Get('trend')
+  async getTrend(
+    @Query('fromDate') fromDate: string,
+    @Query('toDate') toDate: string,
+    @CurrentUser() user: AuthenticatedUser,
+    @Query('sectionId') sectionId?: string,
+    @Query('classId') classId?: string,
+    @Query('sessionId') sessionId?: string,
+  ) {
+    // School-wide (no scope) is admin/staff only — teachers must
+    // narrow to a class/section they're assigned to. We forward
+    // null when neither id is set; assertClassAccess accepts that
+    // shape and 403s teachers.
+    await this.scope.assertClassAccess(user, {
+      classId: classId ?? null,
+      sectionId: sectionId ?? null,
+    });
+    return this.attendance.getTrend(
+      { fromDate, toDate, sectionId, classId },
+      user.schoolId,
+      sessionId,
+    );
   }
 }
 

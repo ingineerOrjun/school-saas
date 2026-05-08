@@ -15,6 +15,9 @@ import { Roles } from '../common/decorators/roles.decorator';
 import { JwtAuthGuard } from '../auth/guards/jwt-auth.guard';
 import { RolesGuard } from '../auth/guards/roles.guard';
 import type { AuthenticatedUser } from '../auth/jwt.strategy';
+import { FeatureKey } from '../feature-flags/feature-catalog';
+import { FeatureFlagsGuard } from '../feature-flags/feature-flags.guard';
+import { RequireFeature } from '../feature-flags/require-feature.decorator';
 import { RunPromotionDto } from './dto/run-promotion.dto';
 import { PromotionService } from './promotion.service';
 
@@ -23,9 +26,14 @@ import { PromotionService } from './promotion.service';
  * year-defining operation and should never be triggered by anyone
  * else. The history reads are also admin-only for now (parents'
  * access to their own child's history is a separate UX iteration).
+ *
+ * Phase 5: gated behind the `promotion` feature flag (on by default).
+ * Platform owners can disable to hide the entire feature for tenants
+ * that don't run the formal academic-year cycle.
  */
 @Controller('promotion')
-@UseGuards(JwtAuthGuard, RolesGuard)
+@UseGuards(JwtAuthGuard, RolesGuard, FeatureFlagsGuard)
+@RequireFeature(FeatureKey.Promotion)
 export class PromotionController {
   constructor(private readonly promotion: PromotionService) {}
 

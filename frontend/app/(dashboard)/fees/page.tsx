@@ -11,11 +11,17 @@ import {
   Settings,
   Users,
   AlertCircle,
+  TrendingUp,
+  Calendar,
+  History,
+  CheckCircle2,
+  Zap,
 } from "lucide-react";
 import { toast } from "sonner";
 import { cn } from "@/lib/utils";
 import { ApiError } from "@/lib/api";
-import { feesApi, type DuesRow } from "@/lib/fees";
+import { formatCurrency } from "@/lib/currency";
+import { feesApi, type DuesRow, type FeesSummary } from "@/lib/fees";
 import { Button } from "@/components/ui/Button";
 import { Skeleton } from "@/components/ui/Skeleton";
 import { EmptyState } from "@/components/ui/EmptyState";
@@ -26,6 +32,7 @@ import { RecordPaymentDialog } from "@/components/fees/RecordPaymentDialog";
 export default function FeesPage() {
   const router = useRouter();
   const [dues, setDues] = React.useState<DuesRow[] | null>(null);
+  const [summary, setSummary] = React.useState<FeesSummary | null>(null);
   const [structureCount, setStructureCount] = React.useState<number | null>(
     null,
   );
@@ -39,12 +46,18 @@ export default function FeesPage() {
     setLoading(true);
     setError(null);
     try {
-      const [rows, structs] = await Promise.all([
+      // All three endpoints in parallel — none depends on the others.
+      // Summary is the new "what's the state of the school's finances?"
+      // surface; dues is the actionable list; structures gates the
+      // empty-state CTA.
+      const [rows, structs, sum] = await Promise.all([
         feesApi.getDues(),
         feesApi.listStructures(),
+        feesApi.getSummary(),
       ]);
       setDues(rows);
       setStructureCount(structs.length);
+      setSummary(sum);
     } catch (err) {
       if (err instanceof ApiError && err.status === 401) {
         router.replace("/login");
@@ -53,6 +66,7 @@ export default function FeesPage() {
       setError(err instanceof ApiError ? err.message : "Failed to load dues.");
       setDues([]);
       setStructureCount(0);
+      setSummary(null);
     } finally {
       setLoading(false);
     }
@@ -107,12 +121,12 @@ export default function FeesPage() {
         </div>
       ) : (
         <>
-          <StatsRow
-            totalDue={stats.totalDue}
-            totalDiscount={stats.totalDiscount}
-            studentsDue={stats.studentsDue}
-            overdue={stats.overdue}
-          />
+          {/* Summary cards — new wide grid sourced from the
+              GET /fees/summary endpoint. The old 3-card row was good
+              for "what's owed" but missed "what's coming in." This
+              splits into two rows: collection (today/month/all) on
+              top, dues (outstanding/overdue/students) below. */}
+          {summary && <SummaryCards summary={summary} duesStats={stats} />}
 
           {noDues ? (
             <div className="glass rounded-xl">
@@ -184,6 +198,23 @@ function Header({
         >
           Refresh
         </Button>
+        {/* Cashier workspace — primary "collect a payment" entry. Lives
+            ahead of the History button in the toolbar so it's the first
+            thing the cashier sees on this page. */}
+        <Link
+          href="/fees/collect"
+          className="inline-flex h-9 items-center gap-1.5 rounded-md border border-primary/30 bg-primary/5 px-3 text-sm font-medium text-primary hover:border-primary/60 hover:bg-primary/10 transition-colors"
+        >
+          <Zap className="h-4 w-4" />
+          Collect payment
+        </Link>
+        <Link
+          href="/fees/payments"
+          className="inline-flex h-9 items-center gap-1.5 rounded-md border border-border bg-surface px-3 text-sm font-medium text-foreground hover:border-primary/40 hover:text-primary transition-colors"
+        >
+          <History className="h-4 w-4" />
+          Payment history
+        </Link>
         <Button
           variant="outline"
           onClick={onManage}
@@ -204,42 +235,84 @@ function Header({
   );
 }
 
-function StatsRow({
-  totalDue,
-  totalDiscount,
-  studentsDue,
-  overdue,
+/**
+ * Six-card summary grid. Top row is "money in" (positive framing for
+ * the cashier — it's what they accomplished), bottom row is "what's
+ * left to chase" (action-oriented).
+ *
+ * Numbers come from the centralized GET /fees/summary endpoint so
+ * they stay consistent with anywhere else they're displayed (e.g.
+ * the admin dashboard). Dues stats (count of students-with-dues, count
+ * of overdue students) reuse the local dues array since they're already
+ * loaded on this page.
+ */
+function SummaryCards({
+  summary,
+  duesStats,
 }: {
-  totalDue: number;
-  totalDiscount: number;
-  studentsDue: number;
-  overdue: number;
+  summary: FeesSummary;
+  duesStats: { studentsDue: number; overdue: number; totalDiscount: number };
 }) {
   return (
-    <div className="grid grid-cols-1 gap-4 sm:grid-cols-3 animate-fade-in-up">
-      <StatCard
-        label="Total outstanding"
-        value={formatMoney(totalDue)}
-        tone="primary"
-        icon={<Wallet className="h-5 w-5" />}
-        hint={
-          totalDiscount > 0
-            ? `After ${formatMoney(totalDiscount)} in scholarships`
-            : undefined
-        }
-      />
-      <StatCard
-        label="Students with dues"
-        value={studentsDue.toString()}
-        tone="muted"
-        icon={<Users className="h-5 w-5" />}
-      />
-      <StatCard
-        label="Overdue"
-        value={overdue.toString()}
-        tone={overdue > 0 ? "destructive" : "muted"}
-        icon={<AlertTriangle className="h-5 w-5" />}
-      />
+    <div className="space-y-4 animate-fade-in-up">
+      {/* Row 1 — collection (positive) */}
+      <div className="grid grid-cols-1 gap-4 sm:grid-cols-3">
+        <StatCard
+          label="Today's collection"
+          value={formatMoney(summary.todayCollection)}
+          tone="primary"
+          icon={<CheckCircle2 className="h-5 w-5" />}
+        />
+        <StatCard
+          label="This month"
+          value={formatMoney(summary.thisMonthCollection)}
+          tone="primary"
+          icon={<Calendar className="h-5 w-5" />}
+        />
+        <StatCard
+          label="Total collected"
+          value={formatMoney(summary.totalCollected)}
+          tone="muted"
+          icon={<TrendingUp className="h-5 w-5" />}
+          hint={
+            summary.totalAssigned > 0
+              ? `of ${formatMoney(summary.totalAssigned)} assigned`
+              : undefined
+          }
+        />
+      </div>
+
+      {/* Row 2 — what's left to chase */}
+      <div className="grid grid-cols-1 gap-4 sm:grid-cols-3">
+        <StatCard
+          label="Total pending"
+          value={formatMoney(summary.totalPending)}
+          tone={summary.totalPending > 0 ? "primary" : "muted"}
+          icon={<Wallet className="h-5 w-5" />}
+          hint={
+            duesStats.totalDiscount > 0
+              ? `After ${formatMoney(duesStats.totalDiscount)} in scholarships`
+              : undefined
+          }
+        />
+        <StatCard
+          label="Overdue amount"
+          value={formatMoney(summary.totalOverdue)}
+          tone={summary.totalOverdue > 0 ? "destructive" : "muted"}
+          icon={<AlertTriangle className="h-5 w-5" />}
+          hint={
+            duesStats.overdue > 0
+              ? `${duesStats.overdue} student${duesStats.overdue === 1 ? "" : "s"} past due`
+              : undefined
+          }
+        />
+        <StatCard
+          label="Students with dues"
+          value={summary.studentsWithDues.toString()}
+          tone="muted"
+          icon={<Users className="h-5 w-5" />}
+        />
+      </div>
     </div>
   );
 }
@@ -439,6 +512,17 @@ function DuesTable({
   );
 }
 
+/**
+ * Per-student status pill with days-aware copy.
+ *
+ *   OVERDUE  → red, "Overdue · 12 days"
+ *   DUE_SOON → amber, "Due in 4 days"  (no money in yet, due within 7d)
+ *   PARTIAL  → amber, "Partial"
+ *   UNPAID   → muted, "Unpaid"
+ *
+ * Day math is done with UTC midnight to avoid TZ drift; the
+ * `oldestDueDate` is already a YYYY-MM-DD string from the backend.
+ */
 function StatusPill({
   overdue,
   partial,
@@ -448,13 +532,17 @@ function StatusPill({
   partial: boolean;
   oldestDueDate: string | null;
 }) {
+  const days = oldestDueDate ? daysBetweenTodayAnd(oldestDueDate) : null;
+
   if (overdue) {
     return (
       <span className="inline-flex items-center gap-1.5 rounded-full bg-destructive/10 px-2 py-0.5 text-xs font-medium text-destructive">
         <AlertTriangle className="h-3 w-3" strokeWidth={2.5} />
         Overdue
-        {oldestDueDate && (
-          <span className="opacity-75 tabular-nums">· since {oldestDueDate}</span>
+        {days !== null && days > 0 && (
+          <span className="opacity-80 tabular-nums">
+            · {days} day{days === 1 ? "" : "s"}
+          </span>
         )}
       </span>
     );
@@ -466,11 +554,42 @@ function StatusPill({
       </span>
     );
   }
+  // DUE_SOON window: not overdue, no payments yet, and oldestDueDate
+  // is within 7 days. We can detect "no payments yet" client-side
+  // because the dues page only includes students with `totalDue > 0`
+  // (or non-zero credit), and the `partial` flag is computed by the
+  // parent — so reaching this branch means UNPAID, not PARTIAL. The
+  // amber chip nudges the cashier to chase before it tips overdue.
+  if (days !== null && days < 0 && days >= -7) {
+    return (
+      <span className="inline-flex items-center gap-1.5 rounded-full bg-amber-500/10 px-2 py-0.5 text-xs font-medium text-amber-700">
+        Due in {-days} day{days === -1 ? "" : "s"}
+      </span>
+    );
+  }
   return (
     <span className="inline-flex items-center gap-1.5 rounded-full bg-muted/70 px-2 py-0.5 text-xs font-medium text-muted-foreground">
       Unpaid
     </span>
   );
+}
+
+/**
+ * Whole days between today and an ISO YYYY-MM-DD date. Positive when
+ * the date is in the past (overdue), negative when in the future
+ * (DUE_SOON-eligible). Uses UTC midnight on both sides so DST and TZ
+ * shifts don't move the boundary.
+ */
+function daysBetweenTodayAnd(iso: string): number {
+  const target = new Date(`${iso}T00:00:00.000Z`).getTime();
+  const now = new Date();
+  const todayUtc = Date.UTC(
+    now.getUTCFullYear(),
+    now.getUTCMonth(),
+    now.getUTCDate(),
+  );
+  const dayMs = 24 * 60 * 60 * 1000;
+  return Math.round((todayUtc - target) / dayMs);
 }
 
 function Th({
@@ -555,9 +674,7 @@ function ErrorBanner({
   );
 }
 
-function formatMoney(n: number): string {
-  return n.toLocaleString(undefined, {
-    minimumFractionDigits: 0,
-    maximumFractionDigits: 2,
-  });
-}
+// Centralized via `lib/currency.formatCurrency`. Local alias kept so the
+// rest of this file can keep its short call sites — no behavioural
+// change vs. the old helper: same 2dp formatting, gains the `रु.` prefix.
+const formatMoney = formatCurrency;

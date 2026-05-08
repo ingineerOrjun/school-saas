@@ -38,6 +38,32 @@ export type StudentWithSection = Prisma.StudentGetPayload<{
   include: typeof studentInclude;
 }>;
 
+/**
+ * Aggregated analytics for the Analytics Center's Student tab.
+ * Composition decision: keep this co-located with StudentService rather
+ * than carving out a separate AnalyticsService — the rollups are
+ * student-domain logic and live alongside the source-of-truth queries.
+ */
+export interface StudentAnalytics {
+  total: number;
+  genderSplit: Array<{
+    gender: 'MALE' | 'FEMALE' | 'OTHER';
+    count: number;
+  }>;
+  /** Students per class. "Unassigned" bucket includes students with no class link at all. */
+  classStrength: Array<{
+    classId: string | null;
+    className: string;
+    count: number;
+  }>;
+  /** Last 12 months of admissions, oldest-first. `month` is "YYYY-MM" (AD). */
+  admissionsTrend: Array<{
+    month: string;
+    count: number;
+  }>;
+  generatedAt: string;
+}
+
 @Injectable()
 export class StudentService {
   constructor(private readonly prisma: PrismaService) {}
@@ -376,6 +402,182 @@ export class StudentService {
       include: studentInclude,
       orderBy: { createdAt: 'desc' },
     });
+  }
+
+  /**
+   * Multi-field search optimized for the cashier workspace's typeahead.
+   *
+   * Matches `q` (case-insensitive contains) against any of:
+   *   • firstName / lastName  (the obvious one)
+   *   • symbolNumber          (Nepal-style roll/admission #; cashiers
+   *                            usually have this written on slips)
+   *   • contactNumber         (parent's phone — what the parent gives
+   *                            the cashier when picking up the receipt)
+   *   • parentName            (catches "Ram Kumar's daughter")
+   *
+   * Returns at most `limit` rows (default 10) so the dropdown stays
+   * scrollable without a virtualized list — the cashier should refine
+   * the query if they're not seeing what they want.
+   *
+   * Empty query returns the most-recently-created students; the UI uses
+   * this as the "recent students" panel before the cashier types.
+   */
+  search(
+    schoolId: string,
+    q: string,
+    limit = 10,
+  ): Promise<StudentWithSection[]> {
+    const trimmed = q.trim();
+    const cap = Math.min(50, Math.max(1, limit));
+
+    if (trimmed.length === 0) {
+      // Empty query → recent students fallback for the "no input yet"
+      // dropdown state. createdAt-desc gives "students added recently"
+      // which is a useful default for new schools.
+      return this.prisma.student.findMany({
+        where: { schoolId },
+        include: studentInclude,
+        orderBy: { createdAt: 'desc' },
+        take: cap,
+      });
+    }
+
+    return this.prisma.student.findMany({
+      where: {
+        schoolId,
+        OR: [
+          { firstName: { contains: trimmed, mode: 'insensitive' } },
+          { lastName: { contains: trimmed, mode: 'insensitive' } },
+          { symbolNumber: { contains: trimmed, mode: 'insensitive' } },
+          { contactNumber: { contains: trimmed, mode: 'insensitive' } },
+          { parentName: { contains: trimmed, mode: 'insensitive' } },
+        ],
+      },
+      include: studentInclude,
+      // Order by name for predictability — cashier's eye scans
+      // alphabetically. createdAt-desc would shuffle results unhelpfully
+      // when the query matches several students.
+      orderBy: [{ firstName: 'asc' }, { lastName: 'asc' }],
+      take: cap,
+    });
+  }
+
+  /**
+   * Aggregated student analytics for the Analytics Center's Student
+   * tab. Single round-trip (one query pulls every student row,
+   * minimally-projected); the rollups are computed in JS.
+   *
+   * Why JS rollups instead of SQL groupBy: the projection is small
+   * (5 fields × ~few hundred rows for typical schools) and we need
+   * THREE different rollups (by gender, by class, by admission month)
+   * against the same row set. One pass-and-bucket is cheaper than
+   * three round-trips, and keeps the multi-rollup logic in one place
+   * where it can't drift out of sync.
+   */
+  async getAnalytics(schoolId: string): Promise<StudentAnalytics> {
+    const students = await this.prisma.student.findMany({
+      where: { schoolId },
+      select: {
+        id: true,
+        gender: true,
+        classId: true,
+        sectionId: true,
+        admissionDate: true,
+        createdAt: true,
+        class: { select: { id: true, name: true } },
+        section: { select: { id: true, classId: true, class: { select: { id: true, name: true } } } },
+      },
+    });
+
+    const total = students.length;
+
+    // ----- Gender split -----
+    const byGender = new Map<string, number>();
+    for (const s of students) {
+      byGender.set(s.gender, (byGender.get(s.gender) ?? 0) + 1);
+    }
+    const genderSplit = ['MALE', 'FEMALE', 'OTHER'].map((g) => ({
+      gender: g as 'MALE' | 'FEMALE' | 'OTHER',
+      count: byGender.get(g) ?? 0,
+    }));
+
+    // ----- Class strength -----
+    // We use the student's effective class — direct `classId` if set,
+    // else the section's parent classId. Students without either count
+    // as "Unassigned" so the principal can see how many haven't been
+    // placed yet.
+    const classCounts = new Map<
+      string,
+      { classId: string | null; className: string; count: number }
+    >();
+    const UNASSIGNED_KEY = '__unassigned__';
+    classCounts.set(UNASSIGNED_KEY, {
+      classId: null,
+      className: 'Unassigned',
+      count: 0,
+    });
+    for (const s of students) {
+      const classId = s.classId ?? s.section?.classId ?? null;
+      const className = s.class?.name ?? s.section?.class?.name ?? null;
+      const key = classId ?? UNASSIGNED_KEY;
+      const existing = classCounts.get(key);
+      if (existing) {
+        existing.count += 1;
+      } else {
+        classCounts.set(key, {
+          classId,
+          className: className ?? 'Unknown',
+          count: 1,
+        });
+      }
+    }
+    const classStrength = [...classCounts.values()]
+      // Drop the "Unassigned" bucket if there are none — it's noise
+      // when every student is placed. Same for "Unknown" buckets that
+      // shouldn't normally exist.
+      .filter((c) => c.count > 0)
+      .sort((a, b) => {
+        // Push Unassigned to the end so the principal scans real
+        // classes first.
+        if (a.classId === null) return 1;
+        if (b.classId === null) return -1;
+        return a.className.localeCompare(b.className);
+      });
+
+    // ----- Admissions trend (last 12 months) -----
+    // Bucket by year-month. Falls back to createdAt for legacy rows
+    // that pre-date the admissionDate column. The trend is exactly
+    // 12 buckets so the chart renders even when there are gap months.
+    const today = new Date();
+    const startOfYearAgo = new Date(
+      Date.UTC(today.getUTCFullYear(), today.getUTCMonth() - 11, 1),
+    );
+    const monthBuckets = new Map<string, number>();
+    for (let i = 11; i >= 0; i--) {
+      const d = new Date(today);
+      d.setUTCMonth(d.getUTCMonth() - i);
+      const key = `${d.getUTCFullYear()}-${String(d.getUTCMonth() + 1).padStart(2, '0')}`;
+      monthBuckets.set(key, 0);
+    }
+    for (const s of students) {
+      const ref = s.admissionDate ?? s.createdAt;
+      if (ref < startOfYearAgo) continue;
+      const key = `${ref.getUTCFullYear()}-${String(ref.getUTCMonth() + 1).padStart(2, '0')}`;
+      if (monthBuckets.has(key)) {
+        monthBuckets.set(key, (monthBuckets.get(key) ?? 0) + 1);
+      }
+    }
+    const admissionsTrend = [...monthBuckets.entries()].map(
+      ([month, count]) => ({ month, count }),
+    );
+
+    return {
+      total,
+      genderSplit,
+      classStrength,
+      admissionsTrend,
+      generatedAt: new Date().toISOString(),
+    };
   }
 
   async findOne(id: string, schoolId: string): Promise<StudentWithSection> {

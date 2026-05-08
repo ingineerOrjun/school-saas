@@ -1,7 +1,20 @@
 import { api } from "./api";
 
 export type FeeFrequency = "MONTHLY" | "ONE_TIME";
-export type AssignmentStatus = "PAID" | "PARTIAL" | "UNPAID";
+/**
+ * Status chip for a single fee assignment. Five values:
+ *   PAID     — fully cleared, no urgency
+ *   PARTIAL  — some money in, balance remains, not yet past due
+ *   DUE_SOON — no money yet, due-date within 7 days (amber chip)
+ *   UNPAID   — no money yet, due-date in the future beyond the soon-window
+ *   OVERDUE  — open balance AND past due-date (wins over PARTIAL)
+ */
+export type AssignmentStatus =
+  | "PAID"
+  | "PARTIAL"
+  | "DUE_SOON"
+  | "UNPAID"
+  | "OVERDUE";
 export type PaymentMethod = "CASH" | "BANK" | "ESEWA" | "OTHER";
 export type DiscountType = "PERCENT" | "FIXED";
 
@@ -42,6 +55,11 @@ export interface StudentAssignment {
   remaining: number;
   status: AssignmentStatus;
   overdue: boolean;
+  /**
+   * Days the assignment is past due (positive) or until due (negative).
+   * Always 0 once the assignment is fully paid.
+   */
+  daysOverdue: number;
   /** Backend flag — payments exist on this assignment, discount is frozen. */
   canEditDiscount?: boolean;
 }
@@ -72,6 +90,80 @@ export interface StudentFeesReport {
   totalDue: number;
   /** Unallocated General Credit — money paid but not yet applied to a fee. */
   totalCredit: number;
+}
+
+export interface FeesSummary {
+  totalCollected: number;
+  totalAssigned: number;
+  totalPending: number;
+  totalOverdue: number;
+  todayCollection: number;
+  thisMonthCollection: number;
+  studentsWithDues: number;
+  monthlyTrend: Array<{ month: string; collected: number }>;
+}
+
+export type PaymentRowStatus = "ACTIVE" | "REFUNDED" | "VOID";
+
+export interface PaymentHistoryRow {
+  id: string;
+  receiptNumber: string | null;
+  date: string;
+  amount: number;
+  method: PaymentMethod | null;
+  notes: string | null;
+  status: PaymentRowStatus;
+  isRefund: boolean;
+  feeStructureName: string | null;
+  student: {
+    id: string;
+    firstName: string;
+    lastName: string;
+    symbolNumber: string | null;
+    className: string | null;
+    sectionName: string | null;
+  };
+  cashier: { id: string; email: string; role: string } | null;
+  createdAt: string;
+}
+
+export interface PaymentHistoryQuery {
+  q?: string;
+  fromDate?: string;
+  toDate?: string;
+  method?: PaymentMethod;
+  classId?: string;
+  studentId?: string;
+  page?: number;
+  pageSize?: number;
+}
+
+export interface PaymentHistoryResponse {
+  rows: PaymentHistoryRow[];
+  total: number;
+  page: number;
+  pageSize: number;
+}
+
+/** Today's-collection snapshot for the cashier workspace. */
+export interface CashierSummary {
+  date: string;
+  collectedToday: number;
+  transactionsToday: number;
+  refundsToday: number;
+  refundsAmountToday: number;
+  byMethod: Array<{
+    method: PaymentMethod | "UNKNOWN";
+    amount: number;
+    count: number;
+  }>;
+  byCashier: Array<{
+    userId: string | null;
+    email: string | null;
+    role: string | null;
+    amount: number;
+    count: number;
+  }>;
 }
 
 export interface DuesRow {
@@ -119,6 +211,22 @@ export interface CreatePaymentInput {
   feeAssignmentId?: string;
   method?: PaymentMethod;
   notes?: string;
+  /**
+   * UUID generated on the client BEFORE the first submit. Repeated
+   * submissions with the same key resolve to the same Payment row on
+   * the server — so a double-clicked "Save & Print" button or a
+   * retried request from a flaky network never duplicates the receipt.
+   */
+  clientRequestId?: string;
+}
+
+export interface RefundPaymentInput {
+  /** Refund amount (positive). Backend stores it as a negative payment row. */
+  amount: number;
+  /** Required free-form reason — recorded on the refund row for audit. */
+  reason: string;
+  /** Optional admin-side notes. */
+  notes?: string;
 }
 
 /** Per-fee breakdown attached to receipts linked to a specific assignment. */
@@ -155,8 +263,62 @@ export interface Receipt {
   feeStructure: { id: string; name: string; frequency: string } | null;
   /** Null for unlinked ("general credit") payments. */
   feeDetail: ReceiptFeeDetail | null;
-  school: { id: string; name: string; slug: string; logoUrl: string | null };
+  school: {
+    id: string;
+    name: string;
+    slug: string;
+    logoUrl: string | null;
+    /** Optional postal address — null when unset by admin. */
+    address: string | null;
+    /** Optional public phone — null when unset by admin. */
+    phone: string | null;
+  };
+  /**
+   * Every fee on the student's account at issue time, with paid/remaining
+   * annotated. Empty for students with no assignments yet.
+   */
+  lineItems: ReceiptLineItem[];
+  /**
+   * Snapshot of the student's overall ledger at the moment this payment
+   * was recorded. Stays faithful even when re-printing an old receipt.
+   */
+  ledger: {
+    previousDue: number;
+    paidNow: number;
+    remainingBalance: number;
+    creditBalance: number;
+  };
+  /** Coarse status badge — PAID_IN_FULL / PARTIAL / BALANCE_DUE. */
+  status: ReceiptStatus;
+  /** True when this slip is itself a refund (negative amount). */
+  isRefund: boolean;
+  /** Public verification URL for the QR code; null when unconfigured. */
+  verificationUrl: string | null;
+  /**
+   * The cashier who originally recorded this payment. Surfaces on the
+   * "Received by" line of the receipt slip. Null for legacy rows that
+   * pre-date the audit-fields migration.
+   */
+  cashier: { id: string; email: string; role: string } | null;
   recordedAt: string;
+}
+
+export type ReceiptStatus = "PAID_IN_FULL" | "PARTIAL" | "BALANCE_DUE";
+
+export interface ReceiptLineItem {
+  feeAssignmentId: string;
+  feeName: string;
+  baseAmount: number;
+  discountAmount: number;
+  finalAmount: number;
+  /** Total paid on this fee through the moment of this payment. */
+  paidToDate: number;
+  /** Portion of THIS payment that landed on this line. */
+  paidThisReceipt: number;
+  remaining: number;
+  status: AssignmentStatus;
+  /** True if the line is the one explicitly linked to this payment. */
+  isFocal: boolean;
 }
 
 export const feesApi = {
@@ -186,8 +348,44 @@ export const feesApi = {
       body: JSON.stringify(input),
     }),
   getDues: () => api<DuesRow[]>("/fees/dues"),
+  getSummary: () => api<FeesSummary>("/fees/summary"),
+  /**
+   * Today's-collection snapshot — drives the cashier workspace stats
+   * bar. Optional `date` (YYYY-MM-DD) lets admins look back; defaults
+   * to today server-side.
+   */
+  getCashierSummary: (date?: string) => {
+    const qs = date ? `?date=${encodeURIComponent(date)}` : "";
+    return api<CashierSummary>(`/fees/cashier-summary${qs}`);
+  },
+  /**
+   * Paginated, filterable payment history. Query params are
+   * URL-encoded; empty fields are dropped server-side so this is
+   * safe to call with all-defaults to get the most-recent N rows.
+   */
+  listPayments: (q: PaymentHistoryQuery = {}) => {
+    const params = new URLSearchParams();
+    for (const [k, v] of Object.entries(q)) {
+      if (v === undefined || v === null || v === "") continue;
+      params.set(k, String(v));
+    }
+    const qs = params.toString();
+    return api<PaymentHistoryResponse>(
+      qs ? `/payments?${qs}` : "/payments",
+    );
+  },
   getReceipt: (paymentId: string) =>
     api<Receipt>(`/payments/${encodeURIComponent(paymentId)}/receipt`),
+  refundPayment: (paymentId: string, input: RefundPaymentInput) =>
+    api<{
+      id: string;
+      amount: number;
+      receiptNumber: string | null;
+      refundOfPaymentId: string | null;
+    }>(`/payments/${encodeURIComponent(paymentId)}/refund`, {
+      method: "POST",
+      body: JSON.stringify(input),
+    }),
 };
 
 /** Today's date in YYYY-MM-DD (local time). */

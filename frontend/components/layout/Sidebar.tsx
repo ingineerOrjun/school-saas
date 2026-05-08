@@ -10,9 +10,11 @@ import {
   BookOpen,
   CalendarCheck,
   ClipboardList,
+  FilePlus2,
   Wallet,
   Megaphone,
   Settings,
+  BarChart3,
   ChevronsLeft,
   PanelLeftOpen,
   Sparkles,
@@ -21,6 +23,7 @@ import {
 } from "lucide-react";
 import { cn } from "@/lib/utils";
 import { getStoredUser, type Role } from "@/lib/auth";
+import { FeatureKey, useFeatures } from "@/lib/features";
 
 type NavItem = {
   label: string;
@@ -28,6 +31,19 @@ type NavItem = {
   icon: LucideIcon;
   /** When set, the link is hidden unless the user has one of these roles. */
   requiresRole?: Role[];
+  /**
+   * Phase 5 — when set, the link is hidden unless the school has
+   * this feature enabled. SUPER_ADMIN bypasses (matches the
+   * backend guard's behaviour). Resolved via the FeaturesContext.
+   */
+  requiresFeature?: string;
+  /**
+   * Optional subsection label rendered above this item. Set on the
+   * FIRST item of a logical group ("Exams" above "Enter Marks", for
+   * example) — subsequent items in the same group leave it blank,
+   * which slots them visually under the existing heading.
+   */
+  groupLabel?: string;
 };
 
 const primary: NavItem[] = [
@@ -42,10 +58,51 @@ const primary: NavItem[] = [
   // it (assignment dialog) aren't theirs to use either.
   { label: "Subjects", href: "/subjects", icon: BookOpen, requiresRole: ["ADMIN", "STAFF"] },
   { label: "Attendance", href: "/attendance", icon: CalendarCheck },
-  { label: "Exams", href: "/exams", icon: ClipboardList },
+  // Three entry points for the exams workflow live under one "Exams"
+  // subsection so they read as a related triplet. The subheading only
+  // appears once (on the first item via `groupLabel`); the others
+  // slot beneath it. Admin / staff see all three; teachers see only
+  // "Enter Marks" + "Results" (the backend rejects non-ADMIN/STAFF
+  // on POST /exams; results read is open to authenticated users
+  // with the per-class scope rules already in place).
+  {
+    label: "Enter Marks",
+    href: "/exams/marks",
+    icon: ClipboardList,
+    groupLabel: "Exams",
+  },
+  {
+    label: "Results",
+    href: "/results/ledger",
+    icon: ClipboardList,
+  },
+  {
+    label: "Create Exam",
+    href: "/exams/create",
+    icon: FilePlus2,
+    requiresRole: ["ADMIN", "STAFF"],
+  },
   // Fees + receipts are financial — admin-only per the role spec.
   { label: "Fees", href: "/fees", icon: Wallet, requiresRole: ["ADMIN"] },
-  { label: "Announcements", href: "/announcements", icon: Megaphone },
+  // Analytics — admin-only control center for cross-module insights.
+  // The page itself enforces the role too (renders an access gate for
+  // non-admins) but hiding the link client-side keeps the nav honest.
+  // Phase 5: also gated behind the `analytics` feature flag.
+  {
+    label: "Analytics",
+    href: "/analytics",
+    icon: BarChart3,
+    requiresRole: ["ADMIN"],
+    requiresFeature: FeatureKey.Analytics,
+  },
+  // Phase 5: announcements is feature-tiered. Default ON; platform
+  // owner can disable per-tenant.
+  {
+    label: "Announcements",
+    href: "/announcements",
+    icon: Megaphone,
+    requiresFeature: FeatureKey.Announcements,
+  },
 ];
 
 const secondary: NavItem[] = [
@@ -106,8 +163,21 @@ export function Sidebar({
   // only when the cached role matches. Admin sees everything.
   const matchesRole = (item: NavItem) =>
     !item.requiresRole || (role !== null && item.requiresRole.includes(role));
-  const visiblePrimary = primary.filter(matchesRole);
-  const visibleSecondary = secondary.filter(matchesRole);
+
+  // Phase 5: feature-flag gate. SUPER_ADMIN sees every nav entry
+  // regardless of the school's flags — matches the backend guard's
+  // bypass and keeps the platform owner unblocked when they
+  // impersonate or audit. Items without `requiresFeature` are
+  // visible to everyone.
+  const { isEnabled } = useFeatures();
+  const matchesFeature = (item: NavItem) => {
+    if (!item.requiresFeature) return true;
+    if (role === "SUPER_ADMIN") return true;
+    return isEnabled(item.requiresFeature);
+  };
+
+  const visiblePrimary = primary.filter(matchesRole).filter(matchesFeature);
+  const visibleSecondary = secondary.filter(matchesRole).filter(matchesFeature);
 
   // On mobile the drawer ignores `collapsed` (always full labels).
   // Use this derived flag inside render branches that depend on
@@ -185,12 +255,27 @@ export function Sidebar({
         </p>
         <ul className="flex flex-col gap-0.5">
           {visiblePrimary.map((item) => (
-            <NavLink
-              key={item.href}
-              item={item}
-              active={isActive(pathname, item.href)}
-              showCollapsed={showCollapsed}
-            />
+            <React.Fragment key={item.href}>
+              {item.groupLabel && (
+                // Inline subsection label. Hidden when the desktop
+                // sidebar is collapsed (no horizontal room) — items
+                // still render, just without the heading.
+                <li
+                  className={cn(
+                    "px-2 pt-3 pb-1 text-[10px] font-semibold uppercase tracking-wider text-muted-foreground/70",
+                    showCollapsed && "md:hidden",
+                  )}
+                  aria-hidden="true"
+                >
+                  {item.groupLabel}
+                </li>
+              )}
+              <NavLink
+                item={item}
+                active={isActive(pathname, item.href)}
+                showCollapsed={showCollapsed}
+              />
+            </React.Fragment>
           ))}
         </ul>
 

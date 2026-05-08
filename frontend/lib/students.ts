@@ -113,9 +113,49 @@ export interface BulkCreateResult {
   failed: BulkFailure[];
 }
 
+/**
+ * Aggregated student analytics — mirror of the backend `StudentAnalytics`.
+ * Powers the Analytics Center's Student tab.
+ */
+export interface StudentAnalytics {
+  total: number;
+  genderSplit: Array<{
+    gender: "MALE" | "FEMALE" | "OTHER";
+    count: number;
+  }>;
+  classStrength: Array<{
+    classId: string | null;
+    className: string;
+    count: number;
+  }>;
+  admissionsTrend: Array<{
+    month: string;
+    count: number;
+  }>;
+  generatedAt: string;
+}
+
 export const studentsApi = {
   list: (filter?: ListStudentsFilter) =>
     api<StudentDto[]>(`/students${buildListQuery(filter)}`),
+  /**
+   * Multi-field typeahead used by the cashier workspace. Matches `q`
+   * against name, symbol no, phone, and parent name. Empty query
+   * returns the most-recently-created students (the "no input yet"
+   * dropdown state). Capped at `limit` (default 10).
+   */
+  search: (q: string, limit = 10) => {
+    const params = new URLSearchParams();
+    if (q) params.set("q", q);
+    params.set("limit", String(limit));
+    return api<StudentDto[]>(`/students/search?${params.toString()}`);
+  },
+  /**
+   * Aggregated student analytics for the Analytics Center. Admin-only
+   * server-side; the page-level role gate ensures non-admins never
+   * even reach the call site.
+   */
+  getAnalytics: () => api<StudentAnalytics>("/students/analytics"),
   get: (id: string) => api<StudentDto>(`/students/${id}`),
   create: (input: CreateStudentInput) =>
     api<StudentDto>("/students", {

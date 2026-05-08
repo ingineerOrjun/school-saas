@@ -29,6 +29,10 @@ import {
   type AttendanceRoster,
   type AttendanceStatus,
 } from "@/lib/attendance";
+import { enqueue as enqueueAttendance } from "@/lib/offline-queue";
+import { cacheRoster, getCachedRoster } from "@/lib/roster-cache";
+import { syncNow } from "@/lib/sync-engine";
+import { useOnlineStatus } from "@/hooks/useOnlineStatus";
 import { Button } from "@/components/ui/Button";
 import { Skeleton } from "@/components/ui/Skeleton";
 import { EmptyState } from "@/components/ui/EmptyState";
@@ -130,6 +134,11 @@ function useInitialScopeFromQuery(): ScopeValue {
 
 export default function AttendancePage() {
   const router = useRouter();
+  // Online status drives the offline path: when offline we still
+  // accept toggles (queued to IndexedDB) but show "Saved offline"
+  // instead of the live "Saved" toast. The sync engine handles the
+  // actual POST when connectivity returns.
+  const online = useOnlineStatus();
   // Pre-fill scope from URL on mount so deep links from the teacher
   // dashboard ("Take attendance") land directly on the right roster
   // instead of an empty picker. We read once at init, not on every
@@ -146,6 +155,19 @@ export default function AttendancePage() {
   >(null);
   const [scope, setScope] = React.useState<ScopeValue>(initialScope);
   const [roster, setRoster] = React.useState<AttendanceRoster[] | null>(null);
+  // ISO timestamp returned with the last successful roster fetch. We
+  // forward this as `lastKnownVersion` on every queued mark so the
+  // sync engine can detect "data changed while user was offline" via
+  // the backend's 409 path. Populated whether the roster came from
+  // network OR cache — both have versions.
+  const [rosterVersion, setRosterVersion] = React.useState<string | null>(
+    null,
+  );
+  // Epoch-ms timestamp when the displayed roster was last fetched
+  // fresh from the server. Set to `null` while showing live network
+  // data; populated from the cache's `updatedAt` when we fall back
+  // to IndexedDB. Drives the "⚠ Showing last synced roster" pill.
+  const [staleSince, setStaleSince] = React.useState<number | null>(null);
   const [loadingClasses, setLoadingClasses] = React.useState(true);
   const [loadingRoster, setLoadingRoster] = React.useState(false);
   const [error, setError] = React.useState<string | null>(null);
@@ -195,12 +217,32 @@ export default function AttendancePage() {
     };
   }, [router]);
 
-  // Fetch the roster whenever date or scope changes. Scope is either a
-  // section or a whole class (for schools that don't use sections).
+  /**
+   * Roster fetch — offline-aware:
+   *
+   *   1. Attempt the network call.
+   *   2. On success: render fresh data + write-through to IndexedDB
+   *      so the next offline visit has a snapshot to fall back on.
+   *   3. On NETWORK failure (TypeError from fetch): consult the
+   *      cache. If we have a snapshot, render it with `staleSince`
+   *      set so the UI shows "⚠ Showing last synced roster". If we
+   *      don't, surface "No offline data available."
+   *   4. On AUTH / server failures (ApiError with a status): treat
+   *      as a real error — these aren't connectivity-related, so
+   *      falling back to cached data would mask the real problem.
+   *
+   * The 401 redirect path stays intact so an expired session still
+   * bounces to /login. When the network comes back, an `online`
+   * event listener below silently re-fetches and clears the
+   * stale-indicator without disturbing the marks the teacher has
+   * already enqueued.
+   */
   React.useEffect(() => {
     const parsed = parseScope(scope);
     if (!parsed.sectionId && !parsed.classId) {
       setRoster(null);
+      setRosterVersion(null);
+      setStaleSince(null);
       return;
     }
     let cancelled = false;
@@ -209,15 +251,52 @@ export default function AttendancePage() {
       setError(null);
       try {
         const data = await attendanceApi.getRoster(date, parsed);
-        if (!cancelled) setRoster(data);
+        if (cancelled) return;
+        setRoster(data.students);
+        setRosterVersion(data.version);
+        setStaleSince(null);
+        // Write-through cache. Fire-and-forget — a failed cache
+        // write must NEVER affect the visible page (e.g. quota
+        // exceeded in private browsing). The `version` is stored
+        // alongside so a later comparison can detect roster drift
+        // (added / removed students) without a content diff.
+        void cacheRoster(parsed, data.students, data.version).catch(() => {
+          /* non-critical */
+        });
       } catch (err) {
         if (err instanceof ApiError && err.status === 401) {
           router.replace("/login");
           return;
         }
-        const msg =
-          err instanceof ApiError ? err.message : "Failed to load roster.";
-        if (!cancelled) setError(msg);
+        // Distinguish real connectivity failures from server-side
+        // errors. `TypeError` from fetch = device went offline mid-
+        // request; that's our cue to consult the cache. ApiError
+        // (the server responded with a 4xx/5xx) is a real error.
+        const isNetworkError = err instanceof TypeError;
+        if (isNetworkError) {
+          const cached = await getCachedRoster(parsed).catch(() => null);
+          if (cancelled) return;
+          if (cached) {
+            setRoster(cached.students);
+            // Cached version may be undefined for snapshots taken
+            // before the versioning rollout. Forward `null` in that
+            // case — the conflict check on the backend just skips
+            // when no header is sent.
+            setRosterVersion(cached.version ?? null);
+            setStaleSince(cached.updatedAt);
+            // No `setError` here — the stale-indicator pill is
+            // sufficient signal. Showing both would feel broken.
+          } else {
+            setRoster(null);
+            setRosterVersion(null);
+            setStaleSince(null);
+            setError("No offline data available for this class yet.");
+          }
+        } else {
+          const msg =
+            err instanceof ApiError ? err.message : "Failed to load roster.";
+          if (!cancelled) setError(msg);
+        }
       } finally {
         if (!cancelled) setLoadingRoster(false);
       }
@@ -226,6 +305,42 @@ export default function AttendancePage() {
       cancelled = true;
     };
   }, [date, scope, router]);
+
+  /**
+   * Auto-refresh when the device comes back online while we're
+   * showing cached (stale) data. Re-runs the effect above by
+   * triggering a synthetic dependency change isn't necessary — we
+   * call the endpoint directly here, and the effect's main path
+   * will re-fire on the next normal dependency change anyway.
+   *
+   * Skips when not actually showing stale data so we don't burn
+   * a request every time the user toggles networks while they're
+   * already on fresh data.
+   */
+  React.useEffect(() => {
+    if (staleSince === null) return;
+    const onOnline = async () => {
+      const parsed = parseScope(scope);
+      if (!parsed.sectionId && !parsed.classId) return;
+      try {
+        const data = await attendanceApi.getRoster(date, parsed);
+        // Server is authoritative once reachable — replace cache + UI
+        // unconditionally. The `version` field is the hook for any
+        // future "your offline snapshot was outdated" notice (we have
+        // both the cached version and the fresh one to compare).
+        setRoster(data.students);
+        setRosterVersion(data.version);
+        setStaleSince(null);
+        void cacheRoster(parsed, data.students, data.version).catch(() => {
+          /* non-critical */
+        });
+      } catch {
+        // Still offline / failed — leave the stale data in place.
+      }
+    };
+    window.addEventListener("online", onOnline);
+    return () => window.removeEventListener("online", onOnline);
+  }, [staleSince, date, scope]);
 
   const stats = React.useMemo(() => {
     if (!roster) return { present: 0, absent: 0, unmarked: 0, total: 0 };
@@ -240,24 +355,73 @@ export default function AttendancePage() {
     return { present, absent, unmarked, total: roster.length };
   }, [roster]);
 
+  /**
+   * Single-student toggle. Always:
+   *   1. Optimistically updates the roster (so the chip flips
+   *      immediately — both online and offline).
+   *   2. Enqueues the mark payload in IndexedDB (durable across
+   *      reload + browser restarts).
+   *   3. If online, kicks the sync engine which posts the queue to
+   *      the backend right away. If offline, the engine sits idle
+   *      until `online` fires and drains everything in order.
+   *
+   * The queue's idempotency comes from the backend's
+   * `prisma.attendance.upsert` + unique(studentId, date) — re-posting
+   * the same payload after a flaky connection just re-confirms the
+   * state, never duplicates.
+   */
   const saveOne = async (studentId: string, status: AttendanceStatus) => {
-    const prev = roster;
     setRoster(
       (r) =>
         r?.map((s) => (s.studentId === studentId ? { ...s, status } : s)) ?? r,
     );
     setSavingIds((s) => new Set(s).add(studentId));
     try {
-      await attendanceApi.mark({ date, entries: [{ studentId, status }] });
-    } catch (err) {
-      setRoster(prev);
-      if (err instanceof ApiError && err.status === 401) {
-        router.replace("/login");
-        return;
+      const parsed = parseScope(scope);
+      const scopeId = parsed.sectionId ?? parsed.classId ?? "unknown";
+      await enqueueAttendance({
+        endpoint: "/attendance/mark",
+        method: "POST",
+        payload: { date, entries: [{ studentId, status }] },
+        feature: "attendance",
+        // Inspector label — admins scanning the queue need to know
+        // which class+date this row is for at a glance.
+        label: `${scopeId} · ${date}`,
+        // Dedup key per (scope, date, student). Toggling the same
+        // student multiple times offline (PRESENT → ABSENT → PRESENT)
+        // collapses to a single PENDING row carrying the latest
+        // intent — the previous payload is overwritten in place.
+        // Other students get their own keys, so this never coalesces
+        // unrelated toggles.
+        dedupKey: `${scopeId}|${date}|${studentId}`,
+        // Roster fingerprint at the time the user took this action.
+        // Sync engine forwards as `X-Last-Known-Version`. Backend
+        // 409s if the live roster has drifted past it — the sync
+        // engine then marks this item FAILED and toasts a one-shot
+        // "Data changed. Please review." prompt instead of silently
+        // overwriting fresher data.
+        lastKnownVersion: rosterVersion ?? undefined,
+      });
+      if (online) {
+        // Best-effort immediate drain. Don't block the UI on the
+        // network round-trip — the engine reports back via the badge.
+        void syncNow();
+      } else {
+        toast.success("Saved offline — will sync when you're back online.");
       }
+    } catch (err) {
+      // Enqueue failed (very rare — IndexedDB unavailable / quota).
+      // Roll back the optimistic update because we have no record of
+      // the change anywhere.
+      setRoster(
+        (r) =>
+          r?.map((s) =>
+            s.studentId === studentId ? { ...s, status: null } : s,
+          ) ?? r,
+      );
       toast.error(
-        err instanceof ApiError
-          ? err.message
+        err instanceof Error
+          ? `Couldn't save: ${err.message}`
           : "Failed to save attendance. Reverted.",
       );
     } finally {
@@ -270,31 +434,55 @@ export default function AttendancePage() {
     }
   };
 
+  /**
+   * Bulk "mark everyone present/absent". Same offline-first contract
+   * as `saveOne`: optimistic UI → enqueue → drain when online.
+   */
   const markAll = async (status: AttendanceStatus) => {
     if (!roster || roster.length === 0) return;
-    const prev = roster;
     setRoster(roster.map((r) => ({ ...r, status })));
     const allIds = new Set(roster.map((r) => r.studentId));
     setSavingIds(allIds);
     try {
-      await attendanceApi.mark({
-        date,
-        entries: roster.map((r) => ({ studentId: r.studentId, status })),
+      const parsed = parseScope(scope);
+      const scopeId = parsed.sectionId ?? parsed.classId ?? "unknown";
+      await enqueueAttendance({
+        endpoint: "/attendance/mark",
+        method: "POST",
+        payload: {
+          date,
+          entries: roster.map((r) => ({ studentId: r.studentId, status })),
+        },
+        feature: "attendance",
+        label: `${scopeId} · ${date}`,
+        // "Mark all" with the same scope+date coalesces — repeated
+        // bulk overrides offline collapse to a single row with the
+        // last-applied status. Distinct from the per-student key so
+        // bulk doesn't clobber individual toggles and vice versa.
+        dedupKey: `${scopeId}|${date}|markAll`,
+        // Same conflict-detection contract as `saveOne` — the bulk
+        // payload covers more students, so a roster change is even
+        // more relevant to flag.
+        lastKnownVersion: rosterVersion ?? undefined,
       });
-      toast.success(
-        status === "PRESENT"
-          ? `Marked all ${roster.length} present`
-          : `Marked all ${roster.length} absent`,
-      );
-    } catch (err) {
-      setRoster(prev);
-      if (err instanceof ApiError && err.status === 401) {
-        router.replace("/login");
-        return;
+      if (online) {
+        toast.success(
+          status === "PRESENT"
+            ? `Marked all ${roster.length} present`
+            : `Marked all ${roster.length} absent`,
+        );
+        void syncNow();
+      } else {
+        toast.success(
+          `Marked all ${roster.length} ${status === "PRESENT" ? "present" : "absent"} — saved offline.`,
+        );
       }
+    } catch (err) {
+      // Enqueue failed — roll back the optimistic update.
+      setRoster((r) => r?.map((s) => ({ ...s, status: null })) ?? r);
       toast.error(
-        err instanceof ApiError
-          ? err.message
+        err instanceof Error
+          ? `Couldn't save: ${err.message}`
           : "Bulk save failed. Roster reverted.",
       );
     } finally {
@@ -486,6 +674,7 @@ export default function AttendancePage() {
             </div>
           ) : roster && roster.length > 0 ? (
             <div className="space-y-4 animate-fade-in-up">
+              {staleSince !== null && <StaleRosterBanner since={staleSince} />}
               <StatsBar
                 present={stats.present}
                 absent={stats.absent}
@@ -539,6 +728,47 @@ function Header() {
       </div>
     </div>
   );
+}
+
+/**
+ * Amber pill above the roster when the displayed list came from
+ * IndexedDB instead of a fresh network call. Two-line layout: the
+ * spec's "Roster may be outdated" warning plus a contextual "last
+ * updated X ago" so the admin / teacher can decide whether to wait
+ * for reconnect or trust the cached snapshot. Re-fetches silently
+ * when the `online` event fires; the banner disappears at that
+ * point.
+ */
+function StaleRosterBanner({ since }: { since: number }) {
+  const ago = formatAgo(since);
+  return (
+    <div
+      role="status"
+      aria-live="polite"
+      className="flex items-start gap-2.5 rounded-md border border-amber-300/60 bg-amber-50 dark:bg-amber-500/10 px-3 py-2 text-xs text-amber-900 dark:text-amber-200"
+    >
+      <AlertCircle className="mt-0.5 h-3.5 w-3.5 shrink-0" />
+      <div className="space-y-0.5">
+        <p className="font-medium">Roster may be outdated</p>
+        <p className="text-amber-900/80 dark:text-amber-200/80">
+          Showing the last synced copy ({ago}). Marks you make now are
+          queued and will sync — alongside any roster changes — once
+          you&apos;re back online.
+        </p>
+      </div>
+    </div>
+  );
+}
+
+function formatAgo(timestamp: number): string {
+  const diffMs = Date.now() - timestamp;
+  if (diffMs < 60_000) return "just now";
+  const mins = Math.floor(diffMs / 60_000);
+  if (mins < 60) return `${mins} minute${mins === 1 ? "" : "s"} ago`;
+  const hours = Math.floor(mins / 60);
+  if (hours < 24) return `${hours} hour${hours === 1 ? "" : "s"} ago`;
+  const days = Math.floor(hours / 24);
+  return `${days} day${days === 1 ? "" : "s"} ago`;
 }
 
 function StatsBar({

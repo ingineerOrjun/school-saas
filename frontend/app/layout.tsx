@@ -42,8 +42,19 @@ export default function RootLayout({
          * `dangerouslySetInnerHTML` is required because Next won't
          * inline a <script>'s text content otherwise — the alternative
          * (a separate JS file) loses the "before hydration" guarantee.
+         *
+         * `suppressHydrationWarning` is required HERE (not just on
+         * <html>) because the `suppress` attribute applies only to the
+         * element it's set on — it doesn't propagate to descendants.
+         * The script's text content unavoidably mismatches between SSR
+         * (empty during streaming) and the client (full script body),
+         * and that mismatch is harmless: the script never re-runs after
+         * hydration, so the divergence has no behavioural effect.
          */}
-        <script dangerouslySetInnerHTML={{ __html: themeScript }} />
+        <script
+          suppressHydrationWarning
+          dangerouslySetInnerHTML={{ __html: themeScript }}
+        />
       </head>
       <body>
         <ThemeProvider>

@@ -6,12 +6,22 @@ export interface SchoolDto {
   slug: string;
   /** Path served by the backend at `/uploads/logos/<file>`. Null when unset. */
   logoUrl: string | null;
+  /** Free-form postal address shown on receipts/marksheets. Null when unset. */
+  address: string | null;
+  /** Public phone number shown on receipts/marksheets. Null when unset. */
+  phone: string | null;
   createdAt: string;
   updatedAt: string;
 }
 
 export interface UpdateSchoolInput {
   name?: string;
+  /**
+   * Empty string is treated as "clear" — the backend converts it to null
+   * so admins can drop a previously-set value without a separate endpoint.
+   */
+  address?: string | null;
+  phone?: string | null;
 }
 
 const API_BASE =

@@ -9,6 +9,20 @@ export interface AttendanceRoster {
   status: AttendanceStatus | null;
 }
 
+/**
+ * Wrapper for `GET /attendance` — students plus a `version` string
+ * the frontend cache uses to detect drift. Mirrors the backend's
+ * `RosterResponse`.
+ *
+ * `version` is the ISO timestamp of the most recently-touched student
+ * in the roster (max(student.updatedAt)). Empty rosters return the
+ * unix epoch so string comparisons work uniformly.
+ */
+export interface RosterResponse {
+  students: AttendanceRoster[];
+  version: string;
+}
+
 export interface AttendanceEntry {
   studentId: string;
   status: AttendanceStatus;
@@ -73,6 +87,36 @@ export type AttendanceReport =
   | SectionAttendanceReport
   | ClassAttendanceReport;
 
+/**
+ * One bucket in an attendance trend series — the per-day breakdown
+ * the dashboard charts plot. `percentage` is null on days with no
+ * recorded marks (weekends, holidays) so the chart can show gaps
+ * instead of a misleading 0%.
+ */
+export interface TrendDayBucket {
+  date: string;
+  presentCount: number;
+  absentCount: number;
+  totalCount: number;
+  percentage: number | null;
+}
+
+export interface AttendanceTrend {
+  fromDate: string;
+  toDate: string;
+  /** "School" for school-wide trends, otherwise the class/section name. */
+  scopeLabel: string;
+  daily: TrendDayBucket[];
+  totals: ReportSummary;
+}
+
+export interface TrendQuery {
+  fromDate: string;
+  toDate: string;
+  sectionId?: string;
+  classId?: string;
+}
+
 export interface ReportQuery {
   fromDate: string;
   toDate: string;
@@ -101,7 +145,7 @@ export const attendanceApi = {
     if (scope.sectionId) params.set("sectionId", scope.sectionId);
     else if (scope.classId) params.set("classId", scope.classId);
     if (sessionId) params.set("sessionId", sessionId);
-    return api<AttendanceRoster[]>(`/attendance?${params.toString()}`);
+    return api<RosterResponse>(`/attendance?${params.toString()}`);
   },
   mark: (input: MarkAttendanceInput) =>
     api<{ marked: number; date: string }>("/attendance/mark", {
@@ -118,6 +162,25 @@ export const attendanceApi = {
     if (q.studentId) params.set("studentId", q.studentId);
     if (sessionId) params.set("sessionId", sessionId);
     return api<AttendanceReport>(`/attendance/report?${params.toString()}`);
+  },
+  /**
+   * Daily attendance trend. School-wide (admin / staff) when neither
+   * scope id is supplied; class- or section-scoped when one is. The
+   * `redirectOn403: false` opt-out means a teacher hitting the
+   * school-wide endpoint surfaces a graceful empty state instead of
+   * being kicked to /login.
+   */
+  getTrend: (q: TrendQuery, sessionId?: string) => {
+    const params = new URLSearchParams({
+      fromDate: q.fromDate,
+      toDate: q.toDate,
+    });
+    if (q.sectionId) params.set("sectionId", q.sectionId);
+    else if (q.classId) params.set("classId", q.classId);
+    if (sessionId) params.set("sessionId", sessionId);
+    return api<AttendanceTrend>(`/attendance/trend?${params.toString()}`, {
+      redirectOn403: false,
+    });
   },
 };
 

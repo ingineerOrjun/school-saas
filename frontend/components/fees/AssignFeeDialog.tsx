@@ -2,8 +2,9 @@
 
 import * as React from "react";
 import { toast } from "sonner";
-import { Check, Percent, DollarSign } from "lucide-react";
+import { Check, Percent, Banknote } from "lucide-react";
 import { ApiError } from "@/lib/api";
+import { formatCurrency } from "@/lib/currency";
 import {
   feesApi,
   todayISO,
@@ -324,7 +325,10 @@ export function AssignFeeDialog({
                       : "text-muted-foreground hover:bg-muted",
                   )}
                 >
-                  <DollarSign className="h-3.5 w-3.5" />
+                  {/* Banknote: currency-agnostic visual for "fixed
+                      amount" — was previously a $-sign which misled
+                      readers in an NPR-only app. */}
+                  <Banknote className="h-3.5 w-3.5" />
                   Fixed
                 </button>
               </div>
@@ -345,7 +349,8 @@ export function AssignFeeDialog({
           )}
 
           {/* Live preview of base / discount / final — only shows once a
-              fee is chosen so there's no dangling "$NaN" noise. */}
+              fee is chosen so there's no dangling "NaN" noise from
+              empty inputs. */}
           {preview && (
             <div className="mt-3 flex flex-wrap items-center gap-x-6 gap-y-1 text-xs">
               <PreviewLine
@@ -500,9 +505,5 @@ function PreviewLine({
   );
 }
 
-function formatMoney(n: number): string {
-  return n.toLocaleString(undefined, {
-    minimumFractionDigits: 0,
-    maximumFractionDigits: 2,
-  });
-}
+// Centralized via `lib/currency.formatCurrency`.
+const formatMoney = formatCurrency;

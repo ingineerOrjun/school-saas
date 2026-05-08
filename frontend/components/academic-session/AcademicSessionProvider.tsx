@@ -2,6 +2,7 @@
 
 import * as React from "react";
 import { ApiError } from "@/lib/api";
+import { getToken } from "@/lib/auth";
 import {
   academicSessionsApi,
   type AcademicSessionDto,
@@ -59,6 +60,19 @@ export function AcademicSessionProvider({
   const [loading, setLoading] = React.useState(true);
 
   const refresh = React.useCallback(async () => {
+    // The provider sits at the root layout level — above /login — so
+    // it mounts before the user has a token. Firing an authenticated
+    // request in that state used to throw a noisy 401 in the console
+    // every time the login page loaded, AND now (with the global 401
+    // handler) was being treated as a session failure even though the
+    // user simply hadn't logged in yet. Skip the call when there's no
+    // token and let the next remount (after login → hard reload) kick
+    // off a real fetch.
+    if (!getToken()) {
+      setSessions([]);
+      setLoading(false);
+      return;
+    }
     setLoading(true);
     try {
       const list = await academicSessionsApi.list();

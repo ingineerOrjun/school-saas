@@ -14,6 +14,10 @@ export interface SchoolDto {
   slug: string;
   /** Public URL (or null if no logo uploaded yet). */
   logoUrl: string | null;
+  /** Free-form postal address shown on receipts. Null when unset. */
+  address: string | null;
+  /** Public phone number shown on receipts. Null when unset. */
+  phone: string | null;
   createdAt: string;
   updatedAt: string;
 }
@@ -23,6 +27,8 @@ const SCHOOL_SELECT = {
   name: true,
   slug: true,
   logoUrl: true,
+  address: true,
+  phone: true,
   createdAt: true,
   updatedAt: true,
 } as const;
@@ -60,14 +66,36 @@ export class SchoolService {
     schoolId: string,
     dto: UpdateSchoolDto,
   ): Promise<SchoolDto> {
-    // Reject empty updates so callers don't hit the DB for nothing.
-    if (dto.name === undefined) {
+    // Empty body → just round-trip the current state. Saves the DB
+    // a no-op write and lets the form-save flow always navigate to a
+    // fresh DTO regardless of which fields the user touched.
+    if (
+      dto.name === undefined &&
+      dto.address === undefined &&
+      dto.phone === undefined
+    ) {
       return this.get(schoolId);
+    }
+
+    // Empty string → null. The DTO permits "" so admins can clear a
+    // value via the form (the standard "blank means no value" pattern);
+    // the DB stores null so receipts cleanly skip the row.
+    const data: {
+      name?: string;
+      address?: string | null;
+      phone?: string | null;
+    } = {};
+    if (dto.name !== undefined) data.name = dto.name;
+    if (dto.address !== undefined) {
+      data.address = dto.address === '' ? null : dto.address;
+    }
+    if (dto.phone !== undefined) {
+      data.phone = dto.phone === '' ? null : dto.phone;
     }
 
     const updated = await this.prisma.school.update({
       where: { id: schoolId },
-      data: { name: dto.name },
+      data,
       select: SCHOOL_SELECT,
     });
     return toDto(updated);
@@ -183,6 +211,8 @@ function toDto(row: {
   name: string;
   slug: string;
   logoUrl: string | null;
+  address: string | null;
+  phone: string | null;
   createdAt: Date;
   updatedAt: Date;
 }): SchoolDto {
@@ -191,6 +221,8 @@ function toDto(row: {
     name: row.name,
     slug: row.slug,
     logoUrl: row.logoUrl,
+    address: row.address,
+    phone: row.phone,
     createdAt: row.createdAt.toISOString(),
     updatedAt: row.updatedAt.toISOString(),
   };

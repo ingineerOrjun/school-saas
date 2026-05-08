@@ -365,6 +365,12 @@ export default function TeachersPage() {
         classes={classes}
         subjects={subjects}
         onClose={() => setAssignmentsTarget(null)}
+        // Re-pull teachers so each row's `assignmentCounts` (which
+        // drives the "X Classes · Y Subjects" / "Unassigned" pill in
+        // the table) reflects the just-saved state. Fires after every
+        // successful bulk save inside the dialog — admins making
+        // several saves before closing get a fresh row each time.
+        onSaved={refresh}
       />
     </div>
   );
