@@ -4,14 +4,17 @@ import {
   Logger,
   NotFoundException,
 } from '@nestjs/common';
+import { ConfigService } from '@nestjs/config';
 import {
   BillingCycle,
   Prisma,
+  Role,
   SchoolSubscription,
   SchoolStatus,
   SubscriptionPlan,
 } from '@prisma/client';
 import { PrismaService } from '../database/prisma.service';
+import { NotificationService } from '../notifications/notification.service';
 import { PlatformAuditService } from './platform-audit.service';
 
 // ---------------------------------------------------------------------------
@@ -74,6 +77,8 @@ export class SubscriptionService {
   constructor(
     private readonly prisma: PrismaService,
     private readonly audit: PlatformAuditService,
+    private readonly notifications: NotificationService,
+    private readonly config: ConfigService,
   ) {}
 
   /**
@@ -128,6 +133,17 @@ export class SubscriptionService {
         `Subscription created with plan=UNLIMITED but cycle=${input.billingCycle}; expected PERPETUAL.`,
       );
     }
+
+    // 2.5. Capture the previous plan BEFORE we insert the new row,
+    // so the post-create notification can decide between
+    // "renewed" vs "plan_changed". Null when this is the school's
+    // first subscription period.
+    const priorRow = await this.prisma.schoolSubscription.findFirst({
+      where: { schoolId: input.schoolId },
+      orderBy: { createdAt: 'desc' },
+      select: { plan: true },
+    });
+    const priorPlan = priorRow?.plan ?? null;
 
     // 3. Persist + update school in one transaction.
     const newStatus = computeNextStatus({
@@ -202,7 +218,96 @@ export class SubscriptionService {
         `actor=${actor.userId}`,
     );
 
+    // Phase 13 — fire the appropriate notice. Distinguish:
+    //   • plan changed (different plan than the previous most-
+    //     recent subscription) → platform.plan_changed.
+    //   • plan unchanged       → platform.subscription_renewed.
+    // First-ever subscription (no prior plan) → renewed (operator
+    // perspective: "we now have a paying period").
+    void this.notifySubscriptionEvent({
+      schoolId: input.schoolId,
+      schoolName: school.name,
+      newPlan: input.plan,
+      billingCycle: input.billingCycle,
+      startDate: input.startDate,
+      endDate: input.endDate ?? null,
+      previousPlan: priorPlan,
+    }).catch((e) => {
+      this.logger.error(
+        `[platform] subscription email failed for school=${school.name}(${input.schoolId}): ${
+          e instanceof Error ? e.message : String(e)
+        }`,
+      );
+    });
+
     return rowToDto(created);
+  }
+
+  /**
+   * Side-effect: fan out the right post-create notification to the
+   * school's primary admin. Called from `create()` as fire-and-
+   * forget so a delivery failure does NOT void the subscription.
+   *
+   * Selection rules:
+   *   • previousPlan === null   → "renewed" (first paid period).
+   *   • previousPlan !== input  → "plan_changed".
+   *   • previousPlan === input  → "renewed" (same-plan renewal).
+   */
+  private async notifySubscriptionEvent(input: {
+    schoolId: string;
+    schoolName: string;
+    newPlan: SubscriptionPlan;
+    billingCycle: BillingCycle;
+    startDate: Date;
+    endDate: Date | null;
+    previousPlan: SubscriptionPlan | null;
+  }): Promise<void> {
+    const admin = await this.prisma.user.findFirst({
+      where: { schoolId: input.schoolId, role: Role.ADMIN },
+      orderBy: { createdAt: 'asc' },
+      select: { id: true, email: true },
+    });
+    if (!admin) return;
+
+    const isPlanChange =
+      input.previousPlan !== null && input.previousPlan !== input.newPlan;
+
+    if (isPlanChange) {
+      await this.notifications.enqueue({
+        templateKey: 'platform.plan_changed',
+        recipients: { email: admin.email },
+        dedupeKey: `school:${input.schoolId}:plan:${input.previousPlan}->${input.newPlan}:${input.startDate.getTime()}`,
+        schoolId: input.schoolId,
+        userId: admin.id,
+        payload: {
+          brand: this.config.get('mail.brand'),
+          schoolName: input.schoolName,
+          adminEmail: admin.email,
+          fromPlan: input.previousPlan ?? 'NONE',
+          toPlan: input.newPlan,
+          endDate: input.endDate ? input.endDate.toISOString() : null,
+          // Plan tier ordering — higher index = higher tier.
+          isUpgrade: PLAN_TIER[input.newPlan] > PLAN_TIER[input.previousPlan!],
+        },
+      });
+    } else {
+      await this.notifications.enqueue({
+        templateKey: 'platform.subscription_renewed',
+        recipients: { email: admin.email },
+        dedupeKey: `school:${input.schoolId}:renewed:${input.startDate.getTime()}`,
+        schoolId: input.schoolId,
+        userId: admin.id,
+        payload: {
+          brand: this.config.get('mail.brand'),
+          schoolName: input.schoolName,
+          adminEmail: admin.email,
+          plan: input.newPlan,
+          billingCycle: input.billingCycle,
+          startDate: input.startDate.toISOString(),
+          endDate: input.endDate ? input.endDate.toISOString() : null,
+        },
+      });
+    }
   }
 
   /**
@@ -305,3 +410,13 @@ function rowToDto(
     updatedAt: row.updatedAt.toISOString(),
   };
 }
+
+// Plan tier ordering — higher index = higher tier. Used by the
+// plan-changed notification to decide between "upgraded" vs
+// "changed" copy.
+const PLAN_TIER: Record<SubscriptionPlan, number> = {
+  TRIAL: 0,
+  MONTHLY: 1,
+  YEARLY: 2,
+  UNLIMITED: 3,
+};

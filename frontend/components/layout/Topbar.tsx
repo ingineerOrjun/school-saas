@@ -2,6 +2,7 @@
 
 import * as React from "react";
 import { useRouter } from "next/navigation";
+import Link from "next/link";
 import {
   Briefcase,
   ChevronDown,
@@ -9,6 +10,7 @@ import {
   HelpCircle,
   LogOut,
   Menu,
+  Monitor,
   Search,
   ShieldCheck,
   User as UserIcon,
@@ -79,8 +81,11 @@ export function Topbar({ onMobileMenuClick }: TopbarProps) {
     return () => document.removeEventListener("mousedown", onClick);
   }, [menuOpen]);
 
-  const handleLogout = () => {
-    logout();
+  const handleLogout = async () => {
+    // Phase 17 follow-up — `logout()` now revokes the server-side
+    // session row before clearing local state. Awaited so the
+    // success toast doesn't fire before the request settles.
+    await logout();
     toast.success("Signed out");
     router.replace("/login");
   };
@@ -195,6 +200,17 @@ export function Topbar({ onMobileMenuClick }: TopbarProps) {
                 </p>
               )}
             </div>
+            {/* Phase 17 follow-up — Devices link is available to ALL
+                roles (not gated like Settings) since it's per-user
+                self-management. Closes the menu on click. */}
+            <Link
+              href="/settings/devices"
+              onClick={() => setMenuOpen(false)}
+              className="mt-1 flex w-full items-center gap-2 rounded-md px-3 py-2 text-sm text-foreground hover:bg-muted transition-colors focus-ring"
+            >
+              <Monitor className="h-4 w-4" />
+              Active devices
+            </Link>
             <button
               type="button"
               onClick={handleLogout}

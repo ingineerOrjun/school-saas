@@ -5,10 +5,14 @@ import {
   Logger,
   NotFoundException,
 } from '@nestjs/common';
+import { ConfigService } from '@nestjs/config';
 import { Role } from '@prisma/client';
 import { randomBytes } from 'crypto';
 import { HashingService } from '../common/hashing/hashing.service';
 import { PrismaService } from '../database/prisma.service';
+import { NotificationService } from '../notifications/notification.service';
+import { SessionService } from '../sessions/session.service';
+import type { SessionRow } from '../sessions/session.service';
 import { PlatformAuditService } from './platform-audit.service';
 
 // ---------------------------------------------------------------------------
@@ -82,6 +86,9 @@ export class SecurityService {
     private readonly prisma: PrismaService,
     private readonly hashing: HashingService,
     private readonly audit: PlatformAuditService,
+    private readonly notifications: NotificationService,
+    private readonly config: ConfigService,
+    private readonly sessions: SessionService,
   ) {}
 
   /**
@@ -274,11 +281,133 @@ export class SecurityService {
       `[platform] password reset user=${target.email}(${userId}) actor=${actor.userId} reason=${reason ?? '<none>'}`,
     );
 
+    // Phase 3 (maturity) — fire the password-reset email through the
+    // central NotificationService. Non-blocking: a delivery failure
+    // does NOT roll back the password change. The temp password is
+    // also still returned in the API response (the platform UI's
+    // "copy to clipboard" affordance) — email is for the END USER
+    // who needs to actually use it.
+    try {
+      await this.notifications.enqueue({
+        templateKey: 'platform.password_reset',
+        recipients: { email: target.email },
+        // Dedupe per (user, watermark) so a double-click on Reset
+        // doesn't fire two emails. The watermark is unique per
+        // reset event so legitimate re-resets DO send again.
+        dedupeKey: `user:${target.id}:reset:${now.getTime()}`,
+        schoolId: target.schoolId,
+        userId: target.id,
+        payload: {
+          brand: this.config.get('mail.brand'),
+          email: target.email,
+          temporaryPassword: tempPassword,
+          performedBy: actor.email ?? actor.userId,
+          loginUrl: `${this.config.get('appUrl')}/login`,
+        },
+      });
+    } catch (e) {
+      this.logger.error(
+        `[platform] password reset email failed for user=${target.email}(${userId}): ${
+          e instanceof Error ? e.message : String(e)
+        }`,
+      );
+    }
+
     return {
       temporaryPassword: tempPassword,
       tokensValidAfter: now.toISOString(),
       user: { id: target.id, email: target.email, role: target.role },
     };
+  }
+
+  // -------------------------------------------------------------------------
+  // Per-user session management (Phase 17 follow-up).
+  //
+  // Operator surfaces complementing the existing watermark-based
+  // force-logout. The watermark is the kill-all hammer; these
+  // methods give the operator a per-session view + per-session
+  // revoke for granular incident response ("revoke only the
+  // session from suspicious IP X, leave the rest alone").
+  // -------------------------------------------------------------------------
+
+  /**
+   * List a user's sessions. Operator-tier — surfaces the same
+   * data as `/me/sessions` but for any user. Refuses SUPER_ADMIN
+   * targets per the same rules as forceLogoutUser.
+   */
+  async listUserSessions(userId: string): Promise<SessionRow[]> {
+    const target = await this.prisma.user.findUnique({
+      where: { id: userId },
+      select: { id: true, role: true },
+    });
+    if (!target) return [];
+    if (target.role === Role.SUPER_ADMIN) {
+      // Don't expose SUPER_ADMIN session lists through the
+      // platform API — symmetric with the impersonation +
+      // force-logout protections.
+      return [];
+    }
+    return this.sessions.listForUser(userId);
+  }
+
+  /**
+   * Revoke ONE of a user's sessions. Audited under the existing
+   * USER_FORCE_LOGOUT action because the operator-visible effect
+   * is the same shape ("a token stopped working"); the audit
+   * `after.scope` field records that this was per-session, not
+   * the watermark.
+   */
+  async revokeUserSession(input: {
+    userId: string;
+    sessionId: string;
+    actor: ActorCtx;
+    reason: string | null;
+  }): Promise<{ revokedAt: string }> {
+    const target = await this.prisma.user.findUnique({
+      where: { id: input.userId },
+      select: { id: true, email: true, role: true, school: { select: { name: true } } },
+    });
+    if (!target) {
+      throw new Error('User not found.'); // surfaces as 500 only on programmer error
+    }
+    if (target.role === Role.SUPER_ADMIN) {
+      throw new Error('Cannot revoke SUPER_ADMIN sessions through the platform API.');
+    }
+
+    const revoked = await this.sessions.revoke({
+      sessionId: input.sessionId,
+      reason: input.reason ?? 'admin revoke',
+      expectUserId: input.userId,
+    });
+
+    await this.audit.record({
+      action: 'USER_FORCE_LOGOUT',
+      actor: {
+        userId: input.actor.userId,
+        email: input.actor.email,
+        role: input.actor.role,
+      },
+      target: {
+        type: 'USER',
+        id: target.id,
+        label: `${target.email}${target.school?.name ? ` (${target.school.name})` : ''}`,
+      },
+      after: {
+        scope: 'session',
+        sessionId: input.sessionId,
+        revokedAt: revoked.revokedAt!.toISOString(),
+      },
+      reason: input.reason,
+      ip: input.actor.ip,
+      userAgent: input.actor.userAgent,
+    });
+
+    this.logger.warn(
+      `[platform] session revoked user=${target.email}(${input.userId}) ` +
+        `session=${input.sessionId} actor=${input.actor.userId}`,
+    );
+
+    return { revokedAt: revoked.revokedAt!.toISOString() };
   }
 }
 

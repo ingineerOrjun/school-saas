@@ -36,6 +36,8 @@ export interface PlatformSchoolRow {
   email: string | null;
   phone: string | null;
   status: SchoolStatus;
+  /** Phase 17 — soft read-only flag distinct from SUSPENDED. */
+  maintenanceMode: boolean;
   expiresAt: string | null;
   studentCount: number;
   teacherCount: number;
@@ -114,6 +116,7 @@ export interface UpdateSchoolStatusInput {
 
 export type PlatformAuditAction =
   | "SCHOOL_STATUS_CHANGED"
+  | "SCHOOL_MAINTENANCE_TOGGLED"
   | "IMPERSONATION_STARTED"
   | "IMPERSONATION_ENDED"
   | "SUBSCRIPTION_CREATED"
@@ -241,6 +244,211 @@ export interface ResetPasswordResult {
   user: { id: string; email: string; role: string };
 }
 
+// ---------------------------------------------------------------------------
+// Phase 1 (maturity) — Per-school snapshot for /platform/schools/:id.
+// ---------------------------------------------------------------------------
+
+export interface SchoolUsage {
+  studentsCount: number;
+  teachersCount: number;
+  activeUsers30d: number;
+}
+
+export interface SchoolFinancials {
+  paymentsTotalAmount: number;
+  paymentsLast30dAmount: number;
+  paymentsLast30dCount: number;
+  refundsLast30dAmount: number;
+  refundsLast30dCount: number;
+  collectionTrend: Array<{ date: string; amount: number }>;
+}
+
+export interface SchoolAcademic {
+  attendanceLast30dCount: number;
+  examsCount: number;
+  attendanceTrend: Array<{ date: string; count: number }>;
+}
+
+export interface SchoolHealthSnapshot {
+  loginFailuresLast60min: number;
+  errorsLast60min: number;
+  subscriptionDaysRemaining: number | null;
+  expiringSoon: boolean;
+  studentLimitNearing: boolean;
+  teacherLimitNearing: boolean;
+}
+
+export interface SchoolActivityItem {
+  kind: "PAYMENT" | "PAYMENT_REFUND" | "AUDIT" | "SUBSCRIPTION_CREATED";
+  at: string;
+  subtype?: string;
+  title: string;
+  subtitle?: string;
+  meta?: Record<string, unknown>;
+}
+
+export interface SchoolSnapshot {
+  generatedAt: string;
+  usage: SchoolUsage;
+  financials: SchoolFinancials;
+  academic: SchoolAcademic;
+  health: SchoolHealthSnapshot;
+  activity: SchoolActivityItem[];
+}
+
+// ---------------------------------------------------------------------------
+// Phase 16 — Platform analytics.
+// ---------------------------------------------------------------------------
+
+export interface RevenueAnalytics {
+  mrrNpr: number;
+  arrNpr: number;
+  activePaidSubscriptions: number;
+  activeTrials: number;
+  planDistribution: Array<{ plan: SubscriptionPlan; count: number }>;
+}
+
+export interface GrowthAnalytics {
+  newSchools30d: number;
+  newSchoolsPrior30d: number;
+  schoolsPerMonth: Array<{ month: string; count: number }>;
+  featureAdoption: Array<{ key: string; enabledCount: number; ratio: number }>;
+}
+
+export interface SystemAnalytics {
+  jobQueue: Record<string, number>;
+  recentFailedJobs: Array<{
+    id: string;
+    name: string;
+    attempts: number;
+    lastError: string | null;
+    completedAt: string;
+  }>;
+  notifications24h: {
+    total: number;
+    bySeverity: Array<{ severity: string; count: number }>;
+    failedDeliveries: number;
+  };
+}
+
+export interface RiskAnalytics {
+  suspendedSchools: number;
+  expiredSchools: number;
+  expiringSoon: number;
+  inactiveSchools: number;
+}
+
+export interface PlatformAnalyticsPayload {
+  generatedAt: string;
+  revenue: RevenueAnalytics;
+  growth: GrowthAnalytics;
+  system: SystemAnalytics;
+  risk: RiskAnalytics;
+}
+
+// ---------------------------------------------------------------------------
+// Phase 14 — Notification Center.
+// ---------------------------------------------------------------------------
+
+export type NotificationSeverity =
+  | "INFO"
+  | "SUCCESS"
+  | "WARNING"
+  | "ERROR"
+  | "CRITICAL";
+
+export interface NotificationListRow {
+  id: string;
+  templateKey: string;
+  title: string;
+  severity: NotificationSeverity;
+  schoolId: string | null;
+  userId: string | null;
+  readAt: string | null;
+  createdAt: string;
+  lastDeliveryStatus: string | null;
+}
+
+export interface NotificationListResponse {
+  rows: NotificationListRow[];
+  total: number;
+  page: number;
+  pageSize: number;
+  unreadCount: number;
+}
+
+export interface NotificationDeliveryRow {
+  id: string;
+  channel: string;
+  recipient: string;
+  status: string;
+  attempts: number;
+  errorMessage: string | null;
+  sentAt: string | null;
+  providerMessageId: string | null;
+  createdAt: string;
+}
+
+export interface NotificationDetailRow extends NotificationListRow {
+  payload: unknown;
+  dedupeKey: string | null;
+  deliveries: NotificationDeliveryRow[];
+}
+
+export interface NotificationListQuery {
+  severity?: NotificationSeverity[];
+  unreadOnly?: boolean;
+  schoolId?: string;
+  page?: number;
+  pageSize?: number;
+}
+
+// ---------------------------------------------------------------------------
+// Phase 10 — System health.
+// ---------------------------------------------------------------------------
+
+export interface HealthErrorEvent {
+  at: string;
+  status: number;
+  method: string;
+  route: string;
+  message: string;
+}
+
+export interface HealthLoginFailureEvent {
+  at: string;
+  email: string;
+  ip: string | null;
+  reason: string;
+}
+
+export interface HealthPayload {
+  generatedAt: string;
+  uptime: { seconds: number; pretty: string; startedAt: string };
+  memory: { rssMb: number; heapUsedMb: number; heapTotalMb: number };
+  database: {
+    healthy: boolean;
+    latencyMs: number | null;
+    error: string | null;
+  };
+  errors: {
+    last5min: number;
+    last15min: number;
+    last60min: number;
+    totalSinceStart: number;
+    recent: HealthErrorEvent[];
+  };
+  loginFailures: {
+    last5min: number;
+    last15min: number;
+    last60min: number;
+    totalSinceStart: number;
+    topIps: Array<{ ip: string; count: number }>;
+    recent: HealthLoginFailureEvent[];
+  };
+  status: "green" | "yellow" | "red";
+}
+
 export const platformApi = {
   /** Cross-platform overview — KPIs + 12-month school growth trend. */
   getOverview: () => api<PlatformOverview>("/platform/overview"),
@@ -265,6 +473,28 @@ export const platformApi = {
   getSchool: (schoolId: string) =>
     api<PlatformSchoolRow>(
       `/platform/schools/${encodeURIComponent(schoolId)}`,
+    ),
+
+  /**
+   * Per-school snapshot — analytics + activity feed in one payload.
+   * Powers the /platform/schools/:id detail page.
+   */
+  getSchoolSnapshot: (schoolId: string) =>
+    api<SchoolSnapshot>(
+      `/platform/schools/${encodeURIComponent(schoolId)}/snapshot`,
+    ),
+
+  /**
+   * Toggle a school's maintenance-mode flag (Phase 17). Soft
+   * read-only gate distinct from SUSPENDED.
+   */
+  setMaintenanceMode: (
+    schoolId: string,
+    input: { enabled: boolean; reason?: string },
+  ) =>
+    api<PlatformSchoolRow>(
+      `/platform/schools/${encodeURIComponent(schoolId)}/maintenance`,
+      { method: "PATCH", body: JSON.stringify(input) },
     ),
 
   /**
@@ -417,5 +647,59 @@ export const platformApi = {
         method: "POST",
         body: JSON.stringify({ reason: reason ?? undefined }),
       },
+    ),
+
+  // ---------- System health (Phase 10) ----------
+
+  /**
+   * Live operator pulse — uptime, memory, DB probe, recent error
+   * rate, recent failed-login summary. The platform health page
+   * polls this every ~30s.
+   */
+  getHealth: () => api<HealthPayload>("/platform/health"),
+
+  // ---------- Platform analytics (Phase 16) ----------
+
+  /**
+   * Cross-cutting analytics — revenue, growth, system, risk.
+   * Powers the /platform/operations cockpit.
+   */
+  getAnalytics: () => api<PlatformAnalyticsPayload>("/platform/analytics"),
+
+  // ---------- Notification center (Phase 14) ----------
+
+  listNotifications: (query: NotificationListQuery = {}) => {
+    const params = new URLSearchParams();
+    if (query.severity && query.severity.length > 0) {
+      params.set("severity", query.severity.join(","));
+    }
+    if (query.unreadOnly) params.set("unread", "true");
+    if (query.schoolId) params.set("schoolId", query.schoolId);
+    if (query.page) params.set("page", String(query.page));
+    if (query.pageSize) params.set("pageSize", String(query.pageSize));
+    const qs = params.toString();
+    return api<NotificationListResponse>(
+      qs ? `/platform/notifications?${qs}` : "/platform/notifications",
+    );
+  },
+
+  getNotificationsUnreadCount: () =>
+    api<{ count: number }>("/platform/notifications/unread-count"),
+
+  getNotification: (id: string) =>
+    api<NotificationDetailRow>(
+      `/platform/notifications/${encodeURIComponent(id)}`,
+    ),
+
+  markNotificationRead: (id: string) =>
+    api<NotificationListRow>(
+      `/platform/notifications/${encodeURIComponent(id)}/read`,
+      { method: "PATCH" },
+    ),
+
+  markNotificationUnread: (id: string) =>
+    api<NotificationListRow>(
+      `/platform/notifications/${encodeURIComponent(id)}/unread`,
+      { method: "PATCH" },
     ),
 };

@@ -123,7 +123,12 @@ export async function registerAdmin(
   return result;
 }
 
-export function logout() {
+/**
+ * Synchronous local logout — clears every cached auth artefact.
+ * Used by the cross-tab storage handler and as the fallback if the
+ * server-side revoke fails.
+ */
+function clearLocalAuth(): void {
   if (typeof window === "undefined") return;
   try {
     window.localStorage.removeItem(TOKEN_KEY);
@@ -139,6 +144,40 @@ export function logout() {
   } catch {
     /* no-op */
   }
+}
+
+/**
+ * Best-effort server-side logout: revokes the session row, then
+ * clears local state. The server call uses `redirectOn401: false`
+ * because a stale token is exactly the case where logout still
+ * needs to clear local state.
+ *
+ * Phase 17 follow-up — calling /auth/logout marks the session
+ * row revoked so the token can't be reused even if it leaks.
+ */
+export async function logout(): Promise<void> {
+  if (typeof window === "undefined") return;
+  try {
+    if (getToken()) {
+      await api("/auth/logout", { method: "POST", redirectOn401: false }).catch(
+        () => {
+          /* swallow — local clear still happens below */
+        },
+      );
+    }
+  } finally {
+    clearLocalAuth();
+  }
+}
+
+/**
+ * Synchronous logout for code paths that can't await (cross-tab
+ * storage events, hard-redirects). Skips the server call; the
+ * server-side session row will be revoked on the next call to
+ * `/auth/logout` or the next `tokensValidAfter` flip.
+ */
+export function logoutSync(): void {
+  clearLocalAuth();
 }
 
 /**

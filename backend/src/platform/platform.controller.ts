@@ -12,6 +12,7 @@ import {
   Req,
   UseGuards,
 } from '@nestjs/common';
+import { SkipThrottle } from '@nestjs/throttler';
 import type { Request } from 'express';
 import { PlatformAuditAction, Role, SchoolStatus } from '@prisma/client';
 import { CurrentUser } from '../common/decorators/current-user.decorator';
@@ -20,13 +21,17 @@ import { RolesGuard } from '../auth/guards/roles.guard';
 import { Roles } from '../common/decorators/roles.decorator';
 import type { AuthenticatedUser } from '../auth/jwt.strategy';
 import { FeatureFlagsService } from '../feature-flags/feature-flags.service';
+import { HealthService } from '../health/health.service';
+import { PlatformAnalyticsService } from './platform-analytics.service';
 import { PlatformService } from './platform.service';
 import { PlatformAuditService } from './platform-audit.service';
+import { SchoolSnapshotService } from './school-snapshot.service';
 import { SecurityService } from './security.service';
 import { SubscriptionService } from './subscription.service';
 import { CreateSubscriptionDto } from './dto/create-subscription.dto';
 import { ForceLogoutSchoolDto } from './dto/force-logout-school.dto';
 import { SecurityActionDto } from './dto/security-action.dto';
+import { SetMaintenanceModeDto } from './dto/set-maintenance-mode.dto';
 import { UpdateFeatureOverridesDto } from './dto/update-feature-overrides.dto';
 import { UpdateSchoolStatusDto } from './dto/update-school-status.dto';
 
@@ -58,6 +63,9 @@ export class PlatformController {
     private readonly subscriptions: SubscriptionService,
     private readonly featureFlags: FeatureFlagsService,
     private readonly security: SecurityService,
+    private readonly health: HealthService,
+    private readonly snapshot: SchoolSnapshotService,
+    private readonly analytics: PlatformAnalyticsService,
   ) {}
 
   /** Cross-platform overview: school + user counts, growth trend. */
@@ -86,6 +94,15 @@ export class PlatformController {
   @Get('schools/:id')
   getSchool(@Param('id', ParseUUIDPipe) id: string) {
     return this.platform.getSchool(id);
+  }
+
+  /**
+   * Per-school snapshot — analytics + activity feed in one payload.
+   * Powers the /platform/schools/:id detail page.
+   */
+  @Get('schools/:id/snapshot')
+  getSchoolSnapshot(@Param('id', ParseUUIDPipe) id: string) {
+    return this.snapshot.getSnapshot(id);
   }
 
   /**
@@ -274,7 +291,72 @@ export class PlatformController {
     return result.set;
   }
 
+  // ---------- Maintenance mode (Phase 17) ----------
+
+  /**
+   * Toggle the school's `maintenanceMode` flag. When ON, the
+   * MaintenanceModeGuard rejects writes from school users with 503;
+   * reads continue to work; SUPER_ADMINs bypass entirely. Audited
+   * via SCHOOL_MAINTENANCE_TOGGLED.
+   */
+  @Patch('schools/:id/maintenance')
+  @HttpCode(HttpStatus.OK)
+  setMaintenanceMode(
+    @Param('id', ParseUUIDPipe) id: string,
+    @Body() dto: SetMaintenanceModeDto,
+    @CurrentUser() user: AuthenticatedUser,
+    @Req() req: Request,
+  ) {
+    return this.platform.setMaintenanceMode(id, dto.enabled, {
+      userId: user.id,
+      email: user.email,
+      role: user.role,
+      ip: req.ip ?? null,
+      userAgent: req.headers['user-agent'] ?? null,
+      reason: dto.reason ?? null,
+    });
+  }
+
   // ---------- Security controls (Phase 9) ----------
+
+  /**
+   * List a user's sessions. Operator-tier read into the same data
+   * the school-side `/me/sessions` exposes — for any user. Used by
+   * the SecurityDialog to render per-session revoke affordances.
+   */
+  @Get('users/:id/sessions')
+  listUserSessions(@Param('id', ParseUUIDPipe) id: string) {
+    return this.security.listUserSessions(id);
+  }
+
+  /**
+   * Revoke one specific session for a user. Granular alternative to
+   * the watermark-based force-logout below — useful when the
+   * operator only wants to kill ONE token (e.g. the one from a
+   * known-bad IP) and leave the rest intact.
+   */
+  @Post('users/:userId/sessions/:sessionId/revoke')
+  @HttpCode(HttpStatus.OK)
+  revokeUserSession(
+    @Param('userId', ParseUUIDPipe) userId: string,
+    @Param('sessionId', ParseUUIDPipe) sessionId: string,
+    @Body() dto: SecurityActionDto,
+    @CurrentUser() user: AuthenticatedUser,
+    @Req() req: Request,
+  ) {
+    return this.security.revokeUserSession({
+      userId,
+      sessionId,
+      actor: {
+        userId: user.id,
+        email: user.email,
+        role: user.role,
+        ip: req.ip ?? null,
+        userAgent: req.headers['user-agent'] ?? null,
+      },
+      reason: dto.reason ?? null,
+    });
+  }
 
   /**
    * Force-logout a single user. Their existing JWTs are rejected
@@ -358,6 +440,47 @@ export class PlatformController {
       },
       dto.reason ?? null,
     );
+  }
+
+  // ---------- Platform analytics (Phase 16) ----------
+
+  /**
+   * Cross-cutting analytics payload — revenue, growth, system,
+   * risk. Powers the ops dashboard + future analytics expansion
+   * sections. Each bucket runs in parallel; total cost is bounded
+   * by the slowest scan (~ schools × 12 months for growth).
+   */
+  @Get('analytics')
+  getAnalytics() {
+    return this.analytics.getAll();
+  }
+
+  // ---------- System health (Phase 10) ----------
+
+  /**
+   * Operator pulse — uptime, memory, DB probe, recent error rate,
+   * recent failed-login summary. Cheap to call (one SELECT 1
+   * round-trip + in-memory rollups), so the platform UI polls this
+   * every ~30s for a live "is the box alive?" view.
+   *
+   * `@SkipThrottle()`:
+   *   The endpoint is BY DESIGN polled at a fixed cadence by the
+   *   operator's open browser tab. The /platform overview also
+   *   includes a one-shot health pull. Together with React's
+   *   StrictMode double-firing in dev + multiple platform tabs
+   *   open during incident response, the call rate easily exceeds
+   *   the default 60/min/IP bucket.
+   *
+   *   Throttling an operational pulse endpoint is a footgun: when
+   *   the operator most needs to see what's happening (during an
+   *   incident, refreshing aggressively), the throttle would lock
+   *   them out. The endpoint is already SUPER_ADMIN-gated, which
+   *   is a far stronger access control than rate limiting.
+   */
+  @Get('health')
+  @SkipThrottle()
+  getHealth() {
+    return this.health.getHealth();
   }
 
   // ---------- Audit log ----------

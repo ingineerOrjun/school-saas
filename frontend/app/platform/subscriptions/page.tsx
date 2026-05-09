@@ -17,6 +17,10 @@ import {
   type SubscriptionPlan,
 } from "@/lib/platform";
 import { PlanChip } from "@/components/platform/ManageSubscriptionDialog";
+import {
+  PageHeader,
+  PanelErrorState,
+} from "@/components/platform-ui";
 
 // ---------------------------------------------------------------------------
 // /platform/subscriptions — cross-tenant view of every school's
@@ -114,30 +118,26 @@ export default function SubscriptionsOverviewPage() {
   }, [rows]);
 
   return (
-    <div className="space-y-6">
-      <header className="flex flex-wrap items-end justify-between gap-3">
-        <div>
-          <h1 className="text-2xl font-semibold tracking-tight text-slate-900">
-            Subscriptions
-          </h1>
-          <p className="mt-1 text-sm text-slate-600">
-            Plan + renewal status for every school. Click a school to manage its
-            plan.
-          </p>
-        </div>
-        <button
-          type="button"
-          onClick={fetchData}
-          disabled={loading}
-          className="inline-flex h-9 items-center gap-1.5 rounded-md border border-slate-200 bg-white px-3 text-sm font-medium text-slate-700 hover:bg-slate-50 transition-colors disabled:opacity-50"
-        >
-          <RotateCw className="h-3.5 w-3.5" />
-          Refresh
-        </button>
-      </header>
+    <div className="space-y-5">
+      <PageHeader
+        title="Subscriptions"
+        description="Plan + renewal status for every school. Click a school to manage its plan."
+        icon={<CreditCard className="h-4 w-4" />}
+        actions={
+          <button
+            type="button"
+            onClick={fetchData}
+            disabled={loading}
+            className="inline-flex h-9 items-center gap-1.5 rounded-md border border-slate-200 bg-white px-3 text-sm font-medium text-slate-700 hover:bg-slate-50 disabled:opacity-50"
+          >
+            <RotateCw className="h-3.5 w-3.5" />
+            Refresh
+          </button>
+        }
+      />
 
       {error ? (
-        <ErrorBanner message={error} />
+        <PanelErrorState message={error} onRetry={fetchData} />
       ) : (
         <>
           <KpiRow
@@ -443,13 +443,4 @@ function Row({ school }: { school: PlatformSchoolRow }) {
   );
 }
 
-function ErrorBanner({ message }: { message: string }) {
-  return (
-    <div className="rounded-md border border-red-200 bg-red-50 p-4 text-sm text-red-800">
-      <div className="flex items-center gap-2 font-medium">
-        <AlertTriangle className="h-4 w-4" />
-        {message}
-      </div>
-    </div>
-  );
-}
+// (ErrorBanner removed — use PanelErrorState from @/components/platform-ui.)

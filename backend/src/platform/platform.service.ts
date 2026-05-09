@@ -4,6 +4,7 @@ import {
   Logger,
   NotFoundException,
 } from '@nestjs/common';
+import { ConfigService } from '@nestjs/config';
 import {
   BillingCycle,
   Role,
@@ -11,6 +12,7 @@ import {
   SubscriptionPlan,
 } from '@prisma/client';
 import { PrismaService } from '../database/prisma.service';
+import { NotificationService } from '../notifications/notification.service';
 import { PlatformAuditService } from './platform-audit.service';
 
 // ---------------------------------------------------------------------------
@@ -53,6 +55,8 @@ export interface PlatformSchoolRow {
   email: string | null;
   phone: string | null;
   status: SchoolStatus;
+  /** Phase 17 — soft read-only flag distinct from SUSPENDED. */
+  maintenanceMode: boolean;
   expiresAt: string | null;
   studentCount: number;
   teacherCount: number;
@@ -107,6 +111,8 @@ export class PlatformService {
   constructor(
     private readonly prisma: PrismaService,
     private readonly audit: PlatformAuditService,
+    private readonly notifications: NotificationService,
+    private readonly config: ConfigService,
   ) {}
 
   // -------------------------------------------------------------------------
@@ -266,6 +272,7 @@ export class PlatformService {
           email: s.email,
           phone: s.phone,
           status: s.status,
+          maintenanceMode: s.maintenanceMode,
           expiresAt: s.expiresAt ? s.expiresAt.toISOString() : null,
           studentCount: s._count.students,
           teacherCount: s._count.teachers,
@@ -318,6 +325,7 @@ export class PlatformService {
       email: s.email,
       phone: s.phone,
       status: s.status,
+      maintenanceMode: s.maintenanceMode,
       expiresAt: s.expiresAt ? s.expiresAt.toISOString() : null,
       studentCount: s._count.students,
       teacherCount: s._count.teachers,
@@ -432,6 +440,171 @@ export class PlatformService {
         `from=${before.status} to=${input.status} ` +
         `actor=${actor.userId}`,
     );
+
+    // Phase 3 (maturity) — fire status-change notices.
+    //
+    //   • SUSPENDED  → school_suspended  (warns the admin + reason)
+    //   • → ACTIVE   → school_reactivated (the recovery confirmation)
+    //
+    // Best-effort: a delivery failure does NOT roll back the
+    // status change. Each call dedupes per (school, transition event)
+    // so a same-millisecond double-click won't double-send.
+    try {
+      const admin = await this.prisma.user.findFirst({
+        where: { schoolId, role: Role.ADMIN },
+        orderBy: { createdAt: 'asc' },
+        select: { id: true, email: true },
+      });
+      if (admin) {
+        if (input.status === 'SUSPENDED' && before.status !== 'SUSPENDED') {
+          await this.notifications.enqueue({
+            templateKey: 'platform.school_suspended',
+            recipients: { email: admin.email },
+            dedupeKey: `school:${schoolId}:suspended:${Date.now()}`,
+            schoolId,
+            userId: admin.id,
+            payload: {
+              brand: this.config.get('mail.brand'),
+              schoolName: before.name,
+              adminEmail: admin.email,
+              reason: input.reason ?? '(no reason provided)',
+              suspendedAt: new Date().toISOString(),
+            },
+          });
+        } else if (
+          input.status === 'ACTIVE' &&
+          (before.status === 'SUSPENDED' || before.status === 'EXPIRED')
+        ) {
+          // Phase 13 — reactivation notice. Only sent when coming
+          // FROM a blocked state; flips between ACTIVE/TRIAL aren't
+          // operationally interesting.
+          await this.notifications.enqueue({
+            templateKey: 'platform.school_reactivated',
+            recipients: { email: admin.email },
+            dedupeKey: `school:${schoolId}:reactivated:${Date.now()}`,
+            schoolId,
+            userId: admin.id,
+            payload: {
+              brand: this.config.get('mail.brand'),
+              schoolName: before.name,
+              adminEmail: admin.email,
+              loginUrl: `${this.config.get('appUrl')}/login`,
+            },
+          });
+        }
+      }
+    } catch (e) {
+      this.logger.error(
+        `[platform] status-change email failed for school=${before.name}(${schoolId}): ${
+          e instanceof Error ? e.message : String(e)
+        }`,
+      );
+    }
+
+    return this.getSchool(schoolId);
+  }
+
+  // -------------------------------------------------------------------------
+  // Maintenance mode (Phase 17) — soft read-only flag distinct from
+  // SUSPENDED. Toggled via the school detail page; enforced by
+  // MaintenanceModeGuard.
+  // -------------------------------------------------------------------------
+
+  async setMaintenanceMode(
+    schoolId: string,
+    enabled: boolean,
+    actor: {
+      userId: string;
+      email?: string | null;
+      role?: string | null;
+      ip?: string | null;
+      userAgent?: string | null;
+      reason?: string | null;
+    },
+  ): Promise<PlatformSchoolRow> {
+    const before = await this.prisma.school.findUnique({
+      where: { id: schoolId },
+      select: { id: true, name: true, maintenanceMode: true },
+    });
+    if (!before) throw new NotFoundException('School not found.');
+
+    if (before.maintenanceMode === enabled) {
+      // No-op — same value, return current row without churning audit.
+      return this.getSchool(schoolId);
+    }
+
+    await this.prisma.school.update({
+      where: { id: schoolId },
+      data: { maintenanceMode: enabled },
+    });
+
+    const toggledAt = new Date();
+
+    await this.audit.record({
+      action: 'SCHOOL_MAINTENANCE_TOGGLED',
+      actor: {
+        userId: actor.userId,
+        email: actor.email,
+        role: actor.role,
+      },
+      target: { type: 'SCHOOL', id: schoolId, label: before.name },
+      before: { maintenanceMode: before.maintenanceMode },
+      after: { maintenanceMode: enabled },
+      reason: actor.reason ?? null,
+      ip: actor.ip,
+      userAgent: actor.userAgent,
+    });
+
+    this.logger.warn(
+      `[platform] maintenance mode ${enabled ? 'ENABLED' : 'DISABLED'} ` +
+        `school=${before.name}(${schoolId}) actor=${actor.userId}`,
+    );
+
+    // Phase 20 — fire a school-wide in-app notification on every
+    // toggle so users see the state in their inbox + bell badge.
+    // School-wide = userId omitted; the school-side access filter
+    // surfaces these to every user at the tenant via the
+    // "userId IS NULL" branch.
+    //
+    // Best-effort: a delivery failure does NOT roll back the toggle.
+    try {
+      await this.notifications.enqueue({
+        templateKey: enabled
+          ? 'platform.maintenance_enabled'
+          : 'platform.maintenance_disabled',
+        // School-wide IN_APP only — fanning out an email per
+        // admin would be noisy at v1; the SUPER_ADMIN already
+        // knows what they did.
+        recipients: {},
+        // Dedupe per (school, transition timestamp) so a same-
+        // millisecond double-click won't double-write the row.
+        dedupeKey: `school:${schoolId}:maintenance:${enabled ? 'on' : 'off'}:${toggledAt.getTime()}`,
+        schoolId,
+        // No userId → school-wide broadcast.
+        severity: enabled ? 'WARNING' : 'INFO',
+        title: enabled
+          ? 'Maintenance mode enabled'
+          : 'Maintenance mode disabled',
+        payload: enabled
+          ? {
+              brand: this.config.get('mail.brand'),
+              schoolName: before.name,
+              reason: actor.reason ?? null,
+              enabledAt: toggledAt.toISOString(),
+            }
+          : {
+              brand: this.config.get('mail.brand'),
+              schoolName: before.name,
+              disabledAt: toggledAt.toISOString(),
+            },
+      });
+    } catch (e) {
+      this.logger.error(
+        `[platform] maintenance notification failed for school=${before.name}(${schoolId}): ${
+          e instanceof Error ? e.message : String(e)
+        }`,
+      );
+    }
 
     return this.getSchool(schoolId);
   }

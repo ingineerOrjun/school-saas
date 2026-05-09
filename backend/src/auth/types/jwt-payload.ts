@@ -52,4 +52,11 @@ export interface JwtPayload {
   iat?: number;
   /** Standard JWT expiry claim — declared for symmetry with `iat`. */
   exp?: number;
+  /**
+   * Phase 17 follow-up — Session id. Present on tokens issued AFTER
+   * the sessions table existed. Absent on legacy tokens — the
+   * strategy treats that as "implicit session" (only the watermark
+   * gates them; once they expire, every token has a sid).
+   */
+  sid?: string;
 }

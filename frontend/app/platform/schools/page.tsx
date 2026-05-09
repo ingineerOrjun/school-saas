@@ -3,9 +3,9 @@
 import * as React from "react";
 import { useSearchParams } from "next/navigation";
 import {
-  Search,
   Building2,
   AlertTriangle,
+  ExternalLink,
   Pause,
   Play,
   RotateCw,
@@ -30,6 +30,15 @@ import {
   PlanChip,
 } from "@/components/platform/ManageSubscriptionDialog";
 import { SecurityDialog } from "@/components/platform/SecurityDialog";
+import {
+  FilterToolbar,
+  PageHeader,
+  PanelEmptyState,
+  PanelErrorState,
+  SchoolStatusPill,
+  SectionCard,
+  SkeletonRows,
+} from "@/components/platform-ui";
 
 // ---------------------------------------------------------------------------
 // /platform/schools — manage every tenant on the platform.
@@ -129,54 +138,47 @@ export default function PlatformSchoolsPage() {
   };
 
   return (
-    <div className="space-y-6">
-      <header className="flex flex-wrap items-end justify-between gap-3">
-        <div>
-          <h1 className="text-2xl font-semibold tracking-tight text-slate-900">
-            Schools
-          </h1>
-          <p className="mt-1 text-sm text-slate-600">
-            Every tenant on the platform. Suspend, reactivate, or mark
-            expired here.
-          </p>
-        </div>
-        <button
-          type="button"
-          onClick={fetchData}
-          disabled={loading}
-          className="inline-flex h-9 items-center gap-1.5 rounded-md border border-slate-200 bg-white px-3 text-sm font-medium text-slate-700 hover:bg-slate-50 transition-colors disabled:opacity-50"
-        >
-          <RotateCw className="h-3.5 w-3.5" />
-          Refresh
-        </button>
-      </header>
-
-      {/* Filter strip */}
-      <div className="rounded-xl border border-slate-200 bg-white p-3">
-        <div className="grid grid-cols-1 gap-2 sm:grid-cols-[2fr_1fr]">
-          <div className="relative">
-            <Search className="pointer-events-none absolute left-2.5 top-1/2 h-4 w-4 -translate-y-1/2 text-slate-400" />
-            <input
-              type="text"
-              value={search}
-              onChange={(e) => setSearch(e.target.value)}
-              placeholder="Search by name, slug, or email…"
-              className="h-9 w-full rounded-md border border-slate-200 bg-white pl-8 pr-3 text-sm focus:outline-none focus:ring-2 focus:ring-slate-300 focus:border-slate-400"
-            />
-          </div>
-          <select
-            value={status}
-            onChange={(e) => setStatus(e.target.value as SchoolStatus | "")}
-            className="h-9 rounded-md border border-slate-200 bg-white px-2.5 text-sm focus:outline-none focus:ring-2 focus:ring-slate-300 focus:border-slate-400"
+    <div className="space-y-5">
+      <PageHeader
+        title="Schools"
+        description="Every tenant on the platform. Open a row for the full detail page."
+        icon={<Building2 className="h-4 w-4" />}
+        actions={
+          <button
+            type="button"
+            onClick={fetchData}
+            disabled={loading}
+            className="inline-flex h-9 items-center gap-1.5 rounded-md border border-slate-200 bg-white px-3 text-sm font-medium text-slate-700 hover:bg-slate-50 disabled:opacity-50"
           >
-            <option value="">All statuses</option>
-            <option value="ACTIVE">Active</option>
-            <option value="TRIAL">Trial</option>
-            <option value="SUSPENDED">Suspended</option>
-            <option value="EXPIRED">Expired</option>
-          </select>
-        </div>
-      </div>
+            <RotateCw className="h-3.5 w-3.5" />
+            Refresh
+          </button>
+        }
+      />
+
+      <FilterToolbar
+        search={search}
+        onSearchChange={setSearch}
+        searchPlaceholder="Search by name, slug, or email…"
+        activeFilters={
+          status
+            ? [{ label: `Status: ${status}`, onClear: () => setStatus("") }]
+            : []
+        }
+        onClearAll={status ? () => setStatus("") : undefined}
+      >
+        <select
+          value={status}
+          onChange={(e) => setStatus(e.target.value as SchoolStatus | "")}
+          className="h-8 rounded-md border border-slate-200 bg-white px-2 text-xs focus:outline-none focus:ring-2 focus:ring-slate-300 focus:border-slate-400"
+        >
+          <option value="">All statuses</option>
+          <option value="ACTIVE">Active</option>
+          <option value="TRIAL">Trial</option>
+          <option value="SUSPENDED">Suspended</option>
+          <option value="EXPIRED">Expired</option>
+        </select>
+      </FilterToolbar>
 
       {/* Result count */}
       {data && !loading && (
@@ -189,11 +191,27 @@ export default function PlatformSchoolsPage() {
 
       {/* Table / state */}
       {loading ? (
-        <SchoolsTableSkeleton />
+        <SectionCard bare>
+          <SkeletonRows rows={6} />
+        </SectionCard>
       ) : error ? (
-        <ErrorBanner message={error} />
+        <PanelErrorState message={error} onRetry={fetchData} />
       ) : !data || data.rows.length === 0 ? (
-        <EmptyState filtered={!!debouncedSearch || !!status} />
+        <SectionCard bare>
+          <PanelEmptyState
+            icon={<Building2 className="h-4 w-4" />}
+            title={
+              !!debouncedSearch || !!status
+                ? "No schools match these filters"
+                : "No schools yet"
+            }
+            description={
+              !!debouncedSearch || !!status
+                ? "Try widening the search or clearing the status filter."
+                : undefined
+            }
+          />
+        </SectionCard>
       ) : (
         <>
           <SchoolsTable
@@ -290,7 +308,12 @@ function SchoolsTable({
           {rows.map((s) => (
             <tr key={s.id} className="hover:bg-slate-50">
               <td className="px-4 py-3">
-                <div className="font-medium text-slate-900">{s.name}</div>
+                <a
+                  href={`/platform/schools/${encodeURIComponent(s.id)}`}
+                  className="font-medium text-slate-900 hover:text-slate-700 hover:underline"
+                >
+                  {s.name}
+                </a>
                 <div className="text-[11px] text-slate-500">
                   {s.slug}
                   {s.email && (
@@ -302,7 +325,7 @@ function SchoolsTable({
                 </div>
               </td>
               <td className="px-4 py-3">
-                <StatusPill status={s.status} />
+                <SchoolStatusPill status={s.status} />
               </td>
               <td className="px-4 py-3">
                 {s.currentSubscription ? (
@@ -380,6 +403,14 @@ function RowActions({
 
   return (
     <div className="inline-flex items-center gap-1">
+      <a
+        href={`/platform/schools/${encodeURIComponent(school.id)}`}
+        className="inline-flex items-center gap-1 rounded-md border border-slate-200 px-2 py-1 text-xs font-medium text-slate-700 hover:border-slate-400 hover:bg-slate-50 transition-colors"
+        title="Open school detail page"
+      >
+        <ExternalLink className="h-3 w-3" />
+        Open
+      </a>
       {canImpersonate && (
         <button
           type="button"
@@ -438,37 +469,8 @@ function RowActions({
   );
 }
 
-function StatusPill({ status }: { status: SchoolStatus }) {
-  const map: Record<
-    SchoolStatus,
-    { label: string; className: string }
-  > = {
-    ACTIVE: {
-      label: "Active",
-      className: "bg-emerald-500/15 text-emerald-700",
-    },
-    TRIAL: {
-      label: "Trial",
-      className: "bg-sky-500/15 text-sky-700",
-    },
-    SUSPENDED: {
-      label: "Suspended",
-      className: "bg-red-500/15 text-red-700",
-    },
-    EXPIRED: {
-      label: "Expired",
-      className: "bg-amber-500/15 text-amber-700",
-    },
-  };
-  const { label, className } = map[status];
-  return (
-    <span
-      className={`inline-flex rounded-full px-2 py-0.5 text-[10px] font-semibold uppercase tracking-wider ${className}`}
-    >
-      {label}
-    </span>
-  );
-}
+// (StatusPill moved to @/components/platform-ui/StatusPill — see
+// SchoolStatusPill in the import list at the top of this file.)
 
 // ---------------------------------------------------------------------------
 // Confirmation dialog. Required reason for SUSPENDED transitions —
@@ -640,44 +642,5 @@ function Pagination({
   );
 }
 
-function SchoolsTableSkeleton() {
-  return (
-    <div className="space-y-2">
-      {Array.from({ length: 6 }).map((_, i) => (
-        <div
-          key={i}
-          className="h-14 animate-pulse rounded-xl border border-slate-200 bg-slate-50"
-        />
-      ))}
-    </div>
-  );
-}
-
-function EmptyState({ filtered }: { filtered: boolean }) {
-  return (
-    <div className="rounded-xl border border-dashed border-slate-200 bg-white p-12 text-center">
-      <div className="mx-auto flex h-12 w-12 items-center justify-center rounded-full bg-slate-100">
-        <Building2 className="h-6 w-6 text-slate-500" />
-      </div>
-      <h3 className="mt-3 text-base font-semibold text-slate-900">
-        {filtered ? "No schools match these filters." : "No schools yet."}
-      </h3>
-      {filtered && (
-        <p className="mt-1 text-sm text-slate-500">
-          Try widening the search or clearing the status filter.
-        </p>
-      )}
-    </div>
-  );
-}
-
-function ErrorBanner({ message }: { message: string }) {
-  return (
-    <div className="rounded-md border border-red-200 bg-red-50 p-4 text-sm text-red-800">
-      <div className="flex items-center gap-2 font-medium">
-        <AlertTriangle className="h-4 w-4" />
-        {message}
-      </div>
-    </div>
-  );
-}
+// (Skeleton/Empty/Error states moved to @/components/platform-ui —
+//  SkeletonRows / PanelEmptyState / PanelErrorState.)

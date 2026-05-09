@@ -1,0 +1,2782 @@
+<h1>Scholaris — Project Documentation</h1>
+<blockquote>
+<p><strong>Purpose.</strong> This document is the single source of truth for what the
+Scholaris platform is, what&#39;s been built, how the pieces fit together,
+and what&#39;s deferred. It&#39;s written for the engineer who picks the project
+up next — whether that&#39;s you in three months or a new collaborator
+tomorrow. It describes <strong>what exists</strong>, not what we hope to build.</p>
+<p>Sections that begin with <strong>⚠ Deferred</strong> describe known gaps with
+explicit reasoning. Don&#39;t treat them as bugs — they&#39;re conscious
+tradeoffs documented for the next planning cycle.</p>
+</blockquote>
+<hr>
+<h2>Table of contents</h2>
+<ol>
+<li><a href="#1-project-overview">Project overview</a></li>
+<li><a href="#2-tech-stack">Tech stack</a></li>
+<li><a href="#3-architectural-principles">Architectural principles</a></li>
+<li><a href="#4-repository-layout">Repository layout</a></li>
+<li><a href="#5-database-schema">Database schema</a></li>
+<li><a href="#6-authentication--security-model">Authentication &amp; security model</a></li>
+<li><a href="#7-the-two-surfaces">The two surfaces — School Dashboard vs Platform Control Layer</a></li>
+<li><a href="#8-platform-control-layer-phases-110">Platform Control Layer (Phases 1–10)</a></li>
+<li><a href="#9-maturity-push-phases-1118">Maturity push (Phases 11–18)</a></li>
+<li><a href="#10-backend-module-reference">Backend module reference</a></li>
+<li><a href="#11-frontend-route--component-reference">Frontend route + component reference</a></li>
+<li><a href="#12-api-reference">API reference</a></li>
+<li><a href="#13-notification-system">Notification system</a></li>
+<li><a href="#14-background-job-system">Background job system</a></li>
+<li><a href="#15-feature-flags">Feature flags</a></li>
+<li><a href="#16-email-templates">Email templates</a></li>
+<li><a href="#17-audit-log">Audit log</a></li>
+<li><a href="#18-migrations-chronology">Migrations chronology</a></li>
+<li><a href="#19-test-coverage">Test coverage</a></li>
+<li><a href="#20-environment-variables">Environment variables</a></li>
+<li><a href="#21-operational-guide">Operational guide</a></li>
+<li><a href="#22-known-limitations--deferred-work">Known limitations &amp; deferred work</a></li>
+<li><a href="#23-future-scope--roadmap">Future scope / roadmap</a></li>
+<li><a href="#24-decision-log">Decision log — key architectural choices</a></li>
+</ol>
+<hr>
+<h2>1. Project overview</h2>
+<p><strong>Scholaris</strong> is a multi-tenant school ERP delivered as SaaS. One backend</p>
+<ul>
+<li>database serves many schools (tenants); each school&#39;s data is isolated
+by <code>schoolId</code> on every domain row.</li>
+</ul>
+<p>The system has two distinct surfaces:</p>
+<ul>
+<li><strong>School Dashboard</strong> (<code>/(dashboard)/...</code>) — what admins, staff, and
+teachers at a school use day-to-day. Tenant-scoped. Soft visual
+language (school primary color, rounded cards, glass effects). Built
+iteratively over Phases 1–14 of school-side product work (see commit
+history pre-platform layer).</li>
+<li><strong>Platform Control Layer</strong> (<code>/platform/...</code>) — what the SaaS operator
+(<code>SUPER_ADMIN</code> role) uses to manage tenants. Cross-tenant. Slate /
+operational visual language. Built across Phases 1–10 (Platform
+Roadmap) + Phases 11–18 (Maturity push).</li>
+</ul>
+<p><strong>Geographic context.</strong> Built for Nepal — supports Bikram Sambat (BS)
+calendar via <code>bikram-sambat-js</code>, NPR currency formatting (<code>रु.</code>), and
+Indian-style number grouping (lakh / crore). The codebase is locale-aware
+where it matters (receipts, marksheets, dates) and English elsewhere.</p>
+<p><strong>Status.</strong> All ten Platform Control Layer phases are shipped end-to-end.
+Maturity push has shipped Phases 11–18 with 9 of 10 email templates,
+session management, ops dashboard, and full test coverage of the
+security-critical surfaces.</p>
+<hr>
+<h2>2. Tech stack</h2>
+<h3>Backend</h3>
+<table>
+<thead>
+<tr>
+<th>Layer</th>
+<th>Choice</th>
+<th>Notes</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>Runtime</td>
+<td>Node.js (any 20+ LTS)</td>
+<td>Tested on Node 20</td>
+</tr>
+<tr>
+<td>Framework</td>
+<td>NestJS 11</td>
+<td>Modular DI, controllers, guards, pipes</td>
+</tr>
+<tr>
+<td>Language</td>
+<td>TypeScript 5 (strict)</td>
+<td><code>tsc --noEmit</code> is a CI gate</td>
+</tr>
+<tr>
+<td>ORM</td>
+<td>Prisma 6</td>
+<td>PostgreSQL provider</td>
+</tr>
+<tr>
+<td>Database</td>
+<td>PostgreSQL</td>
+<td>Multi-tenant by <code>schoolId</code></td>
+</tr>
+<tr>
+<td>Auth</td>
+<td>JWT (<code>@nestjs/jwt</code> + <code>passport-jwt</code>)</td>
+<td>7-day default TTL</td>
+</tr>
+<tr>
+<td>Password hashing</td>
+<td>bcrypt (12 rounds)</td>
+<td><code>HashingService</code> abstraction</td>
+</tr>
+<tr>
+<td>Validation</td>
+<td><code>class-validator</code> + <code>class-transformer</code></td>
+<td>Global <code>ValidationPipe</code></td>
+</tr>
+<tr>
+<td>Scheduling</td>
+<td><code>@nestjs/schedule</code></td>
+<td>Cron triggers for jobs</td>
+</tr>
+<tr>
+<td>Rate limiting</td>
+<td><code>@nestjs/throttler</code></td>
+<td>Custom user-aware guard</td>
+</tr>
+<tr>
+<td>Email (dev)</td>
+<td>Console provider</td>
+<td>Logs to stdout</td>
+</tr>
+<tr>
+<td>Email (prod)</td>
+<td><code>nodemailer</code> (SMTP)</td>
+<td>Lazy-loaded</td>
+</tr>
+<tr>
+<td>Testing</td>
+<td>Jest</td>
+<td>12 suites, 135 tests</td>
+</tr>
+</tbody></table>
+<h3>Frontend</h3>
+<table>
+<thead>
+<tr>
+<th>Layer</th>
+<th>Choice</th>
+<th>Notes</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>Framework</td>
+<td>Next.js 14 (App Router)</td>
+<td>Two route groups: <code>(dashboard)</code> + <code>platform</code></td>
+</tr>
+<tr>
+<td>Language</td>
+<td>TypeScript 5</td>
+<td>Strict mode</td>
+</tr>
+<tr>
+<td>Styling</td>
+<td>Tailwind CSS</td>
+<td>Custom design tokens</td>
+</tr>
+<tr>
+<td>Icons</td>
+<td><code>lucide-react</code></td>
+<td>Used throughout</td>
+</tr>
+<tr>
+<td>Toasts</td>
+<td><code>sonner</code></td>
+<td>Single shared toaster</td>
+</tr>
+<tr>
+<td>Charts</td>
+<td>Custom SVG (<code>Sparkline</code>) + light wrappers</td>
+<td>No heavy chart lib</td>
+</tr>
+<tr>
+<td>State</td>
+<td>Local React state + localStorage</td>
+<td>No Redux / Zustand</td>
+</tr>
+<tr>
+<td>Date utility</td>
+<td><code>bikram-sambat-js</code></td>
+<td>BS calendar conversion</td>
+</tr>
+</tbody></table>
+<h3>Infrastructure (current dev setup)</h3>
+<ul>
+<li>Local PostgreSQL on <code>localhost:5432</code></li>
+<li>Backend on port <code>3001</code> (dev)</li>
+<li>Frontend on port <code>3000</code> (dev)</li>
+<li>Migrations applied via <code>npx prisma migrate deploy</code></li>
+<li>No CI/CD pipeline configured yet</li>
+</ul>
+<hr>
+<h2>3. Architectural principles</h2>
+<p>These are the rules I&#39;ve enforced consistently. Violating them is a
+code-review red flag.</p>
+<h3>3.1. Tenant isolation is mandatory</h3>
+<p>Every domain row carries <code>schoolId</code>. Every read query filters by it.
+Every write writes it. The <strong>only</strong> code that bypasses this is the
+Platform Control Layer (<code>/platform/*</code>), which is <code>SUPER_ADMIN</code>-gated.</p>
+<h3>3.2. Append-only audit trails</h3>
+<p>Two tables are append-only by design:</p>
+<ul>
+<li><code>school_subscriptions</code> — every plan change / renewal / extension is
+a NEW row. The &quot;current&quot; subscription is the most-recent by
+<code>createdAt</code>. We never edit history.</li>
+<li><code>platform_audit_events</code> — every operator-tier write produces a row.
+Includes actor, target, before/after JSON snapshots, reason, IP,
+user-agent. Never edited.</li>
+</ul>
+<h3>3.3. Defense-in-depth on auth</h3>
+<p>Every authenticated request passes through this guard chain:</p>
+<pre><code>UserAwareThrottlerGuard      (per-user-id rate limit)
+  ↓
+JwtAuthGuard                 (token signature + watermark + session)
+  ↓
+RolesGuard                   (when @Roles() declared)
+  ↓
+FeatureFlagsGuard            (when @RequireFeature() declared)
+  ↓
+MaintenanceModeGuard         (writes only; blocks during maintenance)
+  ↓
+Controller method
+</code></pre>
+<h3>3.4. Best-effort side effects</h3>
+<p>Side effects (audit emits, notification enqueues, email sends) <strong>never
+roll back</strong> the underlying action. A delivery failure logs but doesn&#39;t
+fail the transaction. Audit failures swallow errors and log to stderr.
+This is operator-grade resilience: school data integrity &gt; observability.</p>
+<h3>3.5. Idempotency at write time</h3>
+<p>Producers that may fire twice (network retries, double-clicks) get
+unique constraints to collapse on:</p>
+<ul>
+<li><code>payments.(schoolId, clientRequestId)</code> — payment idempotency key</li>
+<li><code>notifications.(templateKey, dedupeKey)</code> — notification dedupe</li>
+<li><code>jobs.(name, dedupeKey)</code> — job dedupe</li>
+<li><code>sessions</code> — single row per token (id is the dedupe key implicitly)</li>
+</ul>
+<h3>3.6. Two surfaces, deliberately separate</h3>
+<p>The school dashboard and the platform control layer never share
+components, layouts, or styling tokens. Cross-pollination is a bug.
+Reasoning: different audiences, different security postures, different
+visual languages. School-side is <code>frontend/components/ui/</code>; platform-side
+is <code>frontend/components/platform-ui/</code>.</p>
+<h3>3.7. Comments explain WHY, not WHAT</h3>
+<p>Every file has a header block explaining its purpose, key tradeoffs,
+and pointers to related code. Inline comments mark non-obvious
+decisions. Don&#39;t add line-by-line comments — code that needs them
+should be refactored.</p>
+<hr>
+<h2>4. Repository layout</h2>
+<pre><code>school management system/
+├── backend/
+│   ├── prisma/
+│   │   ├── schema.prisma                    # Single source of truth for DB
+│   │   ├── migrations/                      # 41 migrations, chronologically named
+│   │   ├── seed-super-admin.ts              # Seeds the platform owner
+│   │   └── ...
+│   ├── src/
+│   │   ├── app.module.ts                    # Root module — every Module imported here
+│   │   ├── main.ts                          # Bootstrap (CORS, validation, trust proxy)
+│   │   ├── auth/                            # Login, JWT, registration
+│   │   ├── platform/                        # Platform Control Layer
+│   │   ├── feature-flags/                   # @Global feature gating
+│   │   ├── notifications/                   # @Global notification system
+│   │   ├── sessions/                        # @Global session tracking
+│   │   ├── health/                          # @Global operator pulse
+│   │   ├── common/
+│   │   │   ├── filters/                     # AllExceptionsFilter
+│   │   │   ├── jobs/                        # @Global background queue
+│   │   │   ├── maintenance/                 # MaintenanceModeGuard
+│   │   │   ├── throttle/                    # UserAwareThrottlerGuard
+│   │   │   ├── decorators/                  # @CurrentUser, @Roles
+│   │   │   ├── hashing/                     # bcrypt wrapper
+│   │   │   └── money/                       # amountInWords
+│   │   ├── academic-session/                # School year management
+│   │   ├── announcement/                    # School-wide notices (feature-gated)
+│   │   ├── attendance/                      # Daily attendance
+│   │   ├── class/                           # Class management
+│   │   ├── dashboard/                       # School-side aggregated stats
+│   │   ├── exams/                           # NEB-style exam + results
+│   │   ├── fees/                            # Fee structures, assignments, payments
+│   │   ├── grading/                         # NEB letter-grade calc
+│   │   ├── promotion/                       # End-of-year promotion (feature-gated)
+│   │   ├── school/                          # Tenant config (logo, contact, etc.)
+│   │   ├── section/                         # Class subdivisions
+│   │   ├── student/                         # Student profiles
+│   │   ├── subject/                         # School subject catalog
+│   │   ├── teacher/                         # Teacher profiles
+│   │   ├── teaching-assignment/             # Teacher → class/section/subject
+│   │   └── user/                            # Per-school user mgmt (admin → invite teachers etc)
+│   ├── test/                                # E2E tests (none yet)
+│   ├── package.json
+│   └── tsconfig.json
+│
+├── frontend/
+│   ├── app/
+│   │   ├── layout.tsx                       # Root layout
+│   │   ├── page.tsx                         # Landing
+│   │   ├── login/                           # /login
+│   │   ├── (dashboard)/                     # School-side route group
+│   │   │   ├── layout.tsx                   # Dashboard chrome (Sidebar + Topbar)
+│   │   │   ├── dashboard/                   # /dashboard (role-aware)
+│   │   │   ├── students/                    # /students CRUD
+│   │   │   ├── teachers/
+│   │   │   ├── classes/
+│   │   │   ├── subjects/
+│   │   │   ├── attendance/
+│   │   │   ├── exams/                       # /exams/marks, /exams/create
+│   │   │   ├── fees/                        # Receipt generation
+│   │   │   ├── analytics/                   # Admin analytics
+│   │   │   ├── announcements/
+│   │   │   └── settings/
+│   │   │       ├── page.tsx                 # Main settings (admin-only)
+│   │   │       ├── sessions/                # ACADEMIC sessions (year mgmt)
+│   │   │       ├── devices/                 # User sessions / devices (Phase 17)
+│   │   │       └── offline/                 # Offline queue diagnostics
+│   │   ├── platform/                        # Platform Control Layer
+│   │   │   ├── layout.tsx                   # Platform chrome (slate)
+│   │   │   ├── page.tsx                     # /platform overview
+│   │   │   ├── schools/
+│   │   │   │   ├── page.tsx                 # Schools list
+│   │   │   │   └── [id]/page.tsx            # School detail page (Phase 12)
+│   │   │   ├── subscriptions/               # Cross-tenant subscription view
+│   │   │   ├── audit/                       # Audit log
+│   │   │   ├── features/                    # Feature flag matrix
+│   │   │   ├── health/                      # System health dashboard
+│   │   │   ├── notifications/               # Notification Center (Phase 14)
+│   │   │   └── operations/                  # Ops dashboard (Phase 18)
+│   │   ├── marketing/                       # Public landing pages (skeletal)
+│   │   ├── marksheet/                       # Public marksheet view
+│   │   ├── receipts/                        # Public receipt view
+│   │   └── results/                         # Public result view
+│   ├── components/
+│   │   ├── ui/                              # School-side primitives
+│   │   ├── platform-ui/                     # Platform-side primitives (Phase 5 maturity)
+│   │   ├── platform/                        # Platform-specific (dialogs, etc.)
+│   │   ├── layout/                          # Sidebar, Topbar, NotificationsBell
+│   │   ├── analytics/                       # Filter UI, charts wrappers
+│   │   ├── academic-session/                # Session selector
+│   │   ├── calendar/                        # BS / AD date pickers
+│   │   ├── charts/                          # Sparkline, gauge, etc.
+│   │   ├── dashboard/                       # AdminDashboardView, TeacherDashboardView
+│   │   ├── documents/                       # Marksheet renderer, etc.
+│   │   ├── exams/                           # Marks entry grid
+│   │   ├── fees/                            # Receipt renderer
+│   │   ├── impersonation/                   # ImpersonateUserDialog, banner
+│   │   ├── maintenance/                     # MaintenanceBanner (Phase 17)
+│   │   ├── students/                        # Student CRUD form
+│   │   ├── sync/                            # Offline sync UI
+│   │   ├── teachers/                        # Teacher CRUD form
+│   │   ├── theme/                           # ThemeToggle (light/dark)
+│   │   └── classes/                         # Class form
+│   ├── lib/
+│   │   ├── api.ts                           # Typed HTTP client
+│   │   ├── auth.ts                          # Login state, logout, impersonation
+│   │   ├── platform.ts                      # Platform API client + types
+│   │   ├── sessions.ts                      # /me/sessions client (Phase 17)
+│   │   ├── features.tsx                     # FeaturesProvider + useFeatures hook
+│   │   ├── currency.ts                      # NPR formatter
+│   │   ├── date.ts                          # AD ↔ BS conversion helpers
+│   │   ├── grading.ts                       # NEB grade lookup
+│   │   ├── offline-queue.ts                 # IndexedDB queue
+│   │   ├── sync-engine.ts                   # Background sync runner
+│   │   └── ... per-domain clients (students.ts, teachers.ts, etc.)
+│   ├── package.json
+│   └── tsconfig.json
+│
+└── docs/
+    └── platform/
+        ├── PROJECT.md                       # ← this file
+        ├── architecture.md                  # Module map + request lifecycle
+        ├── notifications.md                 # Notification flow
+        ├── jobs.md                          # Background queue
+        └── impersonation.md                 # Impersonation safety model
+</code></pre>
+<hr>
+<h2>5. Database schema</h2>
+<p>Schema lives in <code>backend/prisma/schema.prisma</code>. Every model is documented
+with <code>///</code> doc comments inline; this section gives the high-level map.</p>
+<h3>5.1. Core tenant + auth</h3>
+<table>
+<thead>
+<tr>
+<th>Model</th>
+<th>Purpose</th>
+<th>Key fields</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>School</code></td>
+<td>Tenant. Every domain row FK&#39;s to this.</td>
+<td><code>id</code>, <code>name</code>, <code>slug</code> (unique), <code>logoUrl</code>, <code>address</code>, <code>phone</code>, <code>email</code>, <code>status</code> (enum), <code>expiresAt</code>, <code>maintenanceMode</code> (Phase 17), <code>featureOverrides</code> (JSON, Phase 5)</td>
+</tr>
+<tr>
+<td><code>User</code></td>
+<td>Authentication record.</td>
+<td><code>id</code>, <code>email</code> (unique), <code>password</code> (bcrypt hash), <code>role</code> (enum), <code>schoolId</code>, <code>tokensValidAfter</code> (Phase 9 watermark)</td>
+</tr>
+<tr>
+<td><code>Session</code></td>
+<td>Per-token tracking (Phase 17 follow-up).</td>
+<td><code>id</code>, <code>userId</code>, <code>lastActiveAt</code>, <code>ip</code>, <code>userAgent</code>, <code>revokedAt</code>, <code>revokedReason</code></td>
+</tr>
+</tbody></table>
+<h3>5.2. Domain profiles</h3>
+<table>
+<thead>
+<tr>
+<th>Model</th>
+<th>Purpose</th>
+<th>Key fields</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>Student</code></td>
+<td>Student record.</td>
+<td><code>firstName</code>, <code>lastName</code>, <code>symbolNumber</code> (unique per school), <code>gender</code>, <code>dateOfBirth</code>, <code>parentName</code>, <code>contactNumber</code>, <code>address</code>, <code>admissionDate</code>, <code>userId</code> (optional 1:1 with User), <code>classId</code>, <code>sectionId</code></td>
+</tr>
+<tr>
+<td><code>Teacher</code></td>
+<td>Teacher record.</td>
+<td><code>name</code>, <code>userId</code> (REQUIRED 1:1), <code>assignments[]</code> (TeachingAssignment[])</td>
+</tr>
+</tbody></table>
+<h3>5.3. Academic hierarchy</h3>
+<table>
+<thead>
+<tr>
+<th>Model</th>
+<th>Purpose</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>Class</code></td>
+<td>Class within a school (e.g. &quot;Class 8&quot;)</td>
+</tr>
+<tr>
+<td><code>Section</code></td>
+<td>Subdivision of a class (e.g. &quot;8-A&quot;)</td>
+</tr>
+<tr>
+<td><code>Subject</code></td>
+<td>School-owned subject catalog (e.g. &quot;Mathematics&quot;)</td>
+</tr>
+<tr>
+<td><code>TeachingAssignment</code></td>
+<td>One row per (teacher, class, optional section, optional subject). Drives all teacher scoping.</td>
+</tr>
+<tr>
+<td><code>AcademicSession</code></td>
+<td>School year. Exactly one <code>isActive</code> per school. <code>isLocked</code> is precondition for promotion.</td>
+</tr>
+<tr>
+<td><code>StudentAcademicRecord</code></td>
+<td>Per-student per-session immutable history. Set at promotion.</td>
+</tr>
+</tbody></table>
+<h3>5.4. Attendance + exams</h3>
+<table>
+<thead>
+<tr>
+<th>Model</th>
+<th>Purpose</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>Attendance</code></td>
+<td>One row per (student, date). <code>status</code> is <code>PRESENT</code>/<code>ABSENT</code>.</td>
+</tr>
+<tr>
+<td><code>Exam</code></td>
+<td>Named exam (e.g. &quot;Term 1&quot;). FK to School + AcademicSession.</td>
+</tr>
+<tr>
+<td><code>ExamSubject</code></td>
+<td>Per-exam subject row with <code>theoryFullMarks</code> + <code>practicalFullMarks</code>.</td>
+</tr>
+<tr>
+<td><code>Result</code></td>
+<td>One row per (student, subject). Stores <code>theoryMarks</code>, <code>practicalMarks</code>, derived <code>percentage</code> + <code>letterGrade</code> + <code>gradePoint</code>. <code>absent</code> flag for NEB &quot;did not appear&quot; (NG).</td>
+</tr>
+</tbody></table>
+<h3>5.5. Fees</h3>
+<table>
+<thead>
+<tr>
+<th>Model</th>
+<th>Purpose</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>FeeStructure</code></td>
+<td>School-owned fee catalog (e.g. &quot;Term 1 Tuition&quot;). Optional class scope.</td>
+</tr>
+<tr>
+<td><code>FeeAssignment</code></td>
+<td>One row per (student, fee). Snapshots <code>amount</code> at assignment time. Optional <code>discountType</code> + <code>discountValue</code>.</td>
+</tr>
+<tr>
+<td><code>Payment</code></td>
+<td>Cashier-recorded payment. Auto-generated <code>receiptNumber</code> (RCPT-YYYY-NNNN). Idempotent via <code>clientRequestId</code>. Refunds are SEPARATE rows with negative amount + <code>refundOfPaymentId</code> link.</td>
+</tr>
+</tbody></table>
+<h3>5.6. Communications</h3>
+<table>
+<thead>
+<tr>
+<th>Model</th>
+<th>Purpose</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>Announcement</code></td>
+<td>School-wide notice (feature-gated).</td>
+</tr>
+</tbody></table>
+<h3>5.7. Platform control layer</h3>
+<table>
+<thead>
+<tr>
+<th>Model</th>
+<th>Purpose</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>SchoolSubscription</code></td>
+<td>Append-only subscription history. Most recent row = current plan.</td>
+</tr>
+<tr>
+<td><code>PlatformAuditEvent</code></td>
+<td>Append-only operator action log.</td>
+</tr>
+</tbody></table>
+<h3>5.8. Maturity infrastructure</h3>
+<table>
+<thead>
+<tr>
+<th>Model</th>
+<th>Purpose</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>Notification</code></td>
+<td>One per logical event. Idempotent via <code>(templateKey, dedupeKey)</code>.</td>
+</tr>
+<tr>
+<td><code>NotificationDelivery</code></td>
+<td>One per channel attempt. Tracks status (<code>QUEUED</code> → <code>SENT</code>/<code>FAILED</code>/<code>SKIPPED</code>).</td>
+</tr>
+<tr>
+<td><code>Job</code></td>
+<td>Persistent background queue. <code>(name, dedupeKey)</code> unique.</td>
+</tr>
+</tbody></table>
+<h3>5.9. Enums</h3>
+<pre><code class="language-prisma">enum Role {
+  SUPER_ADMIN ADMIN STAFF TEACHER STUDENT PARENT
+}
+
+enum SchoolStatus {
+  ACTIVE TRIAL SUSPENDED EXPIRED
+}
+
+enum SubscriptionPlan {
+  TRIAL MONTHLY YEARLY UNLIMITED
+}
+
+enum BillingCycle {
+  MONTHLY YEARLY ONE_TIME PERPETUAL
+}
+
+enum PlatformAuditAction {
+  SCHOOL_STATUS_CHANGED        // Phase 8
+  IMPERSONATION_STARTED        // Phase 7
+  IMPERSONATION_ENDED          // Phase 7
+  SUBSCRIPTION_CREATED         // Phase 4
+  FEATURE_FLAG_CHANGED         // Phase 5
+  USER_FORCE_LOGOUT            // Phase 9
+  SCHOOL_FORCE_LOGOUT          // Phase 9
+  ADMIN_PASSWORD_RESET         // Phase 9
+  SCHOOL_MAINTENANCE_TOGGLED   // Phase 17
+}
+
+enum NotificationChannel {
+  EMAIL SMS IN_APP WHATSAPP
+}
+
+enum NotificationDeliveryStatus {
+  QUEUED SENDING SENT FAILED SKIPPED
+}
+
+enum NotificationSeverity {
+  INFO SUCCESS WARNING ERROR CRITICAL
+}
+
+enum JobStatus {
+  PENDING SCHEDULED RUNNING SUCCEEDED FAILED DEAD
+}
+
+// Domain enums
+enum AttendanceStatus { PRESENT ABSENT }
+enum Gender { MALE FEMALE OTHER }
+enum LetterGrade { A_PLUS A B_PLUS B C_PLUS C D NG }
+enum FeeFrequency { MONTHLY ONE_TIME }
+enum StudentSessionStatus { PROMOTED RETAINED LEFT }
+enum PaymentMethod { CASH BANK ESEWA OTHER }
+enum DiscountType { PERCENT FIXED }
+enum PaymentStatus { ACTIVE REFUNDED VOID }
+</code></pre>
+<hr>
+<h2>6. Authentication &amp; security model</h2>
+<h3>6.1. Token lifecycle</h3>
+<pre><code>User submits email + password
+  ↓
+AuthService.login()
+  ├── Validates password (bcrypt.compare)
+  ├── On failure → records to HealthService failed-login buffer
+  ├── Checks tenant gate (PlatformService.assertSchoolCanLogin)
+  │     SUSPENDED / EXPIRED schools reject (except SUPER_ADMIN)
+  ├── For TEACHER: requires at least one TeachingAssignment
+  ├── Creates Session row (Phase 17) — captures IP + userAgent
+  └── Issues JWT with payload:
+        { userId, role, schoolId, sid: &lt;session-id&gt;, iat, exp }
+</code></pre>
+<h3>6.2. Per-request validation chain</h3>
+<pre><code>Bearer token arrives
+  ↓
+JwtStrategy.validate()
+  ├── Looks up user by payload.userId
+  ├── Verifies user.schoolId matches payload.schoolId (defense vs token forgery)
+  ├── Watermark check:
+  │     if user.tokensValidAfter exists AND payload.iat &lt; watermark → 401
+  ├── Session check (if payload.sid present):
+  │     if Session.findActive(sid) returns null → 401
+  │     else throttle-touch lastActiveAt (1min throttle)
+  └── Returns AuthenticatedUser (id, email, role, schoolId, sessionId, impersonatedBy?)
+</code></pre>
+<h3>6.3. Three layers of token control</h3>
+<table>
+<thead>
+<tr>
+<th>Mechanism</th>
+<th>Use case</th>
+<th>Granularity</th>
+<th>When</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>JWT <code>exp</code></td>
+<td>Natural expiry</td>
+<td>Per-token</td>
+<td>Default 7d</td>
+</tr>
+<tr>
+<td><code>users.tokensValidAfter</code></td>
+<td>&quot;Kill ALL my user&#39;s tokens&quot;</td>
+<td>Per-user</td>
+<td>Phase 9 force-logout, password reset</td>
+</tr>
+<tr>
+<td><code>sessions.revokedAt</code></td>
+<td>&quot;Kill THAT one token&quot;</td>
+<td>Per-session</td>
+<td>Phase 17 user/admin revoke</td>
+</tr>
+</tbody></table>
+<p>All three are checked on every request. Failing any → 401.</p>
+<h3>6.4. Roles</h3>
+<table>
+<thead>
+<tr>
+<th>Role</th>
+<th>Scope</th>
+<th>Notes</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>SUPER_ADMIN</code></td>
+<td>Cross-tenant</td>
+<td>Platform owner. NOT tied to any school&#39;s lifecycle. Bypasses every feature flag + maintenance mode. Cannot be impersonated.</td>
+</tr>
+<tr>
+<td><code>ADMIN</code></td>
+<td>Single school</td>
+<td>Full access within tenant. Manages users, fees, students, classes, etc.</td>
+</tr>
+<tr>
+<td><code>STAFF</code></td>
+<td>Single school</td>
+<td>Mid-tier academic role. Can manage subjects, exams, marks for ANY class. Cannot manage users, fees, students, classes.</td>
+</tr>
+<tr>
+<td><code>TEACHER</code></td>
+<td>Single school + assignments</td>
+<td>Acts ONLY on classes/sections in their <code>TeachingAssignment</code> rows.</td>
+</tr>
+<tr>
+<td><code>STUDENT</code> / <code>PARENT</code></td>
+<td>Reserved</td>
+<td>Read-only roles, not yet wired into the UI.</td>
+</tr>
+</tbody></table>
+<h3>6.5. Impersonation (Phase 7)</h3>
+<p><code>SUPER_ADMIN</code> can sign in as a school user. The mechanism + safety
+rules are documented in detail at <code>docs/platform/impersonation.md</code>. Key
+points:</p>
+<ul>
+<li>New JWT carries the TARGET&#39;s identity + sentinels (<code>impersonatedBy</code>,
+<code>impersonationStartedAt</code>)</li>
+<li>Cannot impersonate another <code>SUPER_ADMIN</code></li>
+<li>Cannot impersonate self</li>
+<li>Cannot nest (no impersonation-of-impersonator)</li>
+<li>Cannot enter SUSPENDED / EXPIRED tenants (must reactivate first)</li>
+<li>Domain audit columns (<code>createdById</code> on payments etc.) get the TARGET
+user — intentional, since impersonation is for &quot;reproduce what the
+admin sees&quot;</li>
+<li>Platform audit captures every start + end with full actor/target/timestamps</li>
+<li>Banner is rendered ABOVE the topbar on every dashboard page</li>
+</ul>
+<h3>6.6. Rate limiting</h3>
+<ul>
+<li><strong>Default</strong>: 600 req/min per <strong>user</strong> (custom <code>UserAwareThrottlerGuard</code>
+keys by <code>req.user.id</code> when authenticated, falls back to <code>req.ip</code>)</li>
+<li><strong><code>/auth/login</code></strong>: 10/min/IP (named <code>auth</code> bucket)</li>
+<li><strong><code>/auth/register</code></strong>: 5/hour/IP (named <code>register</code> bucket)</li>
+<li><strong><code>/platform/health</code></strong>: <code>@SkipThrottle()</code> — operator polling</li>
+</ul>
+<p>Rationale documented in <code>backend/src/common/throttle/user-aware-throttler.guard.ts</code>.</p>
+<h3>6.7. Maintenance mode (Phase 17)</h3>
+<p>Per-tenant boolean (<code>schools.maintenanceMode</code>) enforced by global
+<code>MaintenanceModeGuard</code>. When ON:</p>
+<ul>
+<li>Read methods (<code>GET</code>, <code>HEAD</code>, <code>OPTIONS</code>) pass.</li>
+<li>Write methods (<code>POST</code>, <code>PATCH</code>, <code>PUT</code>, <code>DELETE</code>) reject with 503 +
+message &quot;This school is in maintenance mode. Reads are allowed;
+writes are paused.&quot;</li>
+<li><code>SUPER_ADMIN</code> always bypasses (operator needs writes to FIX maintenance).</li>
+<li><code>/platform/*</code> paths always bypass (operator console).</li>
+<li>School-side dashboard renders an amber banner ABOVE the topbar.</li>
+<li>Toggled from the school detail page; audited via <code>SCHOOL_MAINTENANCE_TOGGLED</code>.</li>
+</ul>
+<hr>
+<h2>7. The two surfaces</h2>
+<h3>7.1. School Dashboard</h3>
+<p><strong>URL prefix.</strong> <code>/(dashboard)/...</code> (Next.js route group)</p>
+<p><strong>Audience.</strong> ADMIN / STAFF / TEACHER users at one school.</p>
+<p><strong>Visual language.</strong> Soft, school-themed:</p>
+<ul>
+<li>School primary color from CSS variables</li>
+<li>Rounded cards with shadows (<code>Card</code> from <code>components/ui/</code>)</li>
+<li>Glass effects in the topbar (<code>glass</code> utility class)</li>
+<li>Larger empty states with illustration</li>
+<li>Friendly, welcoming copy</li>
+</ul>
+<p><strong>Layout.</strong></p>
+<ul>
+<li>Fixed topbar (calendar toggle, session selector, notifications bell, user menu)</li>
+<li>Collapsible sidebar (responsive: drawer on mobile)</li>
+<li>Optional banners: ImpersonationBanner, MaintenanceBanner</li>
+</ul>
+<p><strong>Pages (selected).</strong></p>
+<ul>
+<li><code>/dashboard</code> — role-aware (admin sees school-wide; teacher sees own classes)</li>
+<li><code>/students</code> — CRUD with filtering, search, bulk operations</li>
+<li><code>/teachers</code>, <code>/classes</code>, <code>/sections</code>, <code>/subjects</code> — admin CRUDs</li>
+<li><code>/attendance</code> — daily attendance grid per (class, date)</li>
+<li><code>/exams/marks</code> — bulk marks entry grid</li>
+<li><code>/exams/create</code>, <code>/results/ledger</code> — exam lifecycle</li>
+<li><code>/fees</code> — fee structures, assignments, payments + receipt printing</li>
+<li><code>/announcements</code> — feature-gated</li>
+<li><code>/analytics</code> — admin-only, 5-tab dashboard with cross-module insights</li>
+<li><code>/settings</code> — admin-only mega-page (school config, users, subjects, sessions, etc.)</li>
+<li><code>/settings/devices</code> — user-level (Phase 17)</li>
+</ul>
+<h3>7.2. Platform Control Layer</h3>
+<p><strong>URL prefix.</strong> <code>/platform/...</code></p>
+<p><strong>Audience.</strong> SUPER_ADMIN only.</p>
+<p><strong>Visual language.</strong> Operational, dense:</p>
+<ul>
+<li>Slate base palette, no school accent</li>
+<li>Square / sharp cards (<code>SectionCard</code> from <code>components/platform-ui/</code>)</li>
+<li>No gradients, minimal animation</li>
+<li>Information-dense, fast-scanning</li>
+<li>Direct, technical copy</li>
+</ul>
+<p><strong>Layout.</strong></p>
+<ul>
+<li>Sticky topbar with &quot;Platform&quot; identity + Sign out + &quot;School view&quot; exit</li>
+<li>Sidebar with status pills next to ready/coming-soon items</li>
+</ul>
+<p><strong>Pages (every one is shipped).</strong></p>
+<table>
+<thead>
+<tr>
+<th>Route</th>
+<th>Purpose</th>
+<th>Phase</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>/platform</code></td>
+<td>Cross-tenant overview</td>
+<td>6</td>
+</tr>
+<tr>
+<td><code>/platform/schools</code></td>
+<td>All-tenant list with status filter + row actions</td>
+<td>3</td>
+</tr>
+<tr>
+<td><code>/platform/schools/[id]</code></td>
+<td>Per-tenant operational command center</td>
+<td>12</td>
+</tr>
+<tr>
+<td><code>/platform/subscriptions</code></td>
+<td>Cross-tenant subscription view (expiring / expired / no plan / active)</td>
+<td>4</td>
+</tr>
+<tr>
+<td><code>/platform/audit</code></td>
+<td>Filterable audit log with side-drawer detail</td>
+<td>8</td>
+</tr>
+<tr>
+<td><code>/platform/features</code></td>
+<td>Cross-tenant feature flag matrix</td>
+<td>5</td>
+</tr>
+<tr>
+<td><code>/platform/health</code></td>
+<td>Live operator pulse (uptime, DB, errors, login failures)</td>
+<td>10</td>
+</tr>
+<tr>
+<td><code>/platform/notifications</code></td>
+<td>Notification Center inbox</td>
+<td>14</td>
+</tr>
+<tr>
+<td><code>/platform/operations</code></td>
+<td>Ops cockpit (revenue, growth, queue, risk)</td>
+<td>18</td>
+</tr>
+</tbody></table>
+<hr>
+<h2>8. Platform Control Layer (Phases 1–10)</h2>
+<p>Built sequentially. Each phase ships a coherent slice end-to-end.</p>
+<h3>Phase 1 — SUPER_ADMIN role</h3>
+<ul>
+<li>New <code>SUPER_ADMIN</code> enum value on <code>Role</code></li>
+<li>Seed script <code>prisma/seed-super-admin.ts</code> to create the first owner</li>
+<li>Migration: <code>20260515000000_platform_layer</code></li>
+</ul>
+<h3>Phase 2 — Platform shell</h3>
+<ul>
+<li>Separate <code>/platform</code> Next.js layout with slate visual language</li>
+<li>Three-state access gate (no token / token but not SUPER_ADMIN / allowed)</li>
+<li>Sidebar with &quot;ready&quot; / &quot;soon&quot; status pills</li>
+</ul>
+<h3>Phase 3 — School management</h3>
+<ul>
+<li><code>GET /platform/schools</code> — paginated list with search + status filter</li>
+<li><code>GET /platform/schools/:id</code> — single school detail</li>
+<li><code>PATCH /platform/schools/:id/status</code> — flip lifecycle (with audit + reason)</li>
+<li>Backend enforces &quot;reason required&quot; for SUSPENDED / EXPIRED</li>
+<li>Frontend dialog mirrors the requirement</li>
+</ul>
+<h3>Phase 4 — Subscriptions</h3>
+<ul>
+<li><code>school_subscriptions</code> table (append-only)</li>
+<li><code>SubscriptionService.create()</code> writes new period + flips <code>school.status</code> per rules:<ul>
+<li>TRIAL plan → status TRIAL</li>
+<li>Future-ending non-TRIAL → status ACTIVE (unless SUSPENDED — SUSPENDED is operator-tier)</li>
+<li>Past-ending → status EXPIRED</li>
+</ul>
+</li>
+<li><code>school.expiresAt</code> denormalized cache of current <code>endDate</code></li>
+<li><code>ManageSubscriptionDialog.tsx</code> UI</li>
+<li>Cross-tenant <code>/platform/subscriptions</code> page bucketed (Expiring soon / Expired / No plan / Active)</li>
+<li>Migration: <code>20260518000000_subscriptions</code></li>
+</ul>
+<h3>Phase 5 — Feature flags</h3>
+<ul>
+<li><code>Schools.featureOverrides</code> (JSON) + per-tenant overrides</li>
+<li>Three-layer resolution (override &gt; subscription &gt; catalog default) in <code>FeatureFlagsService</code></li>
+<li><code>@RequireFeature(FeatureKey.X)</code> decorator + <code>FeatureFlagsGuard</code></li>
+<li>Catalog: analytics, announcements, promotion (default ON); sms, transport, hostel (default OFF, marked Soon)</li>
+<li><code>/me/features</code> school-side endpoint for cached flag map</li>
+<li><code>/platform/features</code> cross-tenant matrix UI with three-state cells</li>
+<li><code>&lt;FeatureGate&gt;</code> page-level guard component</li>
+<li>Sidebar entries hide when feature disabled</li>
+<li>SUPER_ADMIN bypasses every flag</li>
+<li>Migration: <code>20260519000000_feature_flags</code></li>
+</ul>
+<h3>Phase 6 — Platform analytics (basic)</h3>
+<ul>
+<li><code>GET /platform/overview</code> — cross-tenant KPIs + 12-month school growth trend</li>
+<li><code>/platform</code> overview page composes status counts + aggregate usage + sparkline</li>
+</ul>
+<h3>Phase 7 — Impersonation</h3>
+<ul>
+<li><code>ImpersonationService</code> mints token with target&#39;s identity + sentinels</li>
+<li><code>POST /platform/impersonate/:userId</code> (start)</li>
+<li><code>POST /platform/impersonate/end</code> (returns fresh SUPER_ADMIN token)</li>
+<li>Impersonation banner on every dashboard page</li>
+<li>Cannot impersonate SUPER_ADMIN, self, or into SUSPENDED/EXPIRED tenant</li>
+<li>Cannot nest impersonation</li>
+<li>Migration: <code>20260517000000_impersonation_audit_actions</code></li>
+</ul>
+<h3>Phase 8 — Audit logs</h3>
+<ul>
+<li><code>platform_audit_events</code> table (append-only)</li>
+<li><code>PlatformAuditService.record()</code> — single ingestion path; swallows errors</li>
+<li><code>GET /platform/audit</code> — paginated, filterable (action, actor, target, date, free-text search)</li>
+<li>Frontend audit page with custom per-action ChangeSummary + side-drawer for full row detail</li>
+<li>Migration: <code>20260516000000_platform_audit_events</code></li>
+</ul>
+<h3>Phase 9 — Security controls</h3>
+<ul>
+<li><code>users.tokensValidAfter</code> watermark column</li>
+<li><code>JwtStrategy</code> checks watermark on every request</li>
+<li><code>SecurityService.forceLogoutUser()</code> / <code>forceLogoutSchool()</code> / <code>resetPassword()</code></li>
+<li><code>POST /platform/users/:id/force-logout</code></li>
+<li><code>POST /platform/schools/:id/force-logout</code> (reason required, 3+ chars)</li>
+<li><code>POST /platform/users/:id/reset-password</code> (returns plaintext temp password ONCE)</li>
+<li>Refuses SUPER_ADMIN targets across all three actions</li>
+<li>Bulk school force-logout skips SUPER_ADMIN rows</li>
+<li><code>SecurityDialog.tsx</code> UI with school-name confirmation gate for bulk action</li>
+<li><code>ResetPasswordResultModal</code> with click-to-copy + acknowledge gate</li>
+<li>Three new audit actions</li>
+<li>Rate limiting: <code>@nestjs/throttler</code> with named buckets for <code>/auth/login</code> + <code>/auth/register</code></li>
+<li><code>main.ts</code> adds <code>app.set(&#39;trust proxy&#39;, 1)</code> for real client IP</li>
+<li>Migration: <code>20260520000000_security_controls</code></li>
+</ul>
+<h3>Phase 10 — System health</h3>
+<ul>
+<li><code>HealthService</code> (in-memory, @Global): uptime, memory, DB probe, error ring buffer (200 cap), failed-login ring buffer (200 cap)</li>
+<li>Status rollup: green / yellow / red</li>
+<li><code>AllExceptionsFilter</code> switched to <code>APP_FILTER</code> (DI-injected) so it can record errors to HealthService</li>
+<li><code>AuthService.login</code> records failed logins with IP + reason (<code>invalid_credentials</code> / <code>school_blocked</code>)</li>
+<li><code>GET /platform/health</code> (skipped from throttle)</li>
+<li><code>/platform/health</code> page with 30s polling + three-tier status banner + scrollable error/login feeds</li>
+<li>Compact health summary card on <code>/platform</code> overview</li>
+<li>Top source-IP rollup for failed logins (last 60min)</li>
+</ul>
+<hr>
+<h2>9. Maturity push (Phases 11–18)</h2>
+<p>Once the 10-phase platform was complete, a maturity push hardened
+operational gaps. Numbering continues for traceability.</p>
+<h3>Phase 11 — Test hardening</h3>
+<ul>
+<li>Test infrastructure was minimal (1 test). Now: 12 suites, 135 tests.</li>
+<li>Coverage focus: security-critical surfaces (auth gates, impersonation
+rules, force-logout watermarks, feature flag resolution)</li>
+<li>Real Prisma mocks (in-memory map-backed) over schema-shaped fixtures</li>
+</ul>
+<h3>Phase 12 — Platform school detail page</h3>
+<ul>
+<li><code>GET /platform/schools/:id/snapshot</code> — bundled per-school analytics +
+unified activity feed (payments + audit + subscriptions, max 40 items)</li>
+<li><code>/platform/schools/[id]</code> page with 7 sections + sticky action bar:<ol>
+<li>Overview (logo monogram, identity, contact, dates)</li>
+<li>Subscription &amp; billing (KvBlocks + history + days-remaining banner)</li>
+<li>Feature flags (per-row toggle, optimistic updates, three-state cycle)</li>
+<li>Platform analytics (KPI row + 30-day fee/attendance sparklines)</li>
+<li>System health (computed warnings list, severity-tinted card)</li>
+<li>Recent activity (unified feed with kind-aware icons)</li>
+<li>Administration (sticky action bar with status-aware buttons)</li>
+</ol>
+</li>
+</ul>
+<h3>Phase 13 — Email expansion (9 templates shipped)</h3>
+<ul>
+<li>Template registry pattern in <code>backend/src/notifications/templates/</code></li>
+<li>Branded <code>wrapEmail()</code> layout (table-based, inline CSS, mobile-safe)</li>
+<li>Templates: <code>password_reset</code>, <code>school_created</code>, <code>subscription_expiring</code>,
+<code>school_suspended</code>, <code>payment_receipt</code>, <code>subscription_renewed</code>,
+<code>school_reactivated</code>, <code>plan_changed</code>, <code>security_alert</code></li>
+<li>HTML + plain-text + optional in-app rendering per template</li>
+<li>Wired to: <code>AuthService.registerAdmin</code>, <code>SecurityService.resetPassword</code>,
+<code>PlatformService.updateSchoolStatus</code> (suspend + reactivate),
+<code>SubscriptionService.create</code> (renewed vs plan_changed),
+<code>FeesService.recordPayment</code> (receipt)</li>
+</ul>
+<h3>Phase 14 — Notification Center</h3>
+<ul>
+<li><code>notifications.severity</code>, <code>notifications.title</code>, <code>notifications.readAt</code>
+columns added (Phase 14 migration)</li>
+<li><code>NotificationCenterService</code> + <code>NotificationCenterController</code></li>
+<li>Routes: <code>GET /platform/notifications</code>, <code>GET .../unread-count</code>,
+<code>GET .../:id</code>, <code>PATCH .../:id/read</code>, <code>PATCH .../:id/unread</code></li>
+<li><code>/platform/notifications</code> page with severity multi-select, unread-only
+filter, day-grouped list, side-drawer with per-channel deliveries</li>
+<li>Sidebar entry with Bell icon</li>
+</ul>
+<h3>Phase 15 — Background job system</h3>
+<ul>
+<li><code>Job</code> model + <code>JobStatus</code> enum (Phase 15 migration)</li>
+<li><code>JobsModule</code> (@Global): <code>JobQueueService</code>, <code>JobRegistry</code>, <code>JobRunnerService</code></li>
+<li>DB-backed queue with <code>FOR UPDATE SKIP LOCKED</code> claim semantics</li>
+<li>Exponential backoff retry (30s, 2m, 8m, 32m, … capped 1h, ±20% jitter)</li>
+<li>Idempotency via <code>(name, dedupeKey)</code> unique constraint</li>
+<li><code>JobNonRetryableError</code> for fast-fail</li>
+<li><code>OnApplicationShutdown</code> settles in-flight job (30s timeout)</li>
+<li><code>JOBS_AUTOSTART=false</code> env disables poll for tests</li>
+<li>Two real handlers shipped:<ul>
+<li><code>notification.send_delivery</code> (per-delivery dispatch with retry)</li>
+<li><code>platform.subscription_expiring_notice</code> (per-school per-threshold)</li>
+</ul>
+</li>
+<li>Cron refactored to enqueue jobs (<code>SubscriptionExpiringJob</code>)</li>
+</ul>
+<h3>Phase 16 — Platform analytics expansion</h3>
+<ul>
+<li><code>PlatformAnalyticsService</code> with 4 buckets:<ul>
+<li><strong>Revenue</strong> — MRR / ARR using code-level <code>PLAN_MONTHLY_PRICE_NPR</code> map
+(TRIAL=0, MONTHLY=5,000, YEARLY=4,000, UNLIMITED=0)</li>
+<li><strong>Growth</strong> — schools/month for 12 months, 30-day delta vs prior 30-day,
+feature adoption ratios</li>
+<li><strong>System</strong> — queue depth (<code>JobQueueService.stats()</code>), recent failed
+jobs (24h), notification volume by severity</li>
+<li><strong>Risk</strong> — suspended / expired / expiring soon / inactive (30d+ no
+activity proxy via <code>users.updatedAt</code>)</li>
+</ul>
+</li>
+<li><code>GET /platform/analytics</code> endpoint</li>
+<li>⚠ Deferred: churn rate (needs subscription state-change history),
+successful-login trends (needs <code>lastSeenAt</code> column)</li>
+</ul>
+<h3>Phase 17 — Security hardening</h3>
+<ul>
+<li><strong>Maintenance mode</strong>: <code>schools.maintenanceMode</code> field +
+<code>MaintenanceModeGuard</code> (global APP_GUARD, soft read-only),
+<code>/platform/schools/:id/maintenance</code> toggle, school-side
+<code>MaintenanceBanner</code>, <code>SCHOOL_MAINTENANCE_TOGGLED</code> audit action</li>
+<li><strong>Sessions</strong> (Phase 17 follow-up):<ul>
+<li><code>Session</code> model + <code>sessions</code> table (Phase 17 follow-up migration)</li>
+<li><code>SessionService</code> (CRUD + throttled <code>touch</code> + bulk revoke)</li>
+<li>JWT payload extended with <code>sid</code> claim</li>
+<li><code>JwtStrategy.validate</code> looks up session, throttle-touches lastActiveAt</li>
+<li><code>POST /auth/logout</code> — revokes calling session</li>
+<li><code>GET /me/sessions</code> + <code>/me/sessions/:id/revoke</code> + <code>/me/sessions/revoke-others</code></li>
+<li><code>GET /platform/users/:id/sessions</code> + revoke endpoint (operator-tier)</li>
+<li><code>/settings/devices</code> school-side UI with &quot;Sign out everywhere else&quot;</li>
+<li>&quot;Active devices&quot; link added to topbar user menu (all roles)</li>
+<li>User-agent parser (browser + OS) for session list display</li>
+</ul>
+</li>
+</ul>
+<h3>Phase 18 — Ops Dashboard</h3>
+<ul>
+<li><code>/platform/operations</code> page composing <code>PlatformAnalyticsPayload</code> + <code>HealthPayload</code></li>
+<li>Widgets: status banner, KPI row (MRR / new schools / at-risk / queue depth),
+plan distribution, notifications volume, risk panel, queue panel,
+recent failed jobs, feature adoption</li>
+<li>60s polling</li>
+<li>Sidebar entry with Cog icon</li>
+</ul>
+<h3>Phase 19 — Documentation</h3>
+<ul>
+<li><code>docs/platform/architecture.md</code> — module map + request lifecycle</li>
+<li><code>docs/platform/notifications.md</code> — flow + adding templates + center API</li>
+<li><code>docs/platform/jobs.md</code> — queue concepts + handler patterns</li>
+<li><code>docs/platform/impersonation.md</code> — security model + audit attribution</li>
+<li><code>docs/PROJECT.md</code> — this document</li>
+</ul>
+<h3>Phase 5 (Maturity) — Design system</h3>
+<ul>
+<li><code>frontend/components/platform-ui/</code> — primitives for the platform layer:<ul>
+<li><code>PageHeader</code> (title + breadcrumbs + actions slot)</li>
+<li><code>SectionCard</code> (bordered card with title bar, 4 tones)</li>
+<li><code>StatsGrid</code> + <code>StatCard</code> (KPI tile)</li>
+<li><code>StatusPill</code> + <code>SchoolStatusPill</code> + <code>PlanPill</code> (severity-tinted chips)</li>
+<li><code>PanelEmptyState</code>, <code>PanelErrorState</code>, <code>PanelLoadingState</code></li>
+<li><code>SkeletonLine</code>, <code>SkeletonRows</code></li>
+<li><code>FilterToolbar</code> (search + filters strip with active chips)</li>
+</ul>
+</li>
+<li>All 6 platform pages migrated to use these primitives</li>
+<li>Net: ~400 lines of inline markup eliminated, guaranteed visual consistency</li>
+</ul>
+<hr>
+<h2>10. Backend module reference</h2>
+<p>Every Nest module under <code>backend/src/</code>. Listed in dependency order
+(roughly).</p>
+<h3>10.1. Foundation modules</h3>
+<table>
+<thead>
+<tr>
+<th>Module</th>
+<th>Path</th>
+<th>Notes</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>DatabaseModule</code></td>
+<td><code>database/</code></td>
+<td>Provides <code>PrismaService</code> (global)</td>
+</tr>
+<tr>
+<td><code>ConfigModule</code></td>
+<td>(built-in)</td>
+<td>Loaded in <code>app.module</code> with <code>configuration.ts</code></td>
+</tr>
+<tr>
+<td><code>HashingModule</code></td>
+<td><code>common/hashing/</code></td>
+<td><code>HashingService</code> wraps bcrypt</td>
+</tr>
+<tr>
+<td><code>TeacherScopeModule</code></td>
+<td><code>common/auth/</code></td>
+<td><code>TeacherScopeService</code> for assignment-based access checks</td>
+</tr>
+</tbody></table>
+<h3>10.2. Auth + identity</h3>
+<table>
+<thead>
+<tr>
+<th>Module</th>
+<th>Path</th>
+<th>Exports</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>AuthModule</code></td>
+<td><code>auth/</code></td>
+<td><code>AuthService</code>, <code>JwtStrategy</code>, JWT module, Passport module</td>
+</tr>
+<tr>
+<td><code>UserModule</code></td>
+<td><code>user/</code></td>
+<td><code>UserService</code> for school-side user CRUD</td>
+</tr>
+</tbody></table>
+<h3>10.3. Domain modules</h3>
+<table>
+<thead>
+<tr>
+<th>Module</th>
+<th>Path</th>
+<th>Notes</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>SchoolModule</code></td>
+<td><code>school/</code></td>
+<td>Tenant config (logo upload, contact, etc.)</td>
+</tr>
+<tr>
+<td><code>StudentModule</code></td>
+<td><code>student/</code></td>
+<td>Student CRUD with class/section assignment</td>
+</tr>
+<tr>
+<td><code>TeacherModule</code></td>
+<td><code>teacher/</code></td>
+<td>Teacher CRUD; required <code>userId</code> link</td>
+</tr>
+<tr>
+<td><code>ClassModule</code></td>
+<td><code>class/</code></td>
+<td>Class management</td>
+</tr>
+<tr>
+<td><code>SectionModule</code></td>
+<td><code>section/</code></td>
+<td>Section management</td>
+</tr>
+<tr>
+<td><code>SubjectModule</code></td>
+<td><code>subject/</code></td>
+<td>School-owned subject catalog</td>
+</tr>
+<tr>
+<td><code>TeachingAssignmentModule</code></td>
+<td><code>teaching-assignment/</code></td>
+<td>Teacher → class/section/subject</td>
+</tr>
+<tr>
+<td><code>AcademicSessionModule</code></td>
+<td><code>academic-session/</code></td>
+<td>School year mgmt + lock + activate</td>
+</tr>
+<tr>
+<td><code>AttendanceModule</code></td>
+<td><code>attendance/</code></td>
+<td>Daily attendance recording</td>
+</tr>
+<tr>
+<td><code>GradingModule</code></td>
+<td><code>grading/</code></td>
+<td>NEB letter-grade lookup (no DB writes; pure logic)</td>
+</tr>
+<tr>
+<td><code>ExamsModule</code></td>
+<td><code>exams/</code></td>
+<td>Exam + ExamSubject + Result CRUD</td>
+</tr>
+<tr>
+<td><code>FeesModule</code></td>
+<td><code>fees/</code></td>
+<td>FeeStructure + FeeAssignment + Payment + refund</td>
+</tr>
+<tr>
+<td><code>DashboardModule</code></td>
+<td><code>dashboard/</code></td>
+<td>School-side aggregated stats</td>
+</tr>
+<tr>
+<td><code>AnnouncementModule</code></td>
+<td><code>announcement/</code></td>
+<td>Feature-gated school notices</td>
+</tr>
+<tr>
+<td><code>PromotionModule</code></td>
+<td><code>promotion/</code></td>
+<td>Feature-gated end-of-year flow</td>
+</tr>
+</tbody></table>
+<h3>10.4. Cross-cutting infrastructure (all <code>@Global()</code>)</h3>
+<table>
+<thead>
+<tr>
+<th>Module</th>
+<th>Path</th>
+<th>Purpose</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>PlatformModule</code></td>
+<td><code>platform/</code></td>
+<td>Platform Control Layer (NOT @Global; SUPER_ADMIN-gated routes)</td>
+</tr>
+<tr>
+<td><code>FeatureFlagsModule</code></td>
+<td><code>feature-flags/</code></td>
+<td><code>FeatureFlagsService</code>, <code>FeatureFlagsGuard</code>, <code>/me/features</code></td>
+</tr>
+<tr>
+<td><code>HealthModule</code></td>
+<td><code>health/</code></td>
+<td><code>HealthService</code> for operator pulse</td>
+</tr>
+<tr>
+<td><code>NotificationsModule</code></td>
+<td><code>notifications/</code></td>
+<td><code>NotificationService</code>, <code>NotificationCenterService</code>, channels, providers, templates, controller</td>
+</tr>
+<tr>
+<td><code>SessionsModule</code></td>
+<td><code>sessions/</code></td>
+<td><code>SessionService</code> + <code>SessionsController</code></td>
+</tr>
+<tr>
+<td><code>JobsModule</code></td>
+<td><code>common/jobs/</code></td>
+<td><code>JobQueueService</code>, <code>JobRegistry</code>, <code>JobRunnerService</code></td>
+</tr>
+</tbody></table>
+<h3>10.5. Global guards / filters / interceptors</h3>
+<table>
+<thead>
+<tr>
+<th>Mechanism</th>
+<th>Class</th>
+<th>Registered as</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>Exception handler</td>
+<td><code>AllExceptionsFilter</code></td>
+<td><code>APP_FILTER</code> in <code>AppModule.providers</code></td>
+</tr>
+<tr>
+<td>Rate limit</td>
+<td><code>UserAwareThrottlerGuard</code></td>
+<td><code>APP_GUARD</code> in <code>AppModule.providers</code></td>
+</tr>
+<tr>
+<td>Maintenance mode</td>
+<td><code>MaintenanceModeGuard</code></td>
+<td><code>APP_GUARD</code> in <code>AppModule.providers</code></td>
+</tr>
+</tbody></table>
+<hr>
+<h2>11. Frontend route + component reference</h2>
+<h3>11.1. Route groups</h3>
+<p>Next.js App Router with two route groups:</p>
+<ul>
+<li><code>app/(dashboard)/</code> — school-side. Wraps every page with <code>DashboardLayout</code>
+(Sidebar + Topbar + ImpersonationBanner + MaintenanceBanner +
+FeaturesProvider).</li>
+<li><code>app/platform/</code> — platform-side. Wraps with <code>PlatformLayout</code> (slate
+Topbar + Sidebar with ready/soon pills).</li>
+</ul>
+<p>Plus public/standalone routes:</p>
+<ul>
+<li><code>app/login/</code> — login page (no layout)</li>
+<li><code>app/marketing/</code> — public marketing pages (skeletal)</li>
+<li><code>app/marksheet/</code>, <code>app/receipts/</code>, <code>app/results/</code> — public document viewers</li>
+</ul>
+<h3>11.2. Auth state (client-side)</h3>
+<p>Stored in <code>localStorage</code>:</p>
+<table>
+<thead>
+<tr>
+<th>Key</th>
+<th>Shape</th>
+<th>Set by</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>scholaris:token</code></td>
+<td>string</td>
+<td><code>auth.login()</code>, <code>beginImpersonation()</code></td>
+</tr>
+<tr>
+<td><code>scholaris:user</code></td>
+<td><code>SafeUser</code> JSON</td>
+<td>same</td>
+</tr>
+<tr>
+<td><code>scholaris:school</code></td>
+<td><code>SchoolSummary</code> JSON</td>
+<td>same</td>
+</tr>
+<tr>
+<td><code>scholaris:impersonation</code></td>
+<td><code>ImpersonationContext</code> JSON</td>
+<td><code>beginImpersonation()</code> only</td>
+</tr>
+<tr>
+<td><code>scholaris:features</code></td>
+<td><code>Record&lt;string, boolean&gt;</code></td>
+<td><code>FeaturesProvider</code> cache</td>
+</tr>
+</tbody></table>
+<p>Cross-tab safety: <code>DashboardLayout</code> listens for <code>storage</code> events on
+<code>scholaris:token</code> / <code>scholaris:user</code>. Any change → hard navigation to
+<code>/login</code> so both tabs converge.</p>
+<h3>11.3. Frontend lib</h3>
+<table>
+<thead>
+<tr>
+<th>File</th>
+<th>Purpose</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>lib/api.ts</code></td>
+<td>Typed HTTP client. Attaches JWT, handles 401 (clears + redirects), 403 (logs but doesn&#39;t redirect).</td>
+</tr>
+<tr>
+<td><code>lib/auth.ts</code></td>
+<td>Login/logout (now async — calls <code>/auth/logout</code>), impersonation helpers, localStorage I/O</td>
+</tr>
+<tr>
+<td><code>lib/platform.ts</code></td>
+<td>All platform-tier API client + types</td>
+</tr>
+<tr>
+<td><code>lib/sessions.ts</code></td>
+<td><code>/me/sessions</code> client (Phase 17)</td>
+</tr>
+<tr>
+<td><code>lib/features.tsx</code></td>
+<td><code>FeaturesProvider</code> + <code>useFeatures()</code> hook + cached read</td>
+</tr>
+<tr>
+<td><code>lib/currency.ts</code></td>
+<td>NPR formatter (<code>रु. 12,345.50</code> with Indian grouping)</td>
+</tr>
+<tr>
+<td><code>lib/date.ts</code></td>
+<td>AD ↔ BS conversion helpers via <code>bikram-sambat-js</code></td>
+</tr>
+<tr>
+<td><code>lib/grading.ts</code></td>
+<td>NEB letter-grade lookup (mirror of backend logic)</td>
+</tr>
+<tr>
+<td><code>lib/amount-in-words.ts</code></td>
+<td>&quot;Rupees Twelve Thousand…&quot; — receipts</td>
+</tr>
+<tr>
+<td><code>lib/csv.ts</code></td>
+<td>CSV export helpers</td>
+</tr>
+<tr>
+<td><code>lib/offline-queue.ts</code> + <code>lib/sync-engine.ts</code></td>
+<td>IndexedDB-backed offline write queue + drainer</td>
+</tr>
+<tr>
+<td><code>lib/use-dashboard-data.ts</code></td>
+<td>School-side dashboard data hook</td>
+</tr>
+<tr>
+<td><code>lib/{students,teachers,classes,...}.ts</code></td>
+<td>Per-domain API clients</td>
+</tr>
+</tbody></table>
+<h3>11.4. Component primitives</h3>
+<p><strong>School-side (<code>components/ui/</code>)</strong> — soft, school-themed:</p>
+<ul>
+<li><code>Card</code>, <code>CardHeader</code>, <code>CardTitle</code>, <code>CardDescription</code>, <code>CardContent</code>, <code>CardFooter</code></li>
+<li><code>Button</code> (multiple variants: default, ghost, outline, destructive; sizes: sm, md, lg)</li>
+<li><code>Input</code></li>
+<li><code>Modal</code></li>
+<li><code>Skeleton</code></li>
+<li><code>Table</code></li>
+<li><code>EmptyState</code> (school-themed gradient illustration)</li>
+<li><code>Toaster</code> (<code>sonner</code> wrapper)</li>
+<li><code>OnboardingChecklist</code></li>
+</ul>
+<p><strong>Platform-side (<code>components/platform-ui/</code>)</strong> — slate, operational:</p>
+<ul>
+<li><code>PageHeader</code> (title + breadcrumbs + actions slot, regular/compact)</li>
+<li><code>SectionCard</code> (bordered card with title bar; tones: default/warning/danger/success)</li>
+<li><code>StatsGrid</code> + <code>StatCard</code> (KPI tile with icon/delta/loading/href)</li>
+<li><code>StatusPill</code> + <code>SchoolStatusPill</code> + <code>PlanPill</code></li>
+<li><code>PanelEmptyState</code>, <code>PanelErrorState</code>, <code>PanelLoadingState</code></li>
+<li><code>SkeletonLine</code>, <code>SkeletonRows</code></li>
+<li><code>FilterToolbar</code> (search + filters + active-chip strip)</li>
+<li>Re-exports through <code>components/platform-ui/index.ts</code></li>
+</ul>
+<p><strong>Cross-surface components (<code>components/</code>)</strong>:</p>
+<ul>
+<li><code>layout/Sidebar.tsx</code> — school-side sidebar with role-gated + feature-gated entries</li>
+<li><code>layout/Topbar.tsx</code> — school-side topbar with user menu + Devices link</li>
+<li><code>layout/NotificationsBell.tsx</code> — placeholder (school-side inbox future)</li>
+<li><code>impersonation/ImpersonateUserDialog.tsx</code> — picker</li>
+<li><code>impersonation/ImpersonationBanner.tsx</code> — sticky banner during impersonation</li>
+<li><code>maintenance/MaintenanceBanner.tsx</code> — school-side maintenance notice</li>
+<li><code>platform/ManageSubscriptionDialog.tsx</code> — subscription create + history</li>
+<li><code>platform/SecurityDialog.tsx</code> — force-logout + reset password</li>
+<li><code>platform/FeatureGate.tsx</code> — page-level feature flag wrapper</li>
+<li><code>theme/ThemeToggle.tsx</code> — light/dark toggle</li>
+<li><code>calendar/DualDate.tsx</code>, <code>calendar/CalendarToggle.tsx</code> — BS/AD date controls</li>
+<li><code>academic-session/SessionSelector.tsx</code>, <code>AcademicSessionProvider.tsx</code></li>
+<li><code>dashboard/AdminDashboardView.tsx</code>, <code>dashboard/TeacherDashboardView.tsx</code></li>
+<li><code>analytics/DateRangeMenu.tsx</code> and tab components</li>
+<li><code>documents/MarksheetRenderer.tsx</code>, <code>documents/ReceiptRenderer.tsx</code></li>
+<li><code>sync/SyncStatusBadge.tsx</code></li>
+<li><code>charts/Sparkline.tsx</code></li>
+<li>Per-domain forms: <code>students/StudentForm.tsx</code>, <code>teachers/TeacherForm.tsx</code>, <code>classes/ClassForm.tsx</code>, etc.</li>
+</ul>
+<hr>
+<h2>12. API reference</h2>
+<p>Every endpoint. Grouped by surface.</p>
+<h3>12.1. Auth (<code>/auth</code>)</h3>
+<table>
+<thead>
+<tr>
+<th>Method</th>
+<th>Path</th>
+<th>Auth</th>
+<th>Notes</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>POST</td>
+<td><code>/auth/register</code></td>
+<td>none</td>
+<td>Register new tenant + first ADMIN. Throttled 5/hour/IP.</td>
+</tr>
+<tr>
+<td>POST</td>
+<td><code>/auth/login</code></td>
+<td>none</td>
+<td>Login. Throttled 10/min/IP. Records failed logins to health.</td>
+</tr>
+<tr>
+<td>POST</td>
+<td><code>/auth/logout</code></td>
+<td>JWT</td>
+<td>Phase 17 — revokes calling session row.</td>
+</tr>
+</tbody></table>
+<h3>12.2. School-side <code>/me/*</code></h3>
+<table>
+<thead>
+<tr>
+<th>Method</th>
+<th>Path</th>
+<th>Auth</th>
+<th>Notes</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>GET</td>
+<td><code>/me/features</code></td>
+<td>JWT</td>
+<td>Resolved feature map + catalog + tenant maintenance state</td>
+</tr>
+<tr>
+<td>GET</td>
+<td><code>/me/sessions</code></td>
+<td>JWT</td>
+<td>Phase 17 — list my sessions</td>
+</tr>
+<tr>
+<td>POST</td>
+<td><code>/me/sessions/:id/revoke</code></td>
+<td>JWT</td>
+<td>Phase 17</td>
+</tr>
+<tr>
+<td>POST</td>
+<td><code>/me/sessions/revoke-others</code></td>
+<td>JWT</td>
+<td>Phase 17 — log out everywhere except here</td>
+</tr>
+</tbody></table>
+<h3>12.3. School-side domain (excerpt — full list in controllers)</h3>
+<table>
+<thead>
+<tr>
+<th>Method</th>
+<th>Path</th>
+<th>Auth</th>
+<th>Notes</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>GET</td>
+<td><code>/dashboard/summary</code></td>
+<td>JWT</td>
+<td>School-wide aggregate (admin tier)</td>
+</tr>
+<tr>
+<td>GET</td>
+<td><code>/dashboard/teacher-summary</code></td>
+<td>JWT, TEACHER</td>
+<td>Teacher&#39;s own context</td>
+</tr>
+<tr>
+<td>GET, POST, PATCH, DELETE</td>
+<td><code>/students*</code></td>
+<td>JWT</td>
+<td>Standard CRUD</td>
+</tr>
+<tr>
+<td>GET, POST, PATCH, DELETE</td>
+<td><code>/teachers*</code></td>
+<td>JWT, ADMIN</td>
+<td>Includes <code>/teachers/me/assignments</code></td>
+</tr>
+<tr>
+<td>GET, POST, PATCH, DELETE</td>
+<td><code>/classes*</code>, <code>/sections*</code>, <code>/subjects*</code></td>
+<td>JWT, ADMIN</td>
+<td></td>
+</tr>
+<tr>
+<td>GET, POST, DELETE</td>
+<td><code>/announcements*</code></td>
+<td>JWT (read), ADMIN (write); <code>@RequireFeature(Announcements)</code></td>
+<td></td>
+</tr>
+<tr>
+<td>GET, POST</td>
+<td><code>/attendance*</code></td>
+<td>JWT</td>
+<td></td>
+</tr>
+<tr>
+<td>POST</td>
+<td><code>/promotion/run</code></td>
+<td>JWT, ADMIN; <code>@RequireFeature(Promotion)</code></td>
+<td></td>
+</tr>
+<tr>
+<td>GET, POST, PATCH</td>
+<td><code>/exams*</code>, <code>/results*</code></td>
+<td>JWT</td>
+<td></td>
+</tr>
+<tr>
+<td>GET, POST, PATCH</td>
+<td><code>/fees*</code>, <code>/payments*</code></td>
+<td>JWT, ADMIN</td>
+<td></td>
+</tr>
+<tr>
+<td>POST</td>
+<td><code>/payments/:id/refund</code></td>
+<td>JWT, ADMIN</td>
+<td></td>
+</tr>
+<tr>
+<td>GET, POST, PATCH</td>
+<td><code>/academic-sessions*</code></td>
+<td>JWT, ADMIN</td>
+<td></td>
+</tr>
+<tr>
+<td>GET, PATCH</td>
+<td><code>/users*</code></td>
+<td>JWT, ADMIN</td>
+<td></td>
+</tr>
+<tr>
+<td>GET, PATCH, POST</td>
+<td><code>/school*</code></td>
+<td>JWT, ADMIN</td>
+<td>Logo upload via <code>/school/logo</code></td>
+</tr>
+</tbody></table>
+<h3>12.4. Platform layer (<code>@Roles(SUPER_ADMIN)</code> on all)</h3>
+<table>
+<thead>
+<tr>
+<th>Method</th>
+<th>Path</th>
+<th>Notes</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>GET</td>
+<td><code>/platform/overview</code></td>
+<td>Cross-tenant KPIs</td>
+</tr>
+<tr>
+<td>GET</td>
+<td><code>/platform/schools</code></td>
+<td>Paginated list</td>
+</tr>
+<tr>
+<td>GET</td>
+<td><code>/platform/schools/:id</code></td>
+<td>Detail row</td>
+</tr>
+<tr>
+<td>GET</td>
+<td><code>/platform/schools/:id/snapshot</code></td>
+<td>Phase 12 — analytics + activity feed bundle</td>
+</tr>
+<tr>
+<td>GET</td>
+<td><code>/platform/schools/:id/users</code></td>
+<td>Non-SUPER_ADMIN users at the school</td>
+</tr>
+<tr>
+<td>GET</td>
+<td><code>/platform/schools/:id/subscriptions</code></td>
+<td>Plan history</td>
+</tr>
+<tr>
+<td>POST</td>
+<td><code>/platform/schools/:id/subscriptions</code></td>
+<td>Create new period</td>
+</tr>
+<tr>
+<td>PATCH</td>
+<td><code>/platform/schools/:id/status</code></td>
+<td>Change lifecycle (reason required for SUSPENDED/EXPIRED)</td>
+</tr>
+<tr>
+<td>PATCH</td>
+<td><code>/platform/schools/:id/maintenance</code></td>
+<td>Phase 17 — toggle maintenance mode</td>
+</tr>
+<tr>
+<td>GET</td>
+<td><code>/platform/schools/:id/features</code></td>
+<td>Resolved + layered features</td>
+</tr>
+<tr>
+<td>PATCH</td>
+<td><code>/platform/schools/:id/features</code></td>
+<td>Set overrides</td>
+</tr>
+<tr>
+<td>GET</td>
+<td><code>/platform/features/catalog</code></td>
+<td>Catalog only</td>
+</tr>
+<tr>
+<td>GET</td>
+<td><code>/platform/features</code></td>
+<td>Cross-tenant matrix</td>
+</tr>
+<tr>
+<td>GET</td>
+<td><code>/platform/users/:id/sessions</code></td>
+<td>Phase 17 — list any user&#39;s sessions</td>
+</tr>
+<tr>
+<td>POST</td>
+<td><code>/platform/users/:userId/sessions/:sessionId/revoke</code></td>
+<td>Phase 17 — revoke one session</td>
+</tr>
+<tr>
+<td>POST</td>
+<td><code>/platform/users/:id/force-logout</code></td>
+<td>Watermark hammer</td>
+</tr>
+<tr>
+<td>POST</td>
+<td><code>/platform/schools/:id/force-logout</code></td>
+<td>Bulk school force-logout (reason required)</td>
+</tr>
+<tr>
+<td>POST</td>
+<td><code>/platform/users/:id/reset-password</code></td>
+<td>Returns plaintext temp password ONCE</td>
+</tr>
+<tr>
+<td>POST</td>
+<td><code>/platform/impersonate/:userId</code></td>
+<td>Start impersonation</td>
+</tr>
+<tr>
+<td>POST</td>
+<td><code>/platform/impersonate/end</code></td>
+<td>End (returns fresh SUPER_ADMIN token)</td>
+</tr>
+<tr>
+<td>GET</td>
+<td><code>/platform/audit</code></td>
+<td>Filterable + paginated</td>
+</tr>
+<tr>
+<td>GET</td>
+<td><code>/platform/health</code></td>
+<td>Operator pulse (skipped from throttle)</td>
+</tr>
+<tr>
+<td>GET</td>
+<td><code>/platform/analytics</code></td>
+<td>Phase 16 — revenue/growth/system/risk</td>
+</tr>
+<tr>
+<td>GET</td>
+<td><code>/platform/notifications</code></td>
+<td>Phase 14 — list with filters</td>
+</tr>
+<tr>
+<td>GET</td>
+<td><code>/platform/notifications/unread-count</code></td>
+<td>Badge counter</td>
+</tr>
+<tr>
+<td>GET</td>
+<td><code>/platform/notifications/:id</code></td>
+<td>Detail + per-channel deliveries</td>
+</tr>
+<tr>
+<td>PATCH</td>
+<td><code>/platform/notifications/:id/read</code></td>
+<td>Mark read</td>
+</tr>
+<tr>
+<td>PATCH</td>
+<td><code>/platform/notifications/:id/unread</code></td>
+<td>Mark unread</td>
+</tr>
+</tbody></table>
+<hr>
+<h2>13. Notification system</h2>
+<p>Full architecture documented at <code>docs/platform/notifications.md</code>. Summary
+here.</p>
+<h3>13.1. Producer-side API</h3>
+<pre><code class="language-ts">await this.notifications.enqueue({
+  templateKey: &#39;platform.password_reset&#39;,
+  recipients: { email: &#39;foo@bar.com&#39; },
+  dedupeKey: `user:${userId}:reset:${eventTime}`,    // optional
+  severity: &#39;WARNING&#39;,                                // optional, defaults to INFO
+  title: &#39;Password reset by support&#39;,                 // optional
+  schoolId: &#39;...&#39;,                                    // optional, for filtering
+  userId: &#39;...&#39;,                                      // optional, for filtering
+  payload: { brand: this.config.get(&#39;mail.brand&#39;), ... },
+});
+</code></pre>
+<p>Returns <code>{ notification, deliveries, deduped: boolean }</code>. Errors during
+dispatch DO NOT propagate — they&#39;re recorded on the delivery row.</p>
+<h3>13.2. Channels</h3>
+<table>
+<thead>
+<tr>
+<th>Channel</th>
+<th>Status</th>
+<th>Handler</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>EMAIL</code></td>
+<td>Live</td>
+<td><code>EmailChannel</code> → <code>EmailProvider</code> (Console / SMTP)</td>
+</tr>
+<tr>
+<td><code>IN_APP</code></td>
+<td>Wired (no UI yet)</td>
+<td><code>InAppChannel</code> (no-op; rows are the inbox)</td>
+</tr>
+<tr>
+<td><code>SMS</code></td>
+<td>Reserved</td>
+<td>(no handler) — SKIPPED</td>
+</tr>
+<tr>
+<td><code>WHATSAPP</code></td>
+<td>Reserved</td>
+<td>(no handler) — SKIPPED</td>
+</tr>
+</tbody></table>
+<h3>13.3. Email providers</h3>
+<p><code>EMAIL_PROVIDER</code> injection token (in <code>notifications/providers/email-provider.token.ts</code>)
+bound by env via factory in <code>NotificationsModule</code>:</p>
+<ul>
+<li><code>MAIL_PROVIDER=console</code> (default) → <code>ConsoleEmailProvider</code> (logs to stdout)</li>
+<li><code>MAIL_PROVIDER=smtp</code> → <code>SmtpEmailProvider</code> (lazy-loads <code>nodemailer</code>)</li>
+</ul>
+<h3>13.4. Template registry</h3>
+<p>In <code>backend/src/notifications/templates/</code>:</p>
+<ul>
+<li><code>template-registry.ts</code> — exports <code>TEMPLATES</code> map + <code>getTemplate(key)</code></li>
+<li><code>layout.ts</code> — <code>wrapEmail()</code> + <code>emailHeading/Paragraph/Button/Mono/Divider</code></li>
+<li>9 template files (see <a href="#16-email-templates">§16</a>)</li>
+</ul>
+<p>Adding a template: drop a <code>&lt;your&gt;.template.ts</code>, register in
+<code>TEMPLATES</code>, call <code>notifications.enqueue({ templateKey: &#39;your.key&#39;, ... })</code>
+from your producer. Done.</p>
+<h3>13.5. Notification Center (Phase 14)</h3>
+<p>Operator-facing inbox at <code>/platform/notifications</code>. SUPER_ADMIN-gated.
+Backed by <code>NotificationCenterService</code>:</p>
+<ul>
+<li>List with severity multi-select + unread filter + schoolId filter + pagination</li>
+<li>Detail with payload + per-delivery state</li>
+<li>Mark read / unread</li>
+<li>Unread count for the bell badge</li>
+</ul>
+<hr>
+<h2>14. Background job system</h2>
+<p>Full architecture at <code>docs/platform/jobs.md</code>. Summary here.</p>
+<h3>14.1. Concepts</h3>
+<ul>
+<li><strong>Producer</strong> — calls <code>JobQueueService.enqueue({ name, payload, dedupeKey?, runAt? })</code></li>
+<li><strong>Handler</strong> — <code>@Injectable()</code> class implementing <code>JobHandler</code>, registered with <code>JobRegistry</code></li>
+<li><strong>Runner</strong> — <code>JobRunnerService</code> polls every 1s, claims with <code>FOR UPDATE SKIP LOCKED</code></li>
+<li><strong>Queue</strong> — <code>jobs</code> table</li>
+</ul>
+<h3>14.2. Lifecycle</h3>
+<pre><code>PENDING (runAt &lt;= now)
+  ↓ JobRunner.claimNext (FOR UPDATE SKIP LOCKED)
+RUNNING
+  ├── handler resolved → SUCCEEDED
+  └── handler threw:
+        ├── attempts &lt; maxAttempts → PENDING with backoff
+        └── attempts &gt;= maxAttempts OR JobNonRetryableError → FAILED
+(Operator-killed) → DEAD
+</code></pre>
+<h3>14.3. Backoff</h3>
+<p>Exponential: 30s, 2m, 8m, 32m, … capped at 1h, with ±20% jitter.</p>
+<h3>14.4. Test mode</h3>
+<p><code>JOBS_AUTOSTART=false</code> disables the poll loop. Tests use
+<code>jobRunner.runOnceForTesting()</code> to drain deterministically.</p>
+<h3>14.5. Shipped handlers</h3>
+<table>
+<thead>
+<tr>
+<th>Name</th>
+<th>Owner</th>
+<th>Purpose</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>notification.send_delivery</code></td>
+<td><code>notifications/handlers/</code></td>
+<td>Per-delivery dispatch with retry</td>
+</tr>
+<tr>
+<td><code>platform.subscription_expiring_notice</code></td>
+<td><code>platform/jobs/</code></td>
+<td>Per-school per-threshold expiry email</td>
+</tr>
+</tbody></table>
+<h3>14.6. Cron</h3>
+<p><code>@nestjs/schedule</code> for triggers (not the job runner itself). One cron
+ships:</p>
+<ul>
+<li><code>SubscriptionExpiringJob</code> — <code>@Cron(EVERY_DAY_AT_9AM)</code>. Scans schools
+in the ±2-week window of <code>expiresAt</code> and enqueues
+<code>platform.subscription_expiring_notice</code> jobs. The job runner drains
+them async.</li>
+</ul>
+<hr>
+<h2>15. Feature flags</h2>
+<p>Resolution stack (highest precedence first):</p>
+<ol>
+<li><strong><code>schools.featureOverrides</code></strong> — operator-set per-tenant override</li>
+<li><strong><code>school_subscriptions.enabledFeatures</code></strong> — current plan&#39;s flags</li>
+<li><strong>Catalog default</strong> — code-level <code>defaultEnabled</code> per feature</li>
+</ol>
+<h3>15.1. Catalog (in <code>backend/src/feature-flags/feature-catalog.ts</code>)</h3>
+<table>
+<thead>
+<tr>
+<th>Key</th>
+<th>Default</th>
+<th>Coming Soon</th>
+<th>Notes</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>analytics</code></td>
+<td>ON</td>
+<td>—</td>
+<td>Admin analytics dashboard</td>
+</tr>
+<tr>
+<td><code>announcements</code></td>
+<td>ON</td>
+<td>—</td>
+<td>School-wide messaging</td>
+</tr>
+<tr>
+<td><code>promotion</code></td>
+<td>ON</td>
+<td>—</td>
+<td>End-of-year flow</td>
+</tr>
+<tr>
+<td><code>sms</code></td>
+<td>OFF</td>
+<td>✓</td>
+<td>Future feature</td>
+</tr>
+<tr>
+<td><code>transport</code></td>
+<td>OFF</td>
+<td>✓</td>
+<td>Future feature</td>
+</tr>
+<tr>
+<td><code>hostel</code></td>
+<td>OFF</td>
+<td>✓</td>
+<td>Future feature</td>
+</tr>
+</tbody></table>
+<h3>15.2. Backend enforcement</h3>
+<pre><code class="language-ts">@Controller(&#39;announcements&#39;)
+@UseGuards(JwtAuthGuard, RolesGuard, FeatureFlagsGuard)
+@RequireFeature(FeatureKey.Announcements)
+export class AnnouncementController { ... }
+</code></pre>
+<p><code>FeatureFlagsGuard</code> (in <code>feature-flags/</code>) resolves at request time
+via <code>FeatureFlagsService.isEnabled(schoolId, key)</code>. SUPER_ADMIN
+bypasses every flag.</p>
+<h3>15.3. Frontend</h3>
+<ul>
+<li><code>FeaturesProvider</code> mounted in <code>(dashboard)/layout.tsx</code> fetches <code>/me/features</code> on mount</li>
+<li><code>useFeatures()</code> / <code>useFeatureEnabled(key)</code> hooks read the cached map</li>
+<li><code>&lt;FeatureGate featureKey=&quot;...&quot; featureLabel=&quot;...&quot;&gt;</code> page-level wrapper</li>
+<li>Sidebar entries with <code>requiresFeature</code> field hide when off</li>
+</ul>
+<h3>15.4. Cross-tenant management</h3>
+<ul>
+<li><code>/platform/features</code> — three-state matrix (Inherit / Forced ON / Forced OFF)</li>
+<li>Per-school override view embedded in school detail page</li>
+<li><code>FEATURE_FLAG_CHANGED</code> audit row on every override write (no-op writes skipped)</li>
+</ul>
+<hr>
+<h2>16. Email templates</h2>
+<p>In <code>backend/src/notifications/templates/</code>. All emit HTML + plain-text.</p>
+<table>
+<thead>
+<tr>
+<th>Key</th>
+<th>Trigger</th>
+<th>Recipient</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>platform.school_created</code></td>
+<td><code>AuthService.registerAdmin</code></td>
+<td>New school admin</td>
+</tr>
+<tr>
+<td><code>platform.password_reset</code></td>
+<td><code>SecurityService.resetPassword</code></td>
+<td>Reset target</td>
+</tr>
+<tr>
+<td><code>platform.subscription_expiring</code></td>
+<td><code>SubscriptionExpiringJob</code> cron (5 thresholds: 14, 7, 1, 0, -1 days)</td>
+<td>School&#39;s first ADMIN</td>
+</tr>
+<tr>
+<td><code>platform.subscription_renewed</code></td>
+<td><code>SubscriptionService.create</code> (when plan unchanged or first paid period)</td>
+<td>School&#39;s first ADMIN</td>
+</tr>
+<tr>
+<td><code>platform.plan_changed</code></td>
+<td><code>SubscriptionService.create</code> (when plan differs from previous)</td>
+<td>School&#39;s first ADMIN</td>
+</tr>
+<tr>
+<td><code>platform.school_suspended</code></td>
+<td><code>PlatformService.updateSchoolStatus</code> (→ SUSPENDED)</td>
+<td>School&#39;s first ADMIN</td>
+</tr>
+<tr>
+<td><code>platform.school_reactivated</code></td>
+<td><code>PlatformService.updateSchoolStatus</code> (→ ACTIVE from SUSPENDED/EXPIRED)</td>
+<td>School&#39;s first ADMIN</td>
+</tr>
+<tr>
+<td><code>platform.security_alert</code></td>
+<td>(no producer wired yet — template ready for anomaly detection)</td>
+<td>Variable</td>
+</tr>
+<tr>
+<td><code>school.payment_receipt</code></td>
+<td><code>FeesService.recordPayment</code> (when student has linked user with email)</td>
+<td>Student&#39;s user email</td>
+</tr>
+</tbody></table>
+<p>⚠ Deferred: <code>low_storage_warning</code> — needs storage tracking first.
+⚠ Deferred: <code>refund_receipt</code>, <code>exam_published</code>, <code>invitation_email</code> —
+needs corresponding producers wired.</p>
+<h3>16.1. Email layout</h3>
+<p><code>templates/layout.ts</code> exports:</p>
+<ul>
+<li><code>wrapEmail({ brand, preheader, body })</code> — full HTML shell</li>
+<li><code>emailHeading(text)</code>, <code>emailParagraph(text)</code>, <code>emailButton(label, href)</code></li>
+<li><code>emailMonoBlock(text)</code>, <code>emailDivider()</code></li>
+</ul>
+<p>Brand config (<code>MAIL_BRAND_*</code> env vars): productName, supportEmail,
+optional logoUrl, optional footerAddress.</p>
+<hr>
+<h2>17. Audit log</h2>
+<p>Single source: <code>platform_audit_events</code> table.</p>
+<h3>17.1. Actions taxonomy (<code>PlatformAuditAction</code> enum)</h3>
+<table>
+<thead>
+<tr>
+<th>Action</th>
+<th>Phase</th>
+<th>Carried in <code>before</code> / <code>after</code></th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>SCHOOL_STATUS_CHANGED</code></td>
+<td>8</td>
+<td><code>{ status }</code> before + after</td>
+</tr>
+<tr>
+<td><code>IMPERSONATION_STARTED</code></td>
+<td>7</td>
+<td><code>after.startedAt</code>, target school slug</td>
+</tr>
+<tr>
+<td><code>IMPERSONATION_ENDED</code></td>
+<td>7</td>
+<td><code>after.durationMs</code></td>
+</tr>
+<tr>
+<td><code>SUBSCRIPTION_CREATED</code></td>
+<td>4</td>
+<td><code>after.{ plan, billingCycle, startDate, endDate, statusFlippedTo }</code></td>
+</tr>
+<tr>
+<td><code>FEATURE_FLAG_CHANGED</code></td>
+<td>5</td>
+<td><code>before.overrides</code> + <code>after.overrides</code></td>
+</tr>
+<tr>
+<td><code>USER_FORCE_LOGOUT</code></td>
+<td>9</td>
+<td><code>after.tokensValidAfter</code> (or <code>after.scope: &quot;session&quot;</code> for per-session revoke)</td>
+</tr>
+<tr>
+<td><code>SCHOOL_FORCE_LOGOUT</code></td>
+<td>9</td>
+<td><code>after.{ tokensValidAfter, affectedCount }</code></td>
+</tr>
+<tr>
+<td><code>ADMIN_PASSWORD_RESET</code></td>
+<td>9</td>
+<td><code>after.tokensValidAfter</code> (NEVER the password)</td>
+</tr>
+<tr>
+<td><code>SCHOOL_MAINTENANCE_TOGGLED</code></td>
+<td>17</td>
+<td><code>before/after.{ maintenanceMode }</code></td>
+</tr>
+</tbody></table>
+<h3>17.2. What every audit row carries</h3>
+<pre><code class="language-typescript">{
+  id, action, createdAt,
+  actorUserId, actorEmail, actorRole,         // snapshotted at audit time
+  targetType, targetId, targetLabel,           // label snapshotted (e.g., school name)
+  before: JSON | null,
+  after: JSON | null,
+  reason: string | null,                       // free-form note
+  ip: string | null,                           // best-effort
+  userAgent: string | null,
+}
+</code></pre>
+<h3>17.3. UI</h3>
+<ul>
+<li><code>/platform/audit</code> — paginated, filterable list</li>
+<li>Filters: action (multi-option select), date range (from/to), free-text
+search across actor email + target label + reason</li>
+<li>Per-row <code>ChangeSummary</code> rendered per-action with custom logic</li>
+<li>Side-drawer with full row + before/after JSON dump</li>
+</ul>
+<hr>
+<h2>18. Migrations chronology</h2>
+<p>41 migrations, chronologically named. School-side (Phases pre-platform)</p>
+<ul>
+<li>platform layer + maturity push.</li>
+</ul>
+<h3>18.1. School-side foundation (Apr 22 – May 14)</h3>
+<table>
+<thead>
+<tr>
+<th>Migration</th>
+<th>Adds</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>20260422122834_init_multi_tenant</code></td>
+<td>Schools, Users, multi-tenant base</td>
+</tr>
+<tr>
+<td><code>20260422192729_teacher_optional_user</code></td>
+<td>Teacher.userId optional initially</td>
+</tr>
+<tr>
+<td><code>20260422195311_classes_and_sections</code></td>
+<td>Class + Section</td>
+</tr>
+<tr>
+<td><code>20260424094252_attendance</code></td>
+<td>Attendance table</td>
+</tr>
+<tr>
+<td><code>20260424102359_exams_neb_grading</code></td>
+<td>Exam + ExamSubject + Result</td>
+</tr>
+<tr>
+<td><code>20260425100000_exam_split_backfill</code></td>
+<td>Migration to per-subject marks structure</td>
+</tr>
+<tr>
+<td><code>20260425100100_exam_drop_legacy_marks</code></td>
+<td>Cleanup</td>
+</tr>
+<tr>
+<td><code>20260425110000_student_class_link</code></td>
+<td>Student.classId + sectionId</td>
+</tr>
+<tr>
+<td><code>20260425115000_fees_payments_init</code></td>
+<td>FeeStructure + FeeAssignment + Payment</td>
+</tr>
+<tr>
+<td><code>20260425120000_fees_class_scope_discounts</code></td>
+<td>Fee class scope + discount fields</td>
+</tr>
+<tr>
+<td><code>20260430000000_student_demographics</code></td>
+<td>Required gender, DOB, parent, contact</td>
+</tr>
+<tr>
+<td><code>20260430005000_student_symbol_number</code></td>
+<td>NEB symbol number unique per school</td>
+</tr>
+<tr>
+<td><code>20260430010000_school_logo</code></td>
+<td>School.logoUrl</td>
+</tr>
+<tr>
+<td><code>20260430020000_teacher_class_link</code></td>
+<td>Legacy single-class teacher link</td>
+</tr>
+<tr>
+<td><code>20260502000000_teacher_section_link</code></td>
+<td>Legacy section link</td>
+</tr>
+<tr>
+<td><code>20260503000000_teaching_assignments</code></td>
+<td>New TeachingAssignment table</td>
+</tr>
+<tr>
+<td><code>20260503144900_finalize_teaching_assignments</code></td>
+<td>Schema refinement</td>
+</tr>
+<tr>
+<td><code>20260504000000_teacher_user_required</code></td>
+<td>Teacher.userId now required (CASCADE)</td>
+</tr>
+<tr>
+<td><code>20260505000000_announcements</code></td>
+<td>Announcement table</td>
+</tr>
+<tr>
+<td><code>20260506000000_add_staff_role</code></td>
+<td>STAFF role enum value</td>
+</tr>
+<tr>
+<td><code>20260507000000_audit_fields_academic</code></td>
+<td>createdById/updatedById on Subject + Exam + Result</td>
+</tr>
+<tr>
+<td><code>20260508000000_academic_sessions</code></td>
+<td>AcademicSession + sessionId on relevant tables</td>
+</tr>
+<tr>
+<td><code>20260509000000_session_lock_promotion</code></td>
+<td>isLocked + StudentAcademicRecord</td>
+</tr>
+<tr>
+<td><code>20260510000000_backfill_legacy_assignments</code></td>
+<td>Data migration</td>
+</tr>
+<tr>
+<td><code>20260511000000_finalize_teaching_assignments_safety</code></td>
+<td>Safety constraints</td>
+</tr>
+<tr>
+<td><code>20260511010000_drop_teacher_legacy_class_fields</code></td>
+<td>Drop legacy classId/sectionId</td>
+</tr>
+<tr>
+<td><code>20260512000000_result_absent_field</code></td>
+<td>Result.absent for NG handling</td>
+</tr>
+<tr>
+<td><code>20260513000000_school_contact_info</code></td>
+<td>School.address, .phone, .email</td>
+</tr>
+<tr>
+<td><code>20260513010000_payment_refunds</code></td>
+<td>Payment refund mechanism</td>
+</tr>
+<tr>
+<td><code>20260513020000_payment_idempotency_and_status</code></td>
+<td>clientRequestId + PaymentStatus</td>
+</tr>
+<tr>
+<td><code>20260514000000_payment_audit_fields</code></td>
+<td>Payment.createdById + updatedById</td>
+</tr>
+</tbody></table>
+<h3>18.2. Platform layer (May 15 – May 20)</h3>
+<table>
+<thead>
+<tr>
+<th>Migration</th>
+<th>Adds</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>20260515000000_platform_layer</code></td>
+<td>SUPER_ADMIN role + SchoolStatus + School.status, .expiresAt</td>
+</tr>
+<tr>
+<td><code>20260516000000_platform_audit_events</code></td>
+<td>PlatformAuditEvent table</td>
+</tr>
+<tr>
+<td><code>20260517000000_impersonation_audit_actions</code></td>
+<td>IMPERSONATION_STARTED/ENDED enum values</td>
+</tr>
+<tr>
+<td><code>20260518000000_subscriptions</code></td>
+<td>SubscriptionPlan + BillingCycle + SchoolSubscription + SUBSCRIPTION_CREATED</td>
+</tr>
+<tr>
+<td><code>20260519000000_feature_flags</code></td>
+<td>School.featureOverrides + FEATURE_FLAG_CHANGED</td>
+</tr>
+<tr>
+<td><code>20260520000000_security_controls</code></td>
+<td>User.tokensValidAfter + 3 audit actions</td>
+</tr>
+</tbody></table>
+<h3>18.3. Maturity push (May 21 – May 25)</h3>
+<table>
+<thead>
+<tr>
+<th>Migration</th>
+<th>Adds</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>20260521000000_notifications</code></td>
+<td>Notification + NotificationDelivery + 2 enums</td>
+</tr>
+<tr>
+<td><code>20260522000000_jobs</code></td>
+<td>Job + JobStatus enum</td>
+</tr>
+<tr>
+<td><code>20260523000000_notification_severity</code></td>
+<td>Notification.severity, .title, .readAt + enum</td>
+</tr>
+<tr>
+<td><code>20260524000000_maintenance_mode</code></td>
+<td>School.maintenanceMode + SCHOOL_MAINTENANCE_TOGGLED</td>
+</tr>
+<tr>
+<td><code>20260525000000_sessions</code></td>
+<td>Session table + indexes</td>
+</tr>
+</tbody></table>
+<hr>
+<h2>19. Test coverage</h2>
+<p><strong>135 tests across 12 suites.</strong> Run with <code>npm run test</code> from <code>backend/</code>.</p>
+<table>
+<thead>
+<tr>
+<th>Suite</th>
+<th>Tests</th>
+<th>Covers</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>app.controller.spec.ts</code></td>
+<td>1</td>
+<td>Bootstrap smoke</td>
+</tr>
+<tr>
+<td><code>common/money/amount-in-words.spec.ts</code></td>
+<td>26</td>
+<td>Currency-to-words formatting (boundary values, lakh/crore, decimal handling, range guards)</td>
+</tr>
+<tr>
+<td><code>auth/auth.service.spec.ts</code></td>
+<td>8</td>
+<td>Login (credential checks, tenant gate, SUPER_ADMIN bypass on suspended school)</td>
+</tr>
+<tr>
+<td><code>health/health.service.spec.ts</code></td>
+<td>13</td>
+<td>Uptime, memory, DB probe outcomes, ring buffer windowing, status rollup</td>
+</tr>
+<tr>
+<td><code>feature-flags/feature-flags.service.spec.ts</code></td>
+<td>14</td>
+<td>3-layer resolution, isEnabled hot path, setOverrides validation + no-op detection</td>
+</tr>
+<tr>
+<td><code>notifications/notification.service.spec.ts</code></td>
+<td>12</td>
+<td>Template lookup, idempotency, channel fan-out, rendering, delivery state machine</td>
+</tr>
+<tr>
+<td><code>platform/platform.service.spec.ts</code></td>
+<td>4</td>
+<td><code>assertSchoolCanLogin</code> tenant gate (ACTIVE, TRIAL, SUSPENDED, EXPIRED)</td>
+</tr>
+<tr>
+<td><code>platform/security.service.spec.ts</code></td>
+<td>12</td>
+<td>Force-logout (user + school), password reset, audit row safety, email best-effort</td>
+</tr>
+<tr>
+<td><code>platform/impersonation.service.spec.ts</code></td>
+<td>11</td>
+<td>All security invariants (peer, self, nesting, suspended/expired) + happy path token shape</td>
+</tr>
+<tr>
+<td><code>platform/platform-analytics.service.spec.ts</code></td>
+<td>7</td>
+<td>MRR computation, plan distribution, risk counts</td>
+</tr>
+<tr>
+<td><code>common/maintenance/maintenance-mode.guard.spec.ts</code></td>
+<td>13</td>
+<td>Read pass-through, SUPER_ADMIN bypass, platform-tier bypass, write rejection</td>
+</tr>
+<tr>
+<td><code>sessions/session.service.spec.ts</code></td>
+<td>14</td>
+<td>CRUD, throttled touch, idempotent revoke, no-leak via expectUserId, bulk revoke</td>
+</tr>
+</tbody></table>
+<p>⚠ Deferred:</p>
+<ul>
+<li>E2E tests (no <code>test/jest-e2e.json</code> setup configured)</li>
+<li>Frontend tests (no Vitest / RTL setup yet)</li>
+<li>Tests for older school-side modules (students, teachers, fees, attendance, exams) —
+shipped before the maturity push prioritized test coverage</li>
+</ul>
+<hr>
+<h2>20. Environment variables</h2>
+<pre><code class="language-bash"># Database
+DATABASE_URL=postgresql://user:pass@localhost:5432/scholaris?schema=public
+
+# Auth
+JWT_SECRET=&lt;long-random-string&gt;
+JWT_EXPIRES_IN=7d                  # default 7d
+
+# Server
+PORT=3001
+APP_URL=http://localhost:3000      # used in transactional emails for absolute links
+
+# Mail (Phase 3 maturity)
+MAIL_PROVIDER=console              # &#39;console&#39; (dev) or &#39;smtp&#39; (prod)
+MAIL_FROM=&#39;Scholaris &lt;noreply@scholaris.example&gt;&#39;
+MAIL_SMTP_HOST=smtp.example.com    # required when MAIL_PROVIDER=smtp
+MAIL_SMTP_PORT=587
+MAIL_SMTP_USER=username
+MAIL_SMTP_PASS=password
+MAIL_SMTP_SECURE=false             # &#39;true&#39; for TLS-on-connect (port 465)
+MAIL_BRAND_NAME=Scholaris
+MAIL_BRAND_SUPPORT=support@scholaris.example
+MAIL_BRAND_LOGO_URL=https://...    # optional
+MAIL_BRAND_FOOTER=&#39;Acme Building, Kathmandu&#39;  # optional
+
+# Jobs (Phase 15)
+JOBS_AUTOSTART=true                # set &#39;false&#39; in tests to disable poll loop
+
+# Frontend (Next.js)
+NEXT_PUBLIC_API_URL=http://localhost:3001
+</code></pre>
+<hr>
+<h2>21. Operational guide</h2>
+<h3>21.1. First-time setup (dev)</h3>
+<pre><code class="language-bash"># 1. Install deps
+cd backend  &amp;&amp; npm install
+cd ../frontend &amp;&amp; npm install
+
+# 2. Configure backend env
+cd ../backend
+cat &gt; .env &lt;&lt;EOF
+DATABASE_URL=&quot;postgresql://postgres:postgres@localhost:5432/scholaris?schema=public&quot;
+JWT_SECRET=&quot;$(openssl rand -hex 32)&quot;
+PORT=3001
+EOF
+
+# 3. Run migrations
+npx prisma migrate deploy
+
+# 4. Seed the platform owner
+npx ts-node prisma/seed-super-admin.ts
+# → prints initial credentials
+
+# 5. Start backend
+npm run start:dev
+
+# 6. Start frontend (in another terminal)
+cd ../frontend
+npm run dev
+</code></pre>
+<h3>21.2. Restart triggers</h3>
+<p>The Nest dev server needs a restart after:</p>
+<ul>
+<li>New Prisma migration (Prisma client may need regen too)</li>
+<li>New module added to <code>AppModule</code></li>
+<li>Changes to <code>JwtStrategy</code> / global guards</li>
+<li>Changes to schedule/cron registration</li>
+<li>Env var changes</li>
+</ul>
+<p><code>prisma generate</code> may fail with EPERM on Windows when the dev server
+holds the engine binary. Workflow:</p>
+<ol>
+<li>Stop dev server</li>
+<li><code>rm -f node_modules/.prisma/client/query_engine-windows.dll.node.tmp*</code></li>
+<li><code>npx prisma generate</code></li>
+<li>Restart server</li>
+</ol>
+<h3>21.3. Operator-tier daily routine</h3>
+<p>A SUPER_ADMIN logging into <code>/platform</code> typically:</p>
+<ol>
+<li><strong>Glance at <code>/platform/operations</code></strong> — single-page health check.
+Status banner should be green; queue depth should be 0; failed jobs
+panel should be empty.</li>
+<li><strong>Check the Notification Center bell</strong> for unread alerts.</li>
+<li><strong>Drilldowns</strong> as needed:<ul>
+<li><code>/platform/schools</code> for tenant management</li>
+<li><code>/platform/audit</code> for &quot;what just happened?&quot;</li>
+<li><code>/platform/health</code> for live error rate + login pressure</li>
+</ul>
+</li>
+</ol>
+<h3>21.4. Common operations</h3>
+<p><strong>Suspending a school:</strong></p>
+<ol>
+<li>Open <code>/platform/schools/[id]</code></li>
+<li>Click <strong>Suspend</strong> in the action bar</li>
+<li>Provide a reason (required, 3+ chars)</li>
+<li>School admin gets <code>school_suspended</code> email; their users can no longer log in</li>
+</ol>
+<p><strong>Reactivating:</strong></p>
+<ol>
+<li>Same page; status badge says &quot;Suspended&quot;</li>
+<li>Click <strong>Reactivate</strong></li>
+<li>Email goes out (<code>school_reactivated</code>); users can sign in again</li>
+</ol>
+<p><strong>Resetting a school admin&#39;s password:</strong></p>
+<ol>
+<li>Open <code>/platform/schools/[id]</code></li>
+<li>Click <strong>Security</strong> → opens dialog</li>
+<li>Click <strong>Reset password</strong> on the user row</li>
+<li>Copy the temp password from the result modal (one-time)</li>
+<li>Share OOB with the user (NOT email — the email has its own template)</li>
+<li>The user&#39;s existing sessions are invalidated; they log in with the
+temp password and should change it</li>
+</ol>
+<p><strong>Investigating a tenant&#39;s data without affecting the audit trail:</strong></p>
+<ol>
+<li>Open <code>/platform/schools/[id]</code></li>
+<li>Click <strong>Security</strong> → <strong>Sign in</strong> (impersonation picker)</li>
+<li>Pick a user; you&#39;re now seeing their dashboard</li>
+<li>Banner at top reminds you you&#39;re impersonating</li>
+<li>Click <strong>Exit impersonation</strong> when done — fresh SUPER_ADMIN token issued</li>
+</ol>
+<p><strong>Pausing writes for a tenant during a support session:</strong></p>
+<ol>
+<li>Open <code>/platform/schools/[id]</code></li>
+<li>Click <strong>Maintenance</strong> in the action bar</li>
+<li>School users see a banner; their writes return 503 with a clear message</li>
+<li>You can still write (SUPER_ADMIN bypasses)</li>
+<li>Click <strong>Resume</strong> when done</li>
+</ol>
+<hr>
+<h2>22. Known limitations &amp; deferred work</h2>
+<h3>22.1. Backend deferred</h3>
+<ul>
+<li><strong>No background queue worker tuning.</strong> Single in-process worker.
+Past ~100 jobs/sec sustained, swap <code>JobQueueService.claimNext</code> for
+BullMQ (the abstraction is in place — see <code>docs/platform/jobs.md</code>).</li>
+<li><strong>No notification archival.</strong> <code>notifications</code> table grows
+indefinitely. Future cron: move rows older than 90 days to cold
+storage.</li>
+<li><strong>No login anomaly detection.</strong> Session table now records
+IP / UA / lastActiveAt — the data exists. The detection logic
+(new IP from a user who normally signs in from one location → fire
+<code>platform.security_alert</code>) is the next step.</li>
+<li><strong>No API token management.</strong> No <code>personal_access_tokens</code> table.
+Would need scoping + token-issuance UI. Real project, not a stub.</li>
+<li><strong>No churn rate metric.</strong> The <code>/platform/analytics</code> revenue bucket
+tracks current state. Computing churn requires subscription
+state-change history (which is captured in audit rows but not yet
+aggregated).</li>
+<li><strong>No successful-login trend.</strong> We track failed logins (health buffer)
+but not successful ones. Adding <code>users.lastSeenAt</code> would unlock
+Daily Active Users + Weekly Active Users.</li>
+<li><strong>No real billing column.</strong> <code>PLAN_MONTHLY_PRICE_NPR</code> is hard-coded
+in <code>PlatformAnalyticsService</code>. When real billing lands, add
+<code>school_subscriptions.priceMonthly</code> and the analytics service drops
+the constants.</li>
+<li><strong>Maintenance mode doesn&#39;t have a &quot;scheduled&quot; mode.</strong> Toggle is
+immediate. Future: schedule maintenance for a window with auto-toggle.</li>
+<li><strong>No webhook outbox.</strong> Producers fire fire-and-forget via the queue;
+no exposed webhook for downstream consumers. Phase-future.</li>
+</ul>
+<h3>22.2. Frontend deferred</h3>
+<ul>
+<li><strong>No school-side notification inbox UI.</strong> <code>IN_APP</code> channel writes
+to the <code>notifications</code> table; the bell badge in the topbar is
+currently a placeholder. The Notification Center exists for the
+platform side only.</li>
+<li><strong>No frontend test setup.</strong> No Vitest / RTL configured.</li>
+<li><strong>Admin sessions list in SecurityDialog is wired backend-only.</strong>
+Endpoints exist (<code>/platform/users/:id/sessions</code>) but the
+SecurityDialog UI doesn&#39;t yet render the list. Operator can call
+the API directly; UI is next.</li>
+<li><strong>No bulk session revoke for admins.</strong> UI for &quot;revoke all sessions
+for user X&quot; — backend supports it via the watermark (force-logout)
+but a granular per-session list is admin-API-only.</li>
+</ul>
+<h3>22.3. Operational deferred</h3>
+<ul>
+<li><strong>No CI/CD.</strong> Manual <code>npm run test</code> + <code>tsc --noEmit</code>.</li>
+<li><strong>No E2E suite.</strong> Critical login + impersonation flows aren&#39;t tested
+end-to-end against a real Postgres.</li>
+<li><strong>No production deployment guide.</strong> Env vars are documented; the
+rest is left to the deployer (Docker, Kubernetes, Render, Fly,
+whatever).</li>
+</ul>
+<h3>22.4. Documentation deferred</h3>
+<ul>
+<li><strong>No API reference doc</strong> beyond this section. OpenAPI / Swagger
+generation is on the table.</li>
+<li><strong>No frontend component storybook.</strong> The primitives are documented
+via inline comments + this doc; a Storybook would be the next step.</li>
+</ul>
+<hr>
+<h2>23. Future scope / roadmap</h2>
+<p>Ordered roughly by ROI. Each item is sized at &quot;one focused engineer
+turn&quot; unless noted.</p>
+<h3>High-value, ready-to-build</h3>
+<ol>
+<li><strong>School-side in-app inbox UI.</strong> Render the <code>notifications</code> table
+for the logged-in user. Bell badge in topbar shows unread count.
+Backend infra is done — pure frontend work.</li>
+<li><strong>Sessions list in SecurityDialog.</strong> Render
+<code>/platform/users/:id/sessions</code> data with per-session revoke
+buttons. Mostly a UI extension.</li>
+<li><strong>Login anomaly detection.</strong> Background job scans <code>sessions</code> for
+&quot;new IP from a user who normally signs in from elsewhere&quot; → fires
+<code>platform.security_alert</code>. Template is ready.</li>
+<li><strong><code>users.lastSeenAt</code></strong> + DAU/WAU metric in analytics. Small migration<ul>
+<li>existing analytics service extension.</li>
+</ul>
+</li>
+<li><strong>Refund receipt email.</strong> Mirror of <code>payment_receipt</code>, fired from
+<code>FeesService.refund</code>. Template + producer wiring.</li>
+<li><strong>API token management.</strong> Personal access tokens for integrations.
+Migration + service + UI. Multi-turn but well-scoped.</li>
+<li><strong>Churn rate calculation.</strong> Aggregate <code>SCHOOL_STATUS_CHANGED</code> audit
+rows for SUSPENDED transitions in the last N days. Pure analytics
+work.</li>
+</ol>
+<h3>Medium-value, more design work needed</h3>
+<ol start="8">
+<li><strong>Real billing integration.</strong> <code>priceMonthly</code> column on subscriptions.
+Consider Stripe / eSewa integration + invoice generation.</li>
+<li><strong>Webhook outbox.</strong> Let downstream systems subscribe to platform
+events.</li>
+<li><strong>Scheduled maintenance windows.</strong> Toggle on/off auto-fires
+based on <code>start</code> and <code>end</code> timestamps.</li>
+<li><strong>Multi-admin notifications.</strong> Currently emails go to &quot;first
+ADMIN&quot; — multi-admin schools should fan out.</li>
+<li><strong>CSV bulk import</strong> for students / teachers (school-side).
+UI + validation + transactional import.</li>
+</ol>
+<h3>Infrastructure</h3>
+<ol start="13">
+<li><strong>CI/CD pipeline</strong> (GitHub Actions): typecheck + test on PR.</li>
+<li><strong>E2E test setup</strong> with a real Postgres.</li>
+<li><strong>Frontend test setup</strong> (Vitest + RTL).</li>
+<li><strong>OpenAPI / Swagger</strong> generation for the API.</li>
+<li><strong>Storybook</strong> for the design primitives.</li>
+<li><strong>Docker Compose</strong> for the dev environment (Postgres + backend +
+frontend in one <code>docker-compose up</code>).</li>
+<li><strong>Background queue → BullMQ migration</strong> when load demands it.</li>
+<li><strong>Notification archival cron</strong>.</li>
+</ol>
+<h3>Product expansion</h3>
+<ol start="21">
+<li><strong>SMS channel</strong> — wire Twilio / a Nepal-local SMS provider
+(Aakash, Nikatel). Template scaffold is in place.</li>
+<li><strong>WhatsApp Business</strong> channel for parents.</li>
+<li><strong>Transport / hostel modules</strong> — they&#39;re already in the feature
+catalog as &quot;coming soon.&quot;</li>
+<li><strong>Mobile apps</strong> (React Native / Flutter) reusing the existing API.</li>
+<li><strong>Public school directory</strong> + signup flow for self-serve onboarding.</li>
+</ol>
+<hr>
+<h2>24. Decision log</h2>
+<p>Key architectural choices and the reasoning behind them. Documented so
+future contributors don&#39;t accidentally undo decisions made deliberately.</p>
+<h3>Why two completely separate UI surfaces (school + platform)?</h3>
+<p>Different audiences (school admins vs platform owners), different data
+scopes (single tenant vs cross-tenant), different visual languages
+(welcoming vs operational), different security postures. Sharing
+components would invite accidental privilege escalation (e.g., a
+component that doesn&#39;t filter by <code>schoolId</code> because the platform side
+doesn&#39;t need to).</p>
+<h3>Why <code>SUPER_ADMIN</code> as a Role enum value (not a separate table)?</h3>
+<p>Symmetric with other roles. A SUPER_ADMIN still has a User row, an
+email, can authenticate the same way. Putting them in a separate
+table would duplicate the auth machinery. The trade-off: SUPER_ADMINs
+are technically &quot;at&quot; some school (FK requirement), but that schoolId
+is irrelevant to platform routes. Documented in the Role enum.</p>
+<h3>Why append-only subscriptions (no edit endpoint)?</h3>
+<p>Audit trail naturally reflects lifecycle without a versioning column.
+A future &quot;what plan did this school have on date X?&quot; query is a range
+query. A future PDF receipt generator can reconstruct any historical
+period. The cost: the UI has to be careful that &quot;edit&quot; actually means
+&quot;create a new period that supersedes.&quot;</p>
+<h3>Why DB-backed background queue (not Redis)?</h3>
+<p>Two reasons: (1) Postgres is already in the stack — no new infra at
+v1&#39;s volume; (2) the <code>jobs</code> table is operator-visible (<code>SELECT * FROM jobs WHERE status=&#39;FAILED&#39;</code> beats grepping logs). When we hit
+~100 jobs/sec sustained, swap <code>JobQueueService.claimNext</code> for BullMQ
+— the <code>JobHandler</code> interface stays the same.</p>
+<h3>Why hard-coded plan prices in code (not DB)?</h3>
+<p>V1 doesn&#39;t have real billing. Hard-coding <code>PLAN_MONTHLY_PRICE_NPR</code>
+makes MRR computation work today without a column-change migration.
+When real billing lands, add <code>priceMonthly</code> to <code>school_subscriptions</code>
+and remove the constants.</p>
+<h3>Why <code>tokensValidAfter</code> watermark instead of revocation table?</h3>
+<p>Two needs:</p>
+<ul>
+<li>&quot;Kill ALL of a user&#39;s tokens&quot; → watermark is constant-cost (one
+column, no growth). Phase 9.</li>
+<li>&quot;Kill THAT one token&quot; → sessions table (Phase 17).</li>
+</ul>
+<p>Both coexist; the strategy honors both. A pure revocation list would
+grow unbounded without periodic cleanup.</p>
+<h3>Why <code>SessionService.touch</code> throttles to 1/min?</h3>
+<p>Without it, EVERY authenticated request would write to the <code>sessions</code>
+table. Write amplification on what should be a cheap read path. The
+throttle caps at one update per minute per session — operator-visible
+&quot;last active&quot; stays current enough to be useful (within ~1 min).</p>
+<h3>Why JWT-only (no refresh tokens)?</h3>
+<p>Simpler. The session table already gives us per-session revoke + admin
+control. Refresh tokens add complexity (rotation, secure storage,
+re-issuance) for marginal benefit at this scale. Could revisit if
+tokens need to be shorter-lived than 7d.</p>
+<h3>Why no separate audit table per phase?</h3>
+<p>A single <code>platform_audit_events</code> table with a polymorphic
+<code>(targetType, targetId)</code> + JSON <code>before/after</code> was a deliberate choice.
+Adding a new audit-able action is one new enum value + one
+<code>PlatformAuditService.record()</code> call site — never a new table. The
+trade-off: the table mixes heterogeneous shapes; queries that want a
+specific action&#39;s data have to JSON-extract.</p>
+<h3>Why feature flags resolved live (not cached)?</h3>
+<p>Resolution is one indexed lookup. Caching would add invalidation
+complexity (when an override changes, which servers&#39; caches need
+flushing?). A future Phase that adds Redis + horizontal scaling can
+add a TTL-based cache; until then, fresh reads are correct.</p>
+<h3>Why is <code>FeaturesProvider</code> mounted in the dashboard layout (not _app)?</h3>
+<p>The login page doesn&#39;t need feature flags — those routes live outside
+the <code>(dashboard)</code> route group. Mounting at the dashboard layout level
+keeps the fetch tied to authenticated traffic only.</p>
+<h3>Why does impersonation NOT carry a special audit role?</h3>
+<p>Domain audit columns (<code>createdById</code> on payments etc.) get the TARGET
+user. Reasoning: impersonation is for &quot;reproduce what the school admin
+sees + does&quot;; backdating writes to the SUPER_ADMIN would make the
+school&#39;s own audit trail incoherent. The platform-side
+<code>IMPERSONATION_STARTED</code> / <code>IMPERSONATION_ENDED</code> rows bracket every
+write, so the combined story is complete.</p>
+<h3>Why is the global <code>MaintenanceModeGuard</code> a guard (not middleware)?</h3>
+<p>Guards run AFTER <code>JwtAuthGuard</code> so <code>req.user</code> is populated. A middleware
+would have to either re-decode the JWT or duplicate the tenant lookup.</p>
+<h3>Why custom <code>UserAwareThrottlerGuard</code>?</h3>
+<p>Default <code>ThrottlerGuard</code> keys by IP. In production a school behind one
+NAT shares ONE bucket across every teacher&#39;s laptop — one busy user
+starves others. Custom subclass keys by <code>req.user.id</code> for
+authenticated requests. Auth/register stays IP-keyed (no identity yet).</p>
+<hr>
+<h2>Appendix A — How to use this document</h2>
+<p>This doc is meant to be <strong>navigated</strong>, not read top-to-bottom. The
+table of contents is the entry point.</p>
+<ul>
+<li><strong>Onboarding a new engineer</strong>: §3 (principles), §6 (auth), §10
+(modules), §21 (ops).</li>
+<li><strong>Adding a feature flag</strong>: §15. Read the catalog file, add an entry,
+decorate a controller with <code>@RequireFeature(...)</code>, hide the
+sidebar entry on the frontend.</li>
+<li><strong>Adding a new email template</strong>: §13.4. Drop a template file,
+register, call <code>notifications.enqueue</code> from your producer.</li>
+<li><strong>Adding an audit-able action</strong>: §17.1. Add an enum value to
+<code>PlatformAuditAction</code>, generate a migration with <code>ADD VALUE</code>,
+emit via <code>PlatformAuditService.record({action: &#39;YOUR_NEW_ACTION&#39;, ...})</code>.</li>
+<li><strong>Investigating a bug</strong>: §22 first (might be a known limitation),
+then <code>docs/platform/architecture.md</code> for &quot;where to look when X breaks.&quot;</li>
+<li><strong>Planning the next phase</strong>: §23.</li>
+</ul>
+<p>Keep this doc updated. Every new phase / migration / model / route
+should add an entry here. The cost of stale documentation is
+much higher than the cost of keeping it current.</p>
+<hr>
+<h2>Appendix B — File metrics snapshot</h2>
+<p>As of last update:</p>
+<ul>
+<li><strong>41 migrations</strong> (11 school-side + 6 platform layer + 5 maturity = 22 since
+pre-platform; the rest predate)</li>
+<li><strong>12 test suites, 135 tests</strong> all passing</li>
+<li><strong>Backend modules:</strong> ~25 feature/cross-cutting modules</li>
+<li><strong>Frontend pages:</strong> ~40 distinct routes across two surfaces</li>
+<li><strong>Email templates:</strong> 9 production-ready</li>
+<li><strong>Background job handlers:</strong> 2 (<code>notification.send_delivery</code>,
+<code>platform.subscription_expiring_notice</code>)</li>
+<li><strong>Documentation files:</strong> 5 (this + 4 in <code>docs/platform/</code>)</li>
+</ul>
+<hr>
+<p><em>Last updated: this doc tracks the platform state as of the last
+&quot;continue&quot; iteration. When you ship the next phase, append to §9 (or
+add §10) and update §22/§23.</em></p>

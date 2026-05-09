@@ -7,9 +7,13 @@ import {
 import { JwtService } from '@nestjs/jwt';
 import { Role, School, User } from '@prisma/client';
 import { randomBytes } from 'crypto';
+import { ConfigService } from '@nestjs/config';
 import { HashingService } from '../common/hashing/hashing.service';
 import { PrismaService } from '../database/prisma.service';
+import { HealthService } from '../health/health.service';
+import { NotificationService } from '../notifications/notification.service';
 import { PlatformService } from '../platform/platform.service';
+import { SessionService } from '../sessions/session.service';
 import { LoginDto } from './dto/login.dto';
 import { RegisterAdminDto } from './dto/register-admin.dto';
 import type { JwtPayload } from './types/jwt-payload';
@@ -60,14 +64,25 @@ export class AuthService {
     private readonly prisma: PrismaService,
     private readonly hashing: HashingService,
     private readonly jwt: JwtService,
+    private readonly health: HealthService,
+    private readonly notifications: NotificationService,
+    private readonly config: ConfigService,
+    private readonly sessions: SessionService,
   ) {}
 
   /**
    * Provision a new tenant (School) together with its first ADMIN user.
    * Runs inside a transaction so a partial school/user state is impossible.
    * Auto-issues a JWT so the client can sign the admin in immediately.
+   *
+   * `ip` / `userAgent` are snapshotted onto the new session row so
+   * the user's first session shows up in their session list with
+   * the right origin info.
    */
-  async registerAdmin(dto: RegisterAdminDto): Promise<RegisterAdminResult> {
+  async registerAdmin(
+    dto: RegisterAdminDto,
+    ctx: { ip?: string | null; userAgent?: string | null } = {},
+  ): Promise<RegisterAdminResult> {
     const { email, password, schoolName } = dto;
 
     await this.assertEmailAvailable(email);
@@ -92,10 +107,32 @@ export class AuthService {
       return { school, user };
     });
 
+    // Phase 3 (maturity) — welcome email to the new school admin.
+    // Best-effort: a delivery failure does NOT roll back the
+    // registration. Dedupe by user id so a network retry on the
+    // same registration won't send twice.
+    try {
+      await this.notifications.enqueue({
+        templateKey: 'platform.school_created',
+        recipients: { email: user.email },
+        dedupeKey: `user:${user.id}:welcome`,
+        schoolId: school.id,
+        userId: user.id,
+        payload: {
+          brand: this.config.get('mail.brand'),
+          schoolName: school.name,
+          adminEmail: user.email,
+          loginUrl: `${this.config.get('appUrl')}/login`,
+        },
+      });
+    } catch {
+      /* swallow — registration must succeed regardless of email */
+    }
+
     return {
       school,
       user: this.stripPassword(user),
-      accessToken: this.issueToken(user),
+      accessToken: await this.issueToken(user, ctx),
       // A freshly-registered ADMIN never has a teacher record.
       teacher: null,
     };
@@ -105,8 +142,23 @@ export class AuthService {
    * Validate email + password and issue a JWT.
    * Uses a single generic error message for both "email not found" and
    * "wrong password" to avoid leaking whether an account exists.
+   *
+   * Phase 10 — login failures are recorded into the in-memory health
+   * ring buffer with the source IP, so the platform health dashboard
+   * can surface brute-force / credential-stuffing patterns. The
+   * record never carries a password (or anything other than email +
+   * IP); audit-grade detail lives in server logs.
+   *
+   * Phase 17 follow-up — every successful login creates a Session
+   * row with the source IP + user-agent snapshot. The JWT carries
+   * the session's id as `sid`; the strategy rejects tokens whose
+   * session has been revoked.
    */
-  async login(dto: LoginDto): Promise<AuthResult> {
+  async login(
+    dto: LoginDto,
+    ip: string | null = null,
+    userAgent: string | null = null,
+  ): Promise<AuthResult> {
     const user = await this.prisma.user.findUnique({
       where: { email: dto.email },
       include: { school: true },
@@ -116,6 +168,11 @@ export class AuthService {
       !!user && (await this.hashing.compare(dto.password, user.password));
 
     if (!user || !passwordOk) {
+      this.health.recordLoginFailure({
+        email: dto.email,
+        ip,
+        reason: 'invalid_credentials',
+      });
       throw new UnauthorizedException('Invalid email or password.');
     }
 
@@ -128,7 +185,16 @@ export class AuthService {
     // owns the only path that flips a school to either status, so
     // this enforcement is the corresponding read-side check.
     if (user.role !== Role.SUPER_ADMIN) {
-      PlatformService.assertSchoolCanLogin(school.status);
+      try {
+        PlatformService.assertSchoolCanLogin(school.status);
+      } catch (err) {
+        this.health.recordLoginFailure({
+          email: dto.email,
+          ip,
+          reason: 'school_blocked',
+        });
+        throw err;
+      }
     }
 
     // For TEACHER users, derive the landing context from
@@ -169,16 +235,30 @@ export class AuthService {
     return {
       user: this.stripPassword(userWithoutSchool),
       school,
-      accessToken: this.issueToken(user),
+      accessToken: await this.issueToken(user, { ip, userAgent }),
       teacher,
     };
   }
 
-  private issueToken(user: Pick<User, 'id' | 'role' | 'schoolId'>): string {
+  /**
+   * Mint a JWT for a user and back it with a fresh Session row.
+   * The session's id is encoded into the token's `sid` claim so the
+   * strategy can look it up + reject if revoked.
+   */
+  private async issueToken(
+    user: Pick<User, 'id' | 'role' | 'schoolId'>,
+    ctx: { ip?: string | null; userAgent?: string | null } = {},
+  ): Promise<string> {
+    const session = await this.sessions.create({
+      userId: user.id,
+      ip: ctx.ip ?? null,
+      userAgent: ctx.userAgent ?? null,
+    });
     const payload: JwtPayload = {
       userId: user.id,
       role: user.role,
       schoolId: user.schoolId,
+      sid: session.id,
     };
     return this.jwt.sign(payload);
   }

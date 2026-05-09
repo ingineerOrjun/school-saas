@@ -1,9 +1,16 @@
 import { Module } from '@nestjs/common';
 import { ConfigModule } from '@nestjs/config';
-import { APP_GUARD } from '@nestjs/core';
+import { APP_FILTER, APP_GUARD } from '@nestjs/core';
 import { ServeStaticModule } from '@nestjs/serve-static';
-import { ThrottlerGuard, ThrottlerModule } from '@nestjs/throttler';
+import { ThrottlerModule } from '@nestjs/throttler';
 import { join } from 'node:path';
+import { AllExceptionsFilter } from './common/filters/http-exception.filter';
+import { JobsModule } from './common/jobs/jobs.module';
+import { MaintenanceModeGuard } from './common/maintenance/maintenance-mode.guard';
+import { UserAwareThrottlerGuard } from './common/throttle/user-aware-throttler.guard';
+import { HealthModule } from './health/health.module';
+import { NotificationsModule } from './notifications/notifications.module';
+import { SessionsModule } from './sessions/sessions.module';
 import { AcademicSessionModule } from './academic-session/academic-session.module';
 import { AnnouncementModule } from './announcement/announcement.module';
 import { AuthModule } from './auth/auth.module';
@@ -46,17 +53,30 @@ import { UserModule } from './user/user.module';
         index: false,
       },
     }),
-    // Phase 9 — global rate limiter. The default bucket is generous
-    // (60/min) so it never blocks normal app traffic; sensitive
-    // endpoints (login + register) declare their own tighter
-    // buckets via @Throttle() in their controllers. Registered
-    // globally via APP_GUARD below so the limit applies even to
-    // routes that don't opt into UseGuards.
+    // Phase 9 — global rate limiter.
+    //
+    // Buckets:
+    //   • default — wide safety net (600/min). Keyed PER-USER for
+    //     authenticated requests (see UserAwareThrottlerGuard) and
+    //     per-IP for the unauthenticated tail. Each logged-in user
+    //     gets their own quota, so a busy dashboard tab can't burn
+    //     another user's allowance even when both share an IP.
+    //   • auth    — login bucket. 10/min. Keyed per-IP (the user
+    //     isn't authenticated yet by definition).
+    //   • register — tenant-creation bucket. 5/hour per-IP.
+    //
+    // Why 600/min on the default:
+    //   Authenticated dashboards fan out hard. A single page load
+    //   triggers 5-10 reads, React StrictMode double-fires in dev,
+    //   polled endpoints (/platform/health, /me/features, /dashboard/*)
+    //   add a steady baseline, and the operator may have multiple
+    //   tabs open during incident response. 600/min/user is comfortably
+    //   above legitimate usage and still catches a runaway client.
     ThrottlerModule.forRoot([
       {
         name: 'default',
         ttl: 60_000, // 60s
-        limit: 60,
+        limit: 600,
       },
       {
         name: 'auth',
@@ -98,6 +118,24 @@ import { UserModule } from './user/user.module';
     // PlatformModule because it depends on PlatformAuditService for
     // FEATURE_FLAG_CHANGED audit rows.
     FeatureFlagsModule,
+    // Health — Phase 10. @Global() so the global exception filter,
+    // AuthService, and PlatformController can all inject
+    // HealthService without explicit imports. Holds in-memory
+    // ring buffers + the DB probe.
+    HealthModule,
+    // Notifications — maturity Phase 2/3. @Global() so any feature
+    // service (security, subscription, auth) can call
+    // NotificationService.enqueue without an explicit import. Owns
+    // the channel + email-provider DI.
+    NotificationsModule,
+    // Jobs — Phase 15. @Global() so any module can schedule async
+    // work via JobQueueService.enqueue and register handlers at
+    // boot. Boots the in-process runner (poll loop) at app start.
+    JobsModule,
+    // Sessions — Phase 17 follow-up. @Global() so AuthService /
+    // JwtStrategy can inject SessionService for per-token tracking
+    // (login creates, strategy looks up + touches, logout revokes).
+    SessionsModule,
     // Future feature modules will be added here
   ],
   controllers: [],
@@ -106,9 +144,30 @@ import { UserModule } from './user/user.module';
     // ThrottlerModule bucket to every route. Sensitive endpoints
     // can override with @Throttle({ <named-bucket>: { ... } }) to
     // pull from a tighter bucket — see auth.controller.ts.
+    //
+    // Custom UserAwareThrottlerGuard (not the stock ThrottlerGuard)
+    // keys buckets by user id when req.user is set, so dashboard
+    // fan-out from one logged-in user doesn't burn quota shared
+    // with everyone else on the same IP.
     {
       provide: APP_GUARD,
-      useClass: ThrottlerGuard,
+      useClass: UserAwareThrottlerGuard,
+    },
+    // Phase 10 — register the global exception filter via DI so it
+    // can inject HealthService. main.ts no longer instantiates it
+    // manually — the APP_FILTER token is the framework-supported
+    // path for getting DI into a global filter.
+    {
+      provide: APP_FILTER,
+      useClass: AllExceptionsFilter,
+    },
+    // Phase 17 — global maintenance-mode guard. Runs after the
+    // throttler; rejects mutating requests for tenants whose
+    // maintenanceMode flag is on. SUPER_ADMINs and platform-tier
+    // routes bypass; reads always pass through.
+    {
+      provide: APP_GUARD,
+      useClass: MaintenanceModeGuard,
     },
   ],
 })

@@ -1,0 +1,247 @@
+/* PDF stylesheet for PROJECT.md
+ *
+ * Optimised for print: serif body, monospace code, no decorative
+ * effects. Page breaks before each <h1> so sections start on a
+ * fresh page.
+ */
+
+@page {
+  size: A4;
+  margin: 14mm 14mm 16mm 14mm;
+  @bottom-right {
+    content: "Page " counter(page) " of " counter(pages);
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif;
+    font-size: 9pt;
+    color: #6b7280;
+  }
+  @bottom-left {
+    content: "Scholaris — Project Documentation";
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif;
+    font-size: 9pt;
+    color: #6b7280;
+  }
+}
+
+* { box-sizing: border-box; }
+
+html { -webkit-print-color-adjust: exact; print-color-adjust: exact; }
+
+body {
+  font-family: "Segoe UI", -apple-system, BlinkMacSystemFont, Helvetica, Arial, sans-serif;
+  font-size: 10.5pt;
+  line-height: 1.55;
+  color: #0f172a;
+  margin: 0;
+  padding: 0;
+  max-width: 100%;
+}
+
+/* --------------------------------------------------------------------- */
+/* Headings                                                              */
+/* --------------------------------------------------------------------- */
+
+h1, h2, h3, h4, h5, h6 {
+  font-weight: 600;
+  letter-spacing: -0.01em;
+  page-break-after: avoid;
+  break-after: avoid;
+}
+
+h1 {
+  font-size: 22pt;
+  margin: 0 0 12pt 0;
+  padding-bottom: 8pt;
+  border-bottom: 2px solid #0f172a;
+  page-break-before: always;
+  break-before: page;
+}
+h1:first-of-type { page-break-before: auto; break-before: auto; }
+
+h2 {
+  font-size: 16pt;
+  margin: 22pt 0 10pt 0;
+  padding-bottom: 4pt;
+  border-bottom: 1px solid #e2e8f0;
+}
+
+h3 {
+  font-size: 13pt;
+  margin: 18pt 0 8pt 0;
+  color: #1e293b;
+}
+
+h4 {
+  font-size: 11.5pt;
+  margin: 14pt 0 6pt 0;
+  color: #334155;
+}
+
+h5, h6 {
+  font-size: 10.5pt;
+  margin: 12pt 0 4pt 0;
+  color: #334155;
+}
+
+/* --------------------------------------------------------------------- */
+/* Paragraphs / inline                                                    */
+/* --------------------------------------------------------------------- */
+
+p {
+  margin: 0 0 8pt 0;
+  orphans: 3;
+  widows: 3;
+}
+
+a {
+  color: #1e293b;
+  text-decoration: underline;
+  text-decoration-color: #94a3b8;
+}
+
+strong { font-weight: 600; color: #0f172a; }
+em { font-style: italic; color: #334155; }
+
+/* --------------------------------------------------------------------- */
+/* Lists                                                                  */
+/* --------------------------------------------------------------------- */
+
+ul, ol {
+  margin: 0 0 10pt 0;
+  padding-left: 22pt;
+}
+
+li {
+  margin: 0 0 4pt 0;
+  page-break-inside: avoid;
+  break-inside: avoid;
+}
+
+li > p { margin: 0 0 4pt 0; }
+li > ul, li > ol { margin-top: 4pt; margin-bottom: 4pt; }
+
+/* --------------------------------------------------------------------- */
+/* Code                                                                   */
+/* --------------------------------------------------------------------- */
+
+code {
+  font-family: "Consolas", "Menlo", "Monaco", "Courier New", monospace;
+  font-size: 9pt;
+  background: #f1f5f9;
+  padding: 1pt 4pt;
+  border-radius: 3pt;
+  color: #0f172a;
+}
+
+pre {
+  font-family: "Consolas", "Menlo", "Monaco", "Courier New", monospace;
+  font-size: 8.5pt;
+  line-height: 1.45;
+  background: #f8fafc;
+  border: 1px solid #e2e8f0;
+  border-left: 3px solid #475569;
+  border-radius: 4pt;
+  padding: 8pt 10pt;
+  margin: 0 0 10pt 0;
+  overflow-x: hidden;
+  white-space: pre-wrap;
+  word-wrap: break-word;
+  page-break-inside: avoid;
+  break-inside: avoid;
+}
+
+pre code {
+  background: transparent;
+  padding: 0;
+  border-radius: 0;
+  font-size: 8.5pt;
+}
+
+/* --------------------------------------------------------------------- */
+/* Blockquotes                                                            */
+/* --------------------------------------------------------------------- */
+
+blockquote {
+  margin: 0 0 12pt 0;
+  padding: 8pt 12pt;
+  border-left: 3px solid #cbd5e1;
+  background: #f8fafc;
+  color: #334155;
+  font-style: italic;
+}
+
+blockquote p { margin: 0 0 6pt 0; }
+blockquote p:last-child { margin-bottom: 0; }
+
+/* --------------------------------------------------------------------- */
+/* Tables                                                                 */
+/* --------------------------------------------------------------------- */
+
+table {
+  border-collapse: collapse;
+  width: 100%;
+  margin: 0 0 12pt 0;
+  font-size: 9.5pt;
+  page-break-inside: auto;
+}
+
+thead {
+  display: table-header-group;
+}
+
+tr { page-break-inside: avoid; break-inside: avoid; }
+
+th, td {
+  border: 1px solid #e2e8f0;
+  padding: 5pt 8pt;
+  text-align: left;
+  vertical-align: top;
+}
+
+th {
+  background: #f1f5f9;
+  font-weight: 600;
+  color: #0f172a;
+}
+
+/* --------------------------------------------------------------------- */
+/* HR                                                                     */
+/* --------------------------------------------------------------------- */
+
+hr {
+  border: 0;
+  border-top: 1px solid #cbd5e1;
+  margin: 16pt 0;
+}
+
+/* --------------------------------------------------------------------- */
+/* Cover                                                                  */
+/* --------------------------------------------------------------------- */
+
+.cover {
+  page-break-after: always;
+  break-after: page;
+  text-align: center;
+  padding-top: 60pt;
+}
+
+.cover h1 {
+  font-size: 32pt;
+  border: 0;
+  margin: 40pt 0 8pt 0;
+  page-break-before: auto;
+  break-before: auto;
+}
+
+.cover .subtitle {
+  font-size: 14pt;
+  color: #64748b;
+  margin-bottom: 30pt;
+}
+
+.cover .meta {
+  font-size: 10pt;
+  color: #475569;
+  margin-top: 80pt;
+}
+
+.cover .meta div { margin: 4pt 0; }

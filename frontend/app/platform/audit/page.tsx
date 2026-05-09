@@ -3,9 +3,7 @@
 import * as React from "react";
 import Link from "next/link";
 import {
-  Search,
   ShieldAlert,
-  AlertTriangle,
   RotateCw,
   Pause,
   Play,
@@ -20,6 +18,14 @@ import {
   type PlatformAuditRow,
   type SchoolStatus,
 } from "@/lib/platform";
+import {
+  FilterToolbar,
+  PageHeader,
+  PanelEmptyState,
+  PanelErrorState,
+  SectionCard,
+  SkeletonRows,
+} from "@/components/platform-ui";
 
 // ---------------------------------------------------------------------------
 // /platform/audit — searchable, filterable platform audit log.
@@ -47,6 +53,7 @@ const SEARCH_DEBOUNCE_MS = 300;
 const ACTION_OPTIONS: Array<{ key: PlatformAuditAction | ""; label: string }> = [
   { key: "", label: "All actions" },
   { key: "SCHOOL_STATUS_CHANGED", label: "School status changed" },
+  { key: "SCHOOL_MAINTENANCE_TOGGLED", label: "Maintenance toggled" },
   { key: "SUBSCRIPTION_CREATED", label: "Subscription created" },
   { key: "FEATURE_FLAG_CHANGED", label: "Feature flags changed" },
   { key: "IMPERSONATION_STARTED", label: "Impersonation started" },
@@ -103,89 +110,83 @@ export default function PlatformAuditPage() {
 
   const hasFilters = !!debouncedSearch || !!action || !!fromDate || !!toDate;
 
-  return (
-    <div className="space-y-6">
-      <header className="flex flex-wrap items-end justify-between gap-3">
-        <div>
-          <h1 className="text-2xl font-semibold tracking-tight text-slate-900">
-            Audit log
-          </h1>
-          <p className="mt-1 text-sm text-slate-600">
-            Every platform-level write — who did what, when, and why.
-          </p>
-        </div>
-        <button
-          type="button"
-          onClick={fetchData}
-          disabled={loading}
-          className="inline-flex h-9 items-center gap-1.5 rounded-md border border-slate-200 bg-white px-3 text-sm font-medium text-slate-700 hover:bg-slate-50 transition-colors disabled:opacity-50"
-        >
-          <RotateCw className="h-3.5 w-3.5" />
-          Refresh
-        </button>
-      </header>
+  // Build the active-filter chips for the toolbar.
+  const activeFilters = [
+    action && {
+      label: `Action: ${ACTION_OPTIONS.find((o) => o.key === action)?.label ?? action}`,
+      onClear: () => setAction(""),
+    },
+    fromDate && {
+      label: `From: ${fromDate}`,
+      onClear: () => setFromDate(""),
+    },
+    toDate && { label: `To: ${toDate}`, onClear: () => setToDate("") },
+  ].filter(Boolean) as { label: string; onClear: () => void }[];
 
-      {/* Filter strip */}
-      <div className="rounded-xl border border-slate-200 bg-white p-3">
-        <div className="grid grid-cols-1 gap-2 md:grid-cols-[2fr_1fr_1fr_1fr]">
-          <div className="relative">
-            <Search className="pointer-events-none absolute left-2.5 top-1/2 h-4 w-4 -translate-y-1/2 text-slate-400" />
-            <input
-              type="text"
-              value={search}
-              onChange={(e) => setSearch(e.target.value)}
-              placeholder="Search actor email, target, or reason…"
-              className="h-9 w-full rounded-md border border-slate-200 bg-white pl-8 pr-3 text-sm focus:outline-none focus:ring-2 focus:ring-slate-300 focus:border-slate-400"
-            />
-          </div>
-          <select
-            value={action}
-            onChange={(e) =>
-              setAction(e.target.value as PlatformAuditAction | "")
-            }
-            className="h-9 rounded-md border border-slate-200 bg-white px-2.5 text-sm focus:outline-none focus:ring-2 focus:ring-slate-300 focus:border-slate-400"
-          >
-            {ACTION_OPTIONS.map((o) => (
-              <option key={o.key || "all"} value={o.key}>
-                {o.label}
-              </option>
-            ))}
-          </select>
-          <input
-            type="date"
-            value={fromDate}
-            onChange={(e) => setFromDate(e.target.value)}
-            max={toDate || undefined}
-            placeholder="From"
-            className="h-9 rounded-md border border-slate-200 bg-white px-2.5 text-sm focus:outline-none focus:ring-2 focus:ring-slate-300 focus:border-slate-400"
-            aria-label="From date"
-          />
-          <input
-            type="date"
-            value={toDate}
-            onChange={(e) => setToDate(e.target.value)}
-            min={fromDate || undefined}
-            placeholder="To"
-            className="h-9 rounded-md border border-slate-200 bg-white px-2.5 text-sm focus:outline-none focus:ring-2 focus:ring-slate-300 focus:border-slate-400"
-            aria-label="To date"
-          />
-        </div>
-        {hasFilters && (
+  return (
+    <div className="space-y-5">
+      <PageHeader
+        title="Audit log"
+        description="Every platform-level write — who did what, when, and why."
+        icon={<ShieldAlert className="h-4 w-4" />}
+        actions={
           <button
             type="button"
-            onClick={() => {
-              setSearch("");
-              setAction("");
-              setFromDate("");
-              setToDate("");
-            }}
-            className="mt-3 inline-flex items-center gap-1 text-xs font-medium text-slate-500 hover:text-slate-900"
+            onClick={fetchData}
+            disabled={loading}
+            className="inline-flex h-9 items-center gap-1.5 rounded-md border border-slate-200 bg-white px-3 text-sm font-medium text-slate-700 hover:bg-slate-50 disabled:opacity-50"
           >
-            <X className="h-3.5 w-3.5" />
-            Clear filters
+            <RotateCw className="h-3.5 w-3.5" />
+            Refresh
           </button>
-        )}
-      </div>
+        }
+      />
+
+      <FilterToolbar
+        search={search}
+        onSearchChange={setSearch}
+        searchPlaceholder="Search actor email, target, or reason…"
+        activeFilters={activeFilters}
+        onClearAll={
+          hasFilters
+            ? () => {
+                setAction("");
+                setFromDate("");
+                setToDate("");
+              }
+            : undefined
+        }
+      >
+        <select
+          value={action}
+          onChange={(e) =>
+            setAction(e.target.value as PlatformAuditAction | "")
+          }
+          className="h-8 rounded-md border border-slate-200 bg-white px-2 text-xs focus:outline-none focus:ring-2 focus:ring-slate-300 focus:border-slate-400"
+        >
+          {ACTION_OPTIONS.map((o) => (
+            <option key={o.key || "all"} value={o.key}>
+              {o.label}
+            </option>
+          ))}
+        </select>
+        <input
+          type="date"
+          value={fromDate}
+          onChange={(e) => setFromDate(e.target.value)}
+          max={toDate || undefined}
+          className="h-8 rounded-md border border-slate-200 bg-white px-2 text-xs focus:outline-none focus:ring-2 focus:ring-slate-300 focus:border-slate-400"
+          aria-label="From date"
+        />
+        <input
+          type="date"
+          value={toDate}
+          onChange={(e) => setToDate(e.target.value)}
+          min={fromDate || undefined}
+          className="h-8 rounded-md border border-slate-200 bg-white px-2 text-xs focus:outline-none focus:ring-2 focus:ring-slate-300 focus:border-slate-400"
+          aria-label="To date"
+        />
+      </FilterToolbar>
 
       {/* Result count */}
       {data && !loading && (
@@ -198,11 +199,23 @@ export default function PlatformAuditPage() {
 
       {/* Table / state */}
       {loading ? (
-        <AuditTableSkeleton />
+        <SectionCard bare>
+          <SkeletonRows rows={6} />
+        </SectionCard>
       ) : error ? (
-        <ErrorBanner message={error} />
+        <PanelErrorState message={error} onRetry={fetchData} />
       ) : !data || data.rows.length === 0 ? (
-        <EmptyState filtered={hasFilters} />
+        <SectionCard bare>
+          <PanelEmptyState
+            icon={<ShieldAlert className="h-4 w-4" />}
+            title={
+              hasFilters ? "No events match these filters" : "No events recorded yet"
+            }
+            description={
+              hasFilters ? "Try widening the search or date range." : undefined
+            }
+          />
+        </SectionCard>
       ) : (
         <>
           <AuditTable rows={data.rows} onSelect={setSelected} />
@@ -355,6 +368,17 @@ function ChangeSummary({ row }: { row: PlatformAuditRow }) {
             ? `until ${new Date(endDate).toLocaleDateString(undefined, { month: "short", day: "numeric", year: "numeric" })}`
             : "no expiry"}
         </span>
+      </span>
+    );
+  }
+  if (row.action === "SCHOOL_MAINTENANCE_TOGGLED") {
+    const before = (row.before as { maintenanceMode?: boolean } | null)
+      ?.maintenanceMode;
+    const after = (row.after as { maintenanceMode?: boolean } | null)
+      ?.maintenanceMode;
+    return (
+      <span className="inline-flex items-center gap-1 text-xs text-slate-700">
+        {before === true ? "ON" : "OFF"} → {after === true ? "ON" : "OFF"}
       </span>
     );
   }
@@ -541,6 +565,14 @@ function ActionChip({ action }: { action: PlatformAuditAction }) {
       <span className="inline-flex items-center gap-1 rounded-md bg-violet-100 px-1.5 py-0.5 text-[10px] font-semibold uppercase tracking-wider text-violet-800">
         <ShieldAlert className="h-2.5 w-2.5" />
         Features
+      </span>
+    );
+  }
+  if (action === "SCHOOL_MAINTENANCE_TOGGLED") {
+    return (
+      <span className="inline-flex items-center gap-1 rounded-md bg-amber-100 px-1.5 py-0.5 text-[10px] font-semibold uppercase tracking-wider text-amber-800">
+        <ShieldAlert className="h-2.5 w-2.5" />
+        Maintenance
       </span>
     );
   }
@@ -772,47 +804,8 @@ function Pagination({
   );
 }
 
-function AuditTableSkeleton() {
-  return (
-    <div className="space-y-2">
-      {Array.from({ length: 6 }).map((_, i) => (
-        <div
-          key={i}
-          className="h-12 animate-pulse rounded-xl border border-slate-200 bg-slate-50"
-        />
-      ))}
-    </div>
-  );
-}
-
-function EmptyState({ filtered }: { filtered: boolean }) {
-  return (
-    <div className="rounded-xl border border-dashed border-slate-200 bg-white p-12 text-center">
-      <div className="mx-auto flex h-12 w-12 items-center justify-center rounded-full bg-slate-100">
-        <ShieldAlert className="h-6 w-6 text-slate-500" />
-      </div>
-      <h3 className="mt-3 text-base font-semibold text-slate-900">
-        {filtered ? "No events match these filters." : "No audit events yet."}
-      </h3>
-      {!filtered && (
-        <p className="mt-1 text-sm text-slate-500">
-          Platform actions appear here as they happen.
-        </p>
-      )}
-    </div>
-  );
-}
-
-function ErrorBanner({ message }: { message: string }) {
-  return (
-    <div className="rounded-md border border-red-200 bg-red-50 p-4 text-sm text-red-800">
-      <div className="flex items-center gap-2 font-medium">
-        <AlertTriangle className="h-4 w-4" />
-        {message}
-      </div>
-    </div>
-  );
-}
+// (Skeleton/Empty/Error states moved to @/components/platform-ui —
+//  SkeletonRows / PanelEmptyState / PanelErrorState.)
 
 // ---------------------------------------------------------------------------
 

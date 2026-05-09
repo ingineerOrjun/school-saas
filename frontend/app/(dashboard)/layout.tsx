@@ -6,8 +6,10 @@ import { Sparkles } from "lucide-react";
 import { Sidebar } from "@/components/layout/Sidebar";
 import { Topbar } from "@/components/layout/Topbar";
 import { ImpersonationBanner } from "@/components/impersonation/ImpersonationBanner";
+import { MaintenanceBanner } from "@/components/maintenance/MaintenanceBanner";
 import { getStoredUser, getToken } from "@/lib/auth";
 import { FeaturesProvider } from "@/lib/features";
+import { NotificationsProvider } from "@/lib/notifications";
 
 const TOKEN_KEY = "scholaris:token";
 const USER_KEY = "scholaris:user";
@@ -81,6 +83,7 @@ export default function DashboardLayout({
 
   return (
     <FeaturesProvider>
+      <NotificationsProvider>
       <div className="flex h-screen w-full overflow-hidden bg-app">
         {mobileOpen && (
           <div
@@ -102,6 +105,10 @@ export default function DashboardLayout({
               first thing the operator sees on every page. Self-hides
               when no impersonation session is active. */}
           <ImpersonationBanner />
+          {/* Phase 17 — maintenance-mode banner. Renders when the
+              tenant has writes paused so users see the state before
+              they try to save (and get a 503). Self-hides when off. */}
+          <MaintenanceBanner />
           <Topbar onMobileMenuClick={() => setMobileOpen(true)} />
           <main className="flex-1 overflow-y-auto">
             <div className="mx-auto w-full max-w-[1400px] px-4 py-5 sm:px-6 sm:py-6">
@@ -110,6 +117,7 @@ export default function DashboardLayout({
           </main>
         </div>
       </div>
+      </NotificationsProvider>
     </FeaturesProvider>
   );
 }

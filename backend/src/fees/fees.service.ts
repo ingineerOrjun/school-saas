@@ -5,6 +5,7 @@ import {
   Logger,
   NotFoundException,
 } from '@nestjs/common';
+import { ConfigService } from '@nestjs/config';
 import {
   DiscountType,
   FeeAssignment,
@@ -15,6 +16,7 @@ import {
 } from '@prisma/client';
 import { PrismaService } from '../database/prisma.service';
 import BikramSambat from 'bikram-sambat-js';
+import { NotificationService } from '../notifications/notification.service';
 import { AssignFeeDto } from './dto/assign-fee.dto';
 import { CreateFeeStructureDto } from './dto/create-fee-structure.dto';
 import { CreatePaymentDto } from './dto/create-payment.dto';
@@ -406,7 +408,11 @@ export interface Receipt {
 export class FeesService {
   private readonly logger = new Logger(FeesService.name);
 
-  constructor(private readonly prisma: PrismaService) {}
+  constructor(
+    private readonly prisma: PrismaService,
+    private readonly notifications: NotificationService,
+    private readonly config: ConfigService,
+  ) {}
 
   // ---------------------------------------------------------------------
   // Fee structures
@@ -761,7 +767,25 @@ export class FeesService {
     );
 
     try {
-      return await this.recordPaymentInner(dto, schoolId, actingUserId);
+      const created = await this.recordPaymentInner(
+        dto,
+        schoolId,
+        actingUserId,
+      );
+      // Phase 3 (maturity) — fire the payment-receipt email when
+      // the student has a linked User account with an email. No
+      // explicit "parent email" column today, so we fall back to
+      // the student's own login email; rows without one silently
+      // skip (no error). The send is fire-and-forget — a delivery
+      // failure must NEVER void a successful payment.
+      void this.sendPaymentReceiptEmail(created.id, schoolId).catch((e) => {
+        this.logger.error(
+          `recordPayment receipt email failed for paymentId=${created.id}: ${
+            e instanceof Error ? e.message : String(e)
+          }`,
+        );
+      });
+      return created;
     } catch (e) {
       // 4xx exceptions (validation, FK failures we caught) are expected
       // and shouldn't fill the logs with stack traces — let the global
@@ -776,6 +800,71 @@ export class FeesService {
       );
       throw e;
     }
+  }
+
+  /**
+   * Send the payment-receipt email if the student has a linked user
+   * with an email on file. Skips silently otherwise — receipts on
+   * paper are still the primary delivery channel for many tenants.
+   *
+   * Dedupe: keyed on the payment id so an idempotent re-submit of
+   * the same payment (Phase clientRequestId) doesn't fire a second
+   * email.
+   */
+  private async sendPaymentReceiptEmail(
+    paymentId: string,
+    schoolId: string,
+  ): Promise<void> {
+    const row = await this.prisma.payment.findUnique({
+      where: { id: paymentId },
+      select: {
+        id: true,
+        amount: true,
+        receiptNumber: true,
+        method: true,
+        date: true,
+        student: {
+          select: {
+            id: true,
+            firstName: true,
+            lastName: true,
+            user: { select: { id: true, email: true } },
+          },
+        },
+        feeAssignment: {
+          select: { feeStructure: { select: { name: true } } },
+        },
+        createdBy: { select: { email: true } },
+        school: { select: { name: true } },
+      },
+    });
+    if (!row || !row.student.user?.email) return;
+    if (row.amount <= 0) return; // refund row — receipts handled separately
+
+    const studentName =
+      `${row.student.firstName} ${row.student.lastName}`.trim();
+    const amountFormatted = formatNprAmount(row.amount);
+
+    await this.notifications.enqueue({
+      templateKey: 'school.payment_receipt',
+      recipients: { email: row.student.user.email },
+      dedupeKey: `payment:${row.id}:receipt`,
+      schoolId,
+      userId: row.student.user.id,
+      payload: {
+        brand: this.config.get('mail.brand'),
+        recipientEmail: row.student.user.email,
+        schoolName: row.school.name,
+        studentName,
+        receiptNumber: row.receiptNumber ?? row.id.slice(0, 8),
+        amount: row.amount,
+        amountFormatted,
+        method: row.method ?? 'OTHER',
+        paidAt: row.date.toISOString(),
+        feeDescription: row.feeAssignment?.feeStructure?.name,
+        receivedBy: row.createdBy?.email,
+      },
+    });
   }
 
   /**
@@ -1124,7 +1213,84 @@ export class FeesService {
         },
       }),
     ]);
+
+    // Phase 20 — fire the refund-receipt notification when the
+    // student has a linked user with an email. Mirrors the payment-
+    // receipt pattern: best-effort, NEVER voids the refund. Dedupe
+    // keyed on the refund row's id so an idempotent re-submit
+    // doesn't fire twice.
+    void this.sendRefundReceiptNotification(refundRow.id, schoolId).catch(
+      (e) => {
+        this.logger.error(
+          `refund receipt notification failed for refundId=${refundRow.id}: ${
+            e instanceof Error ? e.message : String(e)
+          }`,
+        );
+      },
+    );
+
     return refundRow;
+  }
+
+  /**
+   * Send refund-receipt notification to the student's linked user.
+   * Skips silently when the student has no linked user with an
+   * email (most students don't yet — the receipt is on paper).
+   */
+  private async sendRefundReceiptNotification(
+    refundId: string,
+    schoolId: string,
+  ): Promise<void> {
+    const refund = await this.prisma.payment.findUnique({
+      where: { id: refundId },
+      select: {
+        id: true,
+        amount: true,
+        receiptNumber: true,
+        date: true,
+        refundReason: true,
+        notes: true,
+        student: {
+          select: {
+            firstName: true,
+            lastName: true,
+            user: { select: { id: true, email: true } },
+          },
+        },
+        refundOf: { select: { receiptNumber: true } },
+        createdBy: { select: { email: true } },
+        school: { select: { name: true } },
+      },
+    });
+    if (!refund || !refund.student.user?.email) return;
+
+    const studentName =
+      `${refund.student.firstName} ${refund.student.lastName}`.trim();
+    const absAmount = Math.abs(refund.amount);
+    const amountFormatted = formatNprAmount(absAmount);
+
+    await this.notifications.enqueue({
+      templateKey: 'school.refund_receipt',
+      recipients: { email: refund.student.user.email },
+      dedupeKey: `refund:${refund.id}:receipt`,
+      schoolId,
+      userId: refund.student.user.id,
+      severity: 'WARNING', // refund is an unusual financial event
+      title: `Refund issued — ${amountFormatted}`,
+      payload: {
+        brand: this.config.get('mail.brand'),
+        recipientEmail: refund.student.user.email,
+        schoolName: refund.school.name,
+        studentName,
+        receiptNumber: refund.receiptNumber ?? refund.id.slice(0, 8),
+        amount: absAmount,
+        amountFormatted,
+        refundedAt: refund.date.toISOString(),
+        reason: refund.refundReason ?? refund.notes ?? null,
+        originalReceiptNumber: refund.refundOf?.receiptNumber ?? null,
+        refundedBy: refund.createdBy?.email,
+      },
+    });
   }
 
   /**
@@ -2159,4 +2325,26 @@ function adIsoToBsYear(adIso: string): number {
   // unique-per-year prefix, which is what the sequence relies on.
   const adYear = parseInt(adIso.slice(0, 4), 10);
   return Number.isNaN(adYear) ? 2000 : adYear + 56;
+}
+
+// ---------------------------------------------------------------------------
+// formatNprAmount — Phase 3 receipt-email helper.
+//
+// Lightweight server-side formatter for the receipt template payload.
+// We don't pull in a full Intl.NumberFormat configuration here
+// (the school-side formatCurrency lives in the frontend); this is
+// the minimum the email template needs: "रु. 12,345.50".
+//
+// Mirrors `frontend/lib/currency.ts` formatting rules — keep them in
+// sync if the symbol or grouping ever changes.
+// ---------------------------------------------------------------------------
+function formatNprAmount(amount: number): string {
+  const rounded = Math.round(amount * 100) / 100;
+  const [whole, frac] = rounded.toFixed(2).split('.');
+  // Indian-style grouping: last 3 digits, then groups of 2.
+  const grouped = whole.replace(
+    /(\d)(?=(\d\d)+\d$)/g,
+    '$1,',
+  );
+  return `रु. ${grouped}.${frac}`;
 }

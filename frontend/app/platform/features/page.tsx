@@ -2,7 +2,6 @@
 
 import * as React from "react";
 import {
-  AlertCircle,
   Check,
   ChevronDown,
   Layers,
@@ -25,6 +24,11 @@ import {
   type SubscriptionPlan,
 } from "@/lib/platform";
 import { cn } from "@/lib/utils";
+import {
+  PageHeader,
+  PanelErrorState,
+  PanelLoadingState,
+} from "@/components/platform-ui";
 
 // ---------------------------------------------------------------------------
 // /platform/features — Phase 5 cross-tenant feature flag matrix.
@@ -186,45 +190,24 @@ export default function PlatformFeaturesPage() {
   };
 
   if (loading) {
-    return (
-      <div className="flex h-64 items-center justify-center text-slate-500">
-        <Loader2 className="h-5 w-5 animate-spin" />
-      </div>
-    );
+    return <PanelLoadingState />;
   }
   if (error || !data) {
     return (
-      <div className="flex h-64 flex-col items-center justify-center gap-3 rounded-lg border border-red-200 bg-red-50 p-6 text-red-700">
-        <AlertCircle className="h-5 w-5" />
-        <p className="text-sm">{error ?? "Could not load matrix."}</p>
-        <button
-          onClick={load}
-          className="rounded-md border border-red-300 bg-white px-3 py-1 text-xs font-medium text-red-700 hover:bg-red-100"
-        >
-          Retry
-        </button>
-      </div>
+      <PanelErrorState
+        message={error ?? "Could not load matrix."}
+        onRetry={load}
+      />
     );
   }
 
   return (
-    <div>
-      <header className="mb-6">
-        <div className="flex items-center gap-3">
-          <span className="flex h-9 w-9 items-center justify-center rounded-md bg-slate-900 text-white">
-            <Layers className="h-4 w-4" />
-          </span>
-          <div>
-            <h1 className="text-xl font-semibold text-slate-900">
-              Feature flags
-            </h1>
-            <p className="text-sm text-slate-500">
-              Override what each school can access. Empty cells inherit from
-              the school's plan; click to force on or off.
-            </p>
-          </div>
-        </div>
-      </header>
+    <div className="space-y-5">
+      <PageHeader
+        title="Feature flags"
+        description="Override what each school can access. Empty cells inherit from the school's plan; click to force on or off."
+        icon={<Layers className="h-4 w-4" />}
+      />
 
       <div className="overflow-x-auto rounded-lg border border-slate-200 bg-white">
         <table className="w-full text-sm">

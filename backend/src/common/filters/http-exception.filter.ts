@@ -4,10 +4,13 @@ import {
   ArgumentsHost,
   HttpException,
   HttpStatus,
+  Injectable,
   Logger,
+  Optional,
 } from '@nestjs/common';
 import { Request, Response } from 'express';
 import { Prisma } from '@prisma/client';
+import { HealthService } from '../../health/health.service';
 
 /**
  * Global exception filter. Two responsibilities:
@@ -28,8 +31,18 @@ import { Prisma } from '@prisma/client';
  * responses so existing frontend error parsing keeps working.
  */
 @Catch()
+@Injectable()
 export class AllExceptionsFilter implements ExceptionFilter {
   private readonly logger = new Logger('Exceptions');
+
+  /**
+   * `@Optional()` because the filter is also instantiated in legacy
+   * tests via `new AllExceptionsFilter()` (no DI container). When
+   * `health` is undefined, we silently skip recording — server logs
+   * remain the source of truth, the dashboard just doesn't see the
+   * event.
+   */
+  constructor(@Optional() private readonly health?: HealthService) {}
 
   catch(exception: unknown, host: ArgumentsHost) {
     const ctx = host.switchToHttp();
@@ -54,6 +67,19 @@ export class AllExceptionsFilter implements ExceptionFilter {
       const safeBody = redactBody(request.body);
       if (safeBody !== undefined) {
         this.logger.error(`  body: ${JSON.stringify(safeBody)}`);
+      }
+
+      // Phase 10 — feed the health dashboard's recent-errors panel.
+      // Only 5xx + unhandled exceptions count toward the operator's
+      // "is something on fire?" view. 4xx is user error, not server
+      // health.
+      if (this.health) {
+        this.health.recordError({
+          status,
+          method: request.method,
+          route: request.url,
+          message: describeMessage(message),
+        });
       }
     } else if (status >= 400) {
       this.logger.warn(

@@ -1,11 +1,14 @@
 import {
   BadRequestException,
   Injectable,
+  Logger,
   NotFoundException,
 } from '@nestjs/common';
-import { Prisma, StudentSessionStatus } from '@prisma/client';
+import { ConfigService } from '@nestjs/config';
+import { Prisma, Role, StudentSessionStatus } from '@prisma/client';
 import { AcademicSessionService } from '../academic-session/academic-session.service';
 import { PrismaService } from '../database/prisma.service';
+import { NotificationService } from '../notifications/notification.service';
 import { RunPromotionDto } from './dto/run-promotion.dto';
 
 /**
@@ -54,9 +57,13 @@ export interface PromotionResult {
  */
 @Injectable()
 export class PromotionService {
+  private readonly logger = new Logger(PromotionService.name);
+
   constructor(
     private readonly prisma: PrismaService,
     private readonly sessions: AcademicSessionService,
+    private readonly notifications: NotificationService,
+    private readonly config: ConfigService,
   ) {}
 
   async run(
@@ -261,7 +268,7 @@ export class PromotionService {
       });
     });
 
-    return {
+    const result: PromotionResult = {
       fromSessionId: active.id,
       fromSessionName: active.name,
       toSessionId: newSession.id,
@@ -271,6 +278,73 @@ export class PromotionService {
         total: dto.entries.length,
       },
     };
+
+    // Phase 20 — fire a school-wide in-app notification + email to
+    // the school's first ADMIN summarising the promotion. Best-
+    // effort: a notification failure NEVER rolls back the promotion
+    // (which is already committed by this point).
+    void this.sendPromotionCompletedNotification(schoolId, result).catch(
+      (e) => {
+        this.logger.error(
+          `promotion-completed notification failed for school=${schoolId}: ${
+            e instanceof Error ? e.message : String(e)
+          }`,
+        );
+      },
+    );
+
+    return result;
+  }
+
+  /**
+   * Fan out the promotion-completed notification.
+   * Two recipients:
+   *   • School-wide IN_APP broadcast (every user sees it in the bell).
+   *   • Email to the first ADMIN — the operator-of-record for the
+   *     decision; getting an email summary in their inbox lets them
+   *     forward / archive without opening the dashboard.
+   */
+  private async sendPromotionCompletedNotification(
+    schoolId: string,
+    result: PromotionResult,
+  ): Promise<void> {
+    const school = await this.prisma.school.findUnique({
+      where: { id: schoolId },
+      select: { name: true },
+    });
+    if (!school) return;
+
+    const admin = await this.prisma.user.findFirst({
+      where: { schoolId, role: Role.ADMIN },
+      orderBy: { createdAt: 'asc' },
+      select: { id: true, email: true },
+    });
+
+    await this.notifications.enqueue({
+      templateKey: 'school.promotion_completed',
+      // Email goes to the first admin; in-app broadcast covers
+      // everyone else.
+      recipients: admin ? { email: admin.email } : {},
+      // Per-(school, run-completion) dedupe so an idempotent re-call
+      // can't double-fire.
+      dedupeKey: `school:${schoolId}:promotion:${result.toSessionId}`,
+      schoolId,
+      // No userId → school-wide broadcast for the in-app channel.
+      // Admin still gets the email (recipients.email above).
+      severity: 'SUCCESS',
+      title: `Promotion complete — ${result.toSessionName}`,
+      payload: {
+        brand: this.config.get('mail.brand'),
+        schoolName: school.name,
+        fromSessionName: result.fromSessionName,
+        toSessionName: result.toSessionName,
+        counts: {
+          promoted: result.counts.promoted,
+          retained: result.counts.retained,
+          left: result.counts.left,
+        },
+      },
+    });
   }
 
   /**

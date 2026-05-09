@@ -4,6 +4,7 @@ import { PassportStrategy } from '@nestjs/passport';
 import { Role } from '@prisma/client';
 import { ExtractJwt, Strategy } from 'passport-jwt';
 import { PrismaService } from '../database/prisma.service';
+import { SessionService } from '../sessions/session.service';
 import type { JwtPayload } from './types/jwt-payload';
 
 export interface AuthenticatedUser {
@@ -11,6 +12,13 @@ export interface AuthenticatedUser {
   email: string;
   role: Role;
   schoolId: string;
+  /**
+   * Phase 17 follow-up — session id from the JWT's `sid` claim.
+   * Present on tokens issued after the sessions table existed.
+   * Used by the school-side "log out everywhere except this one"
+   * affordance to identify the calling session.
+   */
+  sessionId?: string;
   /**
    * Phase 7 — impersonation context.
    *
@@ -30,6 +38,7 @@ export class JwtStrategy extends PassportStrategy(Strategy) {
   constructor(
     config: ConfigService,
     private readonly prisma: PrismaService,
+    private readonly sessions: SessionService,
   ) {
     super({
       jwtFromRequest: ExtractJwt.fromAuthHeaderAsBearerToken(),
@@ -82,6 +91,23 @@ export class JwtStrategy extends PassportStrategy(Strategy) {
       }
     }
 
+    // Phase 17 follow-up — session lookup. Tokens issued after
+    // sessions shipped carry a `sid` claim. Tokens issued BEFORE
+    // (legacy) have no sid — they're treated as implicit sessions
+    // gated only by the watermark above. Once those tokens expire
+    // (default 7d), every active token has a sid.
+    if (payload.sid) {
+      const session = await this.sessions.findActive(payload.sid);
+      if (!session) {
+        throw new UnauthorizedException(
+          'Session was revoked. Please log in again.',
+        );
+      }
+      // Best-effort lastActiveAt bump. The service throttles
+      // writes so this is cheap on the hot path.
+      void this.sessions.touch(session.id, session.lastActiveAt);
+    }
+
     // Forward impersonation context. The rest of the app sees a
     // normal `AuthenticatedUser` with the target's identity; the
     // banner / audit trail / platform-route guard read these two
@@ -91,6 +117,7 @@ export class JwtStrategy extends PassportStrategy(Strategy) {
       email: user.email,
       role: user.role,
       schoolId: user.schoolId,
+      sessionId: payload.sid,
       impersonatedBy: payload.impersonatedBy,
       impersonationStartedAt: payload.impersonationStartedAt,
     };

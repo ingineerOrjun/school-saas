@@ -52,6 +52,14 @@ export interface FeatureCatalogEntry {
 export interface MyFeaturesResponse {
   features: Record<string, boolean>;
   catalog: FeatureCatalogEntry[];
+  /**
+   * Phase 17 — tenant-state flags. Drives banners (maintenance mode)
+   * + gates that aren't keyed off plan features. Optional in the
+   * type so older backends without the field still parse.
+   */
+  tenant?: {
+    maintenanceMode: boolean;
+  };
 }
 
 const FEATURES_KEY = "scholaris:features";
@@ -124,6 +132,8 @@ interface FeaturesContextValue {
   refresh: () => Promise<void>;
   /** True while the first fetch is in flight. */
   loading: boolean;
+  /** Phase 17 — true when the tenant is in maintenance mode. */
+  maintenanceMode: boolean;
 }
 
 const FeaturesContext = React.createContext<FeaturesContextValue | null>(null);
@@ -144,6 +154,7 @@ export function FeaturesProvider({
   );
   const [catalog, setCatalog] = React.useState<FeatureCatalogEntry[]>([]);
   const [loading, setLoading] = React.useState(true);
+  const [maintenanceMode, setMaintenanceMode] = React.useState(false);
 
   const refresh = React.useCallback(async () => {
     if (!getToken()) {
@@ -154,6 +165,7 @@ export function FeaturesProvider({
       const result = await featuresApi.getMine();
       setFeatures(result.features);
       setCatalog(result.catalog);
+      setMaintenanceMode(result.tenant?.maintenanceMode ?? false);
       cacheFeatures(result.features);
     } catch (e) {
       // Conservative fallback — keep whatever is cached, otherwise
@@ -176,8 +188,15 @@ export function FeaturesProvider({
   );
 
   const value = React.useMemo<FeaturesContextValue>(
-    () => ({ features, catalog, isEnabled, refresh, loading }),
-    [features, catalog, isEnabled, refresh, loading],
+    () => ({
+      features,
+      catalog,
+      isEnabled,
+      refresh,
+      loading,
+      maintenanceMode,
+    }),
+    [features, catalog, isEnabled, refresh, loading, maintenanceMode],
   );
 
   return (
@@ -204,6 +223,7 @@ export function useFeatures(): FeaturesContextValue {
     isEnabled: (key: string) => cached[key] ?? FEATURE_DEFAULTS[key] ?? false,
     refresh: async () => {},
     loading: false,
+    maintenanceMode: false,
   };
 }
 

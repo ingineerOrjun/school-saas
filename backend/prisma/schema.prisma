@@ -52,6 +52,10 @@ enum PlatformAuditAction {
   /// initial plan creation, renewals, plan changes, and extensions
   /// — all are append-only writes via the same code path.
   SUBSCRIPTION_CREATED
+  /// School-level maintenance mode toggled (Phase 17). Soft
+  /// read-only gate distinct from SUSPENDED. The before/after JSON
+  /// captures the previous + new boolean.
+  SCHOOL_MAINTENANCE_TOGGLED
   /// School-level feature override changed (Phase 5). The
   /// `before`/`after` JSON snapshots carry the override map so the
   /// audit row alone tells the full "who turned what on/off" story.
@@ -161,6 +165,64 @@ enum PaymentMethod {
   OTHER
 }
 
+/// Phase 2 (maturity) — Notification channel taxonomy. Only EMAIL +
+/// IN_APP are wired today; SMS + WHATSAPP are reserved so adding
+/// them is a code change, not a migration.
+enum NotificationChannel {
+  EMAIL
+  SMS
+  IN_APP
+  WHATSAPP
+}
+
+/// Phase 15 — Job lifecycle states. The runtime worker advances
+/// jobs through these; operators read them to triage what's stuck.
+///   PENDING   — waiting to be picked up.
+///   SCHEDULED — claimed by a worker, will run at runAt.
+///   RUNNING   — handler in flight.
+///   SUCCEEDED — handler resolved.
+///   FAILED    — handler threw and retries are exhausted.
+///   DEAD      — operator-killed; no automatic transition.
+enum JobStatus {
+  PENDING
+  SCHEDULED
+  RUNNING
+  SUCCEEDED
+  FAILED
+  DEAD
+}
+
+/// Phase 14 — operator-facing severity tier for Notification Center
+/// listing + filtering. Drives chip color + the bell-badge count.
+///   INFO     — informational (default).
+///   SUCCESS  — completed-action confirmation.
+///   WARNING  — attention-required, not blocking.
+///   ERROR    — recoverable failure.
+///   CRITICAL — production incident, requires immediate attention.
+enum NotificationSeverity {
+  INFO
+  SUCCESS
+  WARNING
+  ERROR
+  CRITICAL
+}
+
+/// Lifecycle of a single delivery attempt.
+///   QUEUED   — created but not yet picked up by a worker / sender.
+///   SENDING  — provider call in flight.
+///   SENT     — provider acknowledged successful delivery.
+///   FAILED   — provider call failed; retries may still be in play.
+///   SKIPPED  — delivery was bypassed (channel disabled, user opted
+///              out, etc.). Not an error; just a record that we
+///              didn't try.
+enum NotificationDeliveryStatus {
+  QUEUED
+  SENDING
+  SENT
+  FAILED
+  SKIPPED
+}
+
 // -----------------------------------------------------------------------------
 // Tenant
 // -----------------------------------------------------------------------------
@@ -195,6 +257,15 @@ model School {
   /// surface "expires in N days" warnings.
   expiresAt DateTime?
 
+  /// Phase 17 — soft read-only flag. When true, the
+  /// MaintenanceModeGuard rejects mutating requests (POST / PATCH /
+  /// PUT / DELETE) with 503 across every tenant-scoped endpoint.
+  /// Reads continue to work; SUPER_ADMIN bypasses the guard so
+  /// the operator can finish whatever maintenance prompted the
+  /// toggle. Distinct from SUSPENDED — a school can be ACTIVE-and-
+  /// in-maintenance during a support session.
+  maintenanceMode Boolean @default(false)
+
   /// Phase 5 — per-tenant feature overrides. Keys are feature
   /// catalog entries (see backend/src/feature-flags/feature-catalog.ts);
   /// values are booleans. An entry here OVERRIDES whatever the
@@ -226,6 +297,7 @@ model School {
   academicSessions       AcademicSession[]
   studentAcademicRecords StudentAcademicRecord[]
   subscriptions          SchoolSubscription[]
+  notifications          Notification[]
 
   @@index([status])
   @@map("schools")
@@ -278,6 +350,8 @@ model User {
   paymentsUpdated     Payment[]      @relation("PaymentUpdatedBy")
   platformAuditEvents PlatformAuditEvent[] @relation("PlatformAuditActor")
   subscriptionsCreated SchoolSubscription[] @relation("SubscriptionCreatedBy")
+  notifications        Notification[]
+  sessions             Session[]
 
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
@@ -1019,6 +1093,168 @@ model AcademicSession {
   @@index([schoolId])
   @@index([schoolId, isActive])
   @@map("academic_sessions")
+}
+
+// -----------------------------------------------------------------------------
+// Sessions (Phase 17 follow-up)
+// -----------------------------------------------------------------------------
+
+/// One row per issued JWT. The token's `sid` claim points back here;
+/// JwtStrategy looks up the row on every request, rejects revoked
+/// tokens, and throttle-touches `lastActiveAt`.
+///
+/// Distinct from `users.tokensValidAfter`:
+///   • Watermark is the "kill all" hammer (operator-grade incident
+///     response). Phase 9.
+///   • Sessions are per-token (user-grade "log out my old laptop").
+///     Phase 17 follow-up.
+/// Both coexist; the strategy honors both.
+///
+/// Backwards compatibility:
+///   Tokens issued before this model existed have no `sid` claim.
+///   The strategy treats them as implicit sessions and falls through
+///   to the watermark check alone. Once those tokens expire (default
+///   7d), every active token has a sid.
+model Session {
+  id            String    @id @default(uuid()) @db.Uuid
+  userId        String    @db.Uuid
+  user          User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+  createdAt     DateTime  @default(now())
+  /// Throttle-updated by the JWT strategy on each authenticated
+  /// request. Capped at one write per minute per session to avoid
+  /// write amplification.
+  lastActiveAt  DateTime  @default(now())
+  /// Snapshotted at creation, NOT live — IP / UA can change as the
+  /// session moves networks; the snapshot answers "where did this
+  /// session originally come from?"
+  ip            String?
+  userAgent     String?
+  /// Null while active. Once set, the strategy rejects the token;
+  /// the row stays for audit history.
+  revokedAt     DateTime?
+  revokedReason String?
+
+  @@index([userId, lastActiveAt(sort: Desc)])
+  @@index([userId, createdAt(sort: Desc)])
+  @@map("sessions")
+}
+
+// -----------------------------------------------------------------------------
+// Notifications (Phase 2 maturity)
+// -----------------------------------------------------------------------------
+
+/// One row per logical notification event. Channel-agnostic: the
+/// `deliveries` back-relation captures which channels were attempted
+/// + the outcome. Templates live in TypeScript modules; `templateKey`
+/// is the stable code-side identifier the renderer looks up.
+///
+/// Idempotency: `(templateKey, dedupeKey)` is unique when both are
+/// set. A producer that fires the same trigger twice resolves to the
+/// same Notification row + the existing deliveries.
+model Notification {
+  id          String   @id @default(uuid()) @db.Uuid
+  templateKey String
+  schoolId    String?  @db.Uuid
+  userId      String?  @db.Uuid
+  payload     Json     @default("{}")
+  dedupeKey   String?
+  /// Phase 14 — operator-facing severity for the Notification Center.
+  /// Default INFO so legacy rows / existing producers don't need to
+  /// supply it. Producers SHOULD pass an explicit severity for
+  /// anything beyond plain informational events.
+  severity    NotificationSeverity @default(INFO)
+  /// Denormalised display title — produced by the template at write
+  /// time so list views skip re-rendering. Nullable for legacy rows.
+  title       String?
+  /// Null until the operator opens the row in the Notification
+  /// Center. The bell badge counts rows where this is null.
+  readAt      DateTime?
+  createdAt   DateTime @default(now())
+
+  // Cascade on parent removal so the audit trail stays consistent
+  // with the rest of the tenant's data.
+  school School? @relation(fields: [schoolId], references: [id], onDelete: Cascade)
+  user   User?   @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  deliveries NotificationDelivery[]
+
+  @@unique([templateKey, dedupeKey])
+  @@index([schoolId, createdAt(sort: Desc)])
+  @@index([userId, createdAt(sort: Desc)])
+  @@index([severity, createdAt(sort: Desc)])
+  @@map("notifications")
+}
+
+/// One row per channel attempt against a Notification. Retries
+/// create new rows — the source Notification stays untouched.
+model NotificationDelivery {
+  id                String                     @id @default(uuid()) @db.Uuid
+  notificationId    String                     @db.Uuid
+  channel           NotificationChannel
+  /// Per-channel address: email for EMAIL, phone for SMS, user id
+  /// for IN_APP. Snapshotted at delivery time so renaming the user's
+  /// email later doesn't rewrite history.
+  recipient         String
+  status            NotificationDeliveryStatus @default(QUEUED)
+  attempts          Int                        @default(0)
+  /// Last provider error on FAILED. Truncated to 1KB at the service
+  /// layer to keep audit rows compact.
+  errorMessage      String?
+  /// Provider message id (SES/SendGrid/Twilio) when available — lets
+  /// us trace bounces + complaints back to the originating delivery.
+  providerMessageId String?
+  sentAt            DateTime?
+  createdAt         DateTime                   @default(now())
+  updatedAt         DateTime                   @updatedAt
+
+  notification Notification @relation(fields: [notificationId], references: [id], onDelete: Cascade)
+
+  @@index([notificationId])
+  @@index([status])
+  @@map("notification_deliveries")
+}
+
+// -----------------------------------------------------------------------------
+// Background jobs (Phase 15 maturity)
+// -----------------------------------------------------------------------------
+
+/// One row per logical job. The runtime in-process worker reads from
+/// here, advances state, retries on failure, and writes outcomes.
+///
+/// Persisted state means:
+///   • A process restart picks up where the worker left off.
+///   • Operators query the table to triage what's stuck.
+///   • Idempotent producers can re-call enqueue without spamming.
+///
+/// (name, dedupeKey) is unique when both are set — re-enqueueing
+/// the same logical work returns the existing row instead of
+/// creating a duplicate.
+model Job {
+  id           String    @id @default(uuid()) @db.Uuid
+  /// Stable handler key (e.g. "notification.send_delivery").
+  /// The JobRegistry maps this to a TypeScript handler.
+  name         String
+  payload      Json      @default("{}")
+  /// Idempotency key — combined with `name` for the unique index.
+  dedupeKey    String?
+  status       JobStatus @default(PENDING)
+  /// When this job becomes eligible to run. Future timestamps defer
+  /// execution; the worker only picks up rows whose runAt <= now().
+  runAt        DateTime  @default(now())
+  attempts     Int       @default(0)
+  maxAttempts  Int       @default(3)
+  /// Last error text, truncated by the service to ~1KB.
+  lastError    String?
+  startedAt    DateTime?
+  completedAt  DateTime?
+  createdAt    DateTime  @default(now())
+  updatedAt    DateTime  @updatedAt
+
+  @@unique([name, dedupeKey])
+  @@index([runAt])
+  @@index([status])
+  @@index([name, status])
+  @@map("jobs")
 }
 
 /// Per-student per-session history row. Captures the class the

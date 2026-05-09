@@ -4,7 +4,10 @@ import * as React from "react";
 import Link from "next/link";
 import { usePathname, useRouter } from "next/navigation";
 import {
+  Activity,
+  Bell,
   Building2,
+  Cog,
   CreditCard,
   LayoutDashboard,
   Layers,
@@ -67,6 +70,17 @@ const NAV: Array<{
   // generic Building2 since the matrix UI renders as stacked
   // override / subscription / default tiers.
   { label: "Feature flags", href: "/platform/features", icon: Layers, status: "ready" },
+  // Phase 10 — system health dashboard. Activity icon for the
+  // "live pulse" framing.
+  { label: "System health", href: "/platform/health", icon: Activity, status: "ready" },
+  // Phase 14 — Notification Center. Operator-facing inbox for
+  // every platform-emitted notification + their per-channel
+  // delivery state.
+  { label: "Notifications", href: "/platform/notifications", icon: Bell, status: "ready" },
+  // Phase 18 — Ops cockpit. Composes the other surfaces; an
+  // operator usually reads it first then drills into the
+  // specific page.
+  { label: "Operations", href: "/platform/operations", icon: Cog, status: "ready" },
 ];
 
 export default function PlatformLayout({
@@ -144,8 +158,12 @@ function PlatformTopbar() {
         </Link>
         <button
           type="button"
-          onClick={() => {
-            logout();
+          onClick={async () => {
+            // Phase 17 follow-up — `logout()` now revokes the
+            // session row server-side before clearing local state.
+            // Awaited so the navigation happens after the call
+            // settles (or fails — the local clear runs either way).
+            await logout();
             window.location.assign("/login");
           }}
           className="inline-flex h-8 items-center gap-1.5 rounded-md border border-white/15 bg-white/5 px-2.5 text-xs font-medium text-slate-100 hover:bg-white/10 transition-colors"
