@@ -1,12 +1,16 @@
 "use client";
 
 import * as React from "react";
-import { Activity, RotateCcw, X } from "lucide-react";
+import { Activity, RotateCcw, Shield, X } from "lucide-react";
 import {
   isEnabled,
   reset,
   useRequestPressure,
 } from "@/lib/request-pressure";
+import {
+  reset as resetCooldowns,
+  useCooldownStats,
+} from "@/lib/request-cooldown";
 import { cn } from "@/lib/utils";
 
 // ---------------------------------------------------------------------------
@@ -37,12 +41,17 @@ import { cn } from "@/lib/utils";
 
 export function RequestPressurePanel() {
   const stats = useRequestPressure();
+  const cooldownStats = useCooldownStats();
   const [open, setOpen] = React.useState(false);
 
   if (!isEnabled()) return null;
 
   const totalRequests = stats.reduce((sum, s) => sum + s.count, 0);
   const totalDuplicates = stats.reduce((sum, s) => sum + s.duplicatesIn5s, 0);
+  const totalCooldownBlocks = cooldownStats.reduce(
+    (sum, c) => sum + c.blocks,
+    0,
+  );
   // Top 10 by call count.
   const top = stats.slice(0, 10);
   // Surface "duplicate-heavy" rows above the others — these are the
@@ -70,13 +79,22 @@ export function RequestPressurePanel() {
               <Activity className="h-3 w-3 text-emerald-400" />
               <p className="text-[11px] font-semibold">Request pressure</p>
               <span className="text-slate-400">
-                {totalRequests} req · {totalDuplicates} dupes
+                {totalRequests} req · {totalDuplicates} dupes ·{" "}
+                <span className="text-emerald-400">
+                  {totalCooldownBlocks} blocked
+                </span>
               </span>
             </div>
             <div className="flex items-center gap-1">
               <button
                 type="button"
-                onClick={() => reset()}
+                onClick={() => {
+                  reset();
+                  // Clear cooldown counters too — operators will
+                  // expect both halves of the panel to zero out
+                  // when they hit Reset.
+                  resetCooldowns();
+                }}
                 title="Reset stats"
                 className="p-1 rounded hover:bg-slate-800 text-slate-400 hover:text-slate-100"
               >
@@ -92,6 +110,33 @@ export function RequestPressurePanel() {
               </button>
             </div>
           </div>
+
+          {cooldownStats.length > 0 && (
+            <div className="px-3 py-2 border-b border-slate-700 bg-emerald-950/30">
+              <p className="text-emerald-300 mb-1 flex items-center gap-1">
+                <Shield className="h-3 w-3" />
+                Cooldown blocks (requests suppressed before flight):
+              </p>
+              <ul className="space-y-0.5">
+                {cooldownStats.map((c) => (
+                  <li
+                    key={c.key}
+                    className="flex items-center justify-between gap-2"
+                  >
+                    <span className="truncate text-emerald-200">{c.key}</span>
+                    <span className="tabular-nums text-emerald-400 shrink-0">
+                      {c.blocks} blocked
+                    </span>
+                  </li>
+                ))}
+              </ul>
+              <p className="text-emerald-400/70 mt-1 text-[9px]">
+                These requests never fired — UX-level cooldown caught
+                them. High counts here mean the user is mashing
+                buttons; that's working as intended.
+              </p>
+            </div>
+          )}
 
           {referenceDuplicates.length > 0 && (
             <div className="px-3 py-2 border-b border-slate-700 bg-red-950/50">
@@ -212,6 +257,13 @@ export function RequestPressurePanel() {
           ) : duplicateHeavy.length > 0 ? (
             <span className="text-amber-300">
               · {totalDuplicates} dupe{totalDuplicates === 1 ? "" : "s"}
+            </span>
+          ) : totalCooldownBlocks > 0 ? (
+            // No duplicates AND cooldown is suppressing requests —
+            // green positive signal so the developer sees the
+            // suppression is working.
+            <span className="text-emerald-300">
+              · {totalCooldownBlocks} blocked
             </span>
           ) : null}
         </button>

@@ -81,6 +81,21 @@ enum PlatformAuditAction {
   /// SUPER_ADMIN-gated. `before` / `after` carry the old + new
   /// codes for the audit trail.
   SCHOOL_CODE_UPDATED
+  /// School ADMIN locked an exam. After this, every Result write
+  /// path (per-student save, bulk save, grid save) rejects with
+  /// HTTP 423 LOCKED unless the exam is explicitly unlocked first.
+  /// `target` carries the examId; `after.lockedAt` is the lock time.
+  MARKS_LOCKED
+  /// School ADMIN unlocked an exam, re-enabling marks edits.
+  /// `target` carries the examId. Edits performed AFTER unlock
+  /// continue to flow through the existing per-result audit path.
+  MARKS_UNLOCKED
+  /// School-side bulk attendance overwrite (mark all present /
+  /// absent for a class on a given day). Surfaced as audit because
+  /// it touches every student in the scope at once and is hard to
+  /// undo by hand. `after.entryCount` records how many students
+  /// were affected.
+  ATTENDANCE_BULK_OVERWRITE
 }
 
 /// Subscription plan tiers (Phase 4). Real billing integration is
@@ -417,6 +432,7 @@ model User {
   subjectsUpdated     Subject[]      @relation("SubjectUpdatedBy")
   examsCreated        Exam[]         @relation("ExamCreatedBy")
   examsUpdated        Exam[]         @relation("ExamUpdatedBy")
+  examsLocked         Exam[]         @relation("ExamLockedBy")
   resultsCreated      Result[]       @relation("ResultCreatedBy")
   resultsUpdated      Result[]       @relation("ResultUpdatedBy")
   paymentsCreated     Payment[]      @relation("PaymentCreatedBy")
@@ -638,6 +654,22 @@ model Exam {
   /// so removing a session detaches its exams instead of cascading.
   sessionId String?         @db.Uuid
   session   AcademicSession? @relation(fields: [sessionId], references: [id], onDelete: SetNull)
+
+  /// Marks-publication lock. When true, every Result write path
+  /// (results.save / bulkSave / gridSave) rejects with HTTP 423
+  /// LOCKED. Toggled by school ADMINs via the `/exams/:id/lock` and
+  /// `/exams/:id/unlock` endpoints. Defaults to false so existing
+  /// rows stay editable until an operator explicitly publishes.
+  ///
+  /// `lockedAt` and `lockedById` are the audit context — preserved
+  /// even after a subsequent unlock so the marksheet UI can still
+  /// render "Locked by X on Jan 15 at 10:42, unlocked by Y at …"
+  /// from a single row's history (cross-checked against the
+  /// PlatformAuditEvent stream).
+  locked     Boolean   @default(false)
+  lockedAt   DateTime?
+  lockedById String?   @db.Uuid
+  lockedBy   User?     @relation("ExamLockedBy", fields: [lockedById], references: [id], onDelete: SetNull)
 
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt

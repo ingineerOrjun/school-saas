@@ -1034,6 +1034,14 @@ function categoryFor(action: PlatformAuditAction): OpsSecurityEvent['category'] 
       return 'ROLE_CHANGE';
     case 'SUBSCRIPTION_CREATED':
       return 'ROLE_CHANGE';
+    case 'MARKS_LOCKED':
+    case 'MARKS_UNLOCKED':
+    case 'ATTENDANCE_BULK_OVERWRITE':
+      // School-side data-integrity actions — bucketed under
+      // ROLE_CHANGE for now since the Operations Center doesn't yet
+      // have a dedicated "data integrity" lane. A follow-up panel
+      // can carve these out into their own category.
+      return 'ROLE_CHANGE';
   }
 }
 
@@ -1083,6 +1091,12 @@ function descriptionFor(r: {
       return `${actor} assigned School ID for ${target}`;
     case 'SCHOOL_CODE_UPDATED':
       return `${actor} changed School ID for ${target}`;
+    case 'MARKS_LOCKED':
+      return `${actor} locked marks for ${target}`;
+    case 'MARKS_UNLOCKED':
+      return `${actor} unlocked marks for ${target}`;
+    case 'ATTENDANCE_BULK_OVERWRITE':
+      return `${actor} bulk-overwrote attendance for ${target}`;
   }
 }
 
