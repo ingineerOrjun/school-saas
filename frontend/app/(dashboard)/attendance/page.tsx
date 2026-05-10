@@ -20,7 +20,7 @@ import { ApiError } from "@/lib/api";
 import { getStoredUser } from "@/lib/auth";
 import { classesApi, type ClassWithSections } from "@/lib/classes";
 import {
-  teachingAssignmentsApi,
+  useMyTeachingAssignments,
   type TeachingAssignmentDto,
 } from "@/lib/teaching-assignments";
 import {
@@ -33,10 +33,12 @@ import { enqueue as enqueueAttendance } from "@/lib/offline-queue";
 import { cacheRoster, getCachedRoster } from "@/lib/roster-cache";
 import { syncNow } from "@/lib/sync-engine";
 import { useOnlineStatus } from "@/hooks/useOnlineStatus";
+import { useIsMobile } from "@/hooks/useMediaQuery";
 import { Button } from "@/components/ui/Button";
 import { Skeleton } from "@/components/ui/Skeleton";
 import { EmptyState } from "@/components/ui/EmptyState";
 import { DualDate } from "@/components/calendar/DualDate";
+import { MobileAttendanceList } from "@/components/mobile/MobileAttendanceList";
 
 /**
  * Composite scope identifier for the roster dropdown. Encoded as a
@@ -139,6 +141,10 @@ export default function AttendancePage() {
   // instead of the live "Saved" toast. The sync engine handles the
   // actual POST when connectivity returns.
   const online = useOnlineStatus();
+  // Phase 25 — phone-shaped roster swap. Same data sources, same
+  // saveOne/markAll handlers; only the rendering changes when
+  // we're on a narrow screen.
+  const isMobile = useIsMobile();
   // Pre-fill scope from URL on mount so deep links from the teacher
   // dashboard ("Take attendance") land directly on the right roster
   // instead of an empty picker. We read once at init, not on every
@@ -150,9 +156,38 @@ export default function AttendancePage() {
   // classes/sections — they can't act outside their scope anyway, and
   // showing the full catalog would just waste their time. ADMIN keeps
   // the full list (`null` = "no filter applied").
-  const [assignments, setAssignments] = React.useState<
-    TeachingAssignmentDto[] | null
-  >(null);
+  //
+  // Role gate is computed via useEffect (not at render time) so the
+  // initial SSR render and the first hydrated render agree on
+  // `isTeacher = false` — `getStoredUser()` reads localStorage which
+  // doesn't exist server-side. The hook stays disabled until the
+  // role lands, then refires for genuine teachers only.
+  const [isTeacher, setIsTeacher] = React.useState<boolean | null>(null);
+  React.useEffect(() => {
+    setIsTeacher(getStoredUser()?.role === "TEACHER");
+  }, []);
+  const {
+    data: rawAssignments,
+    isLoading: assignmentsLoading,
+    error: assignmentsError,
+  } = useMyTeachingAssignments({ enabled: isTeacher === true });
+  const assignments: TeachingAssignmentDto[] | null = React.useMemo(() => {
+    // ADMIN/STAFF — no filter (existing semantics: null means "show all").
+    if (isTeacher === false) return null;
+    // 403 → not-a-teacher row / role mismatch. Existing UX: empty
+    // catalog (dropdown collapses) rather than blocking the page.
+    if (
+      assignmentsError instanceof ApiError &&
+      assignmentsError.status === 403
+    ) {
+      return [];
+    }
+    // While the hook hasn't resolved (or role is still null on first
+    // render), surface as `[]` so we don't briefly leak the unfiltered
+    // admin catalog to a teacher mid-load. The combined-loading flag
+    // below keeps the dropdown disabled during this window anyway.
+    return rawAssignments ?? (isTeacher ? [] : null);
+  }, [isTeacher, rawAssignments, assignmentsError]);
   const [scope, setScope] = React.useState<ScopeValue>(initialScope);
   const [roster, setRoster] = React.useState<AttendanceRoster[] | null>(null);
   // ISO timestamp returned with the last successful roster fetch. We
@@ -175,31 +210,19 @@ export default function AttendancePage() {
     () => new Set(),
   );
 
-  // Load classes — and, for TEACHER users, their assignments — in
-  // parallel. The dropdown blends them downstream so a teacher only
-  // sees classes/sections they're authorized for.
+  // Load classes only — assignments now flow through the React Query
+  // cache via `useMyTeachingAssignments()` above. The two used to be
+  // fetched together via Promise.all; splitting them removes the
+  // duplicate /teachers/me/assignments hits across pages without
+  // changing the user-visible loading flow (see `referenceLoading`
+  // below, which combines both halves before the dropdown is enabled).
   React.useEffect(() => {
     let cancelled = false;
     (async () => {
-      const role = getStoredUser()?.role ?? null;
       try {
-        const [classList, myAssignments] = await Promise.all([
-          classesApi.list(),
-          role === "TEACHER"
-            ? teachingAssignmentsApi.listMine().catch((err) => {
-                // 403 here means "not a teacher row yet" — treat as
-                // "no assignments" so the dropdown collapses to empty
-                // rather than blocking the page entirely.
-                if (err instanceof ApiError && err.status === 403) {
-                  return [];
-                }
-                throw err;
-              })
-            : Promise.resolve(null),
-        ]);
+        const classList = await classesApi.list();
         if (cancelled) return;
         setClasses(classList);
-        setAssignments(myAssignments);
       } catch (err) {
         if (err instanceof ApiError && err.status === 401) {
           router.replace("/login");
@@ -497,7 +520,14 @@ export default function AttendancePage() {
     [classes, assignments],
   );
 
-  const noClasses = !loadingClasses && visibleClasses.length === 0;
+  // Combined "reference data not ready yet" flag. Classes come from
+  // an imperative fetch; assignments come from the React Query hook.
+  // We gate the dropdown on BOTH so a teacher never briefly sees the
+  // unfiltered catalog flicker through during the assignments hydration
+  // window. Mirrors the old Promise.all-based UX exactly.
+  const referenceLoading =
+    loadingClasses || isTeacher === null || (isTeacher && assignmentsLoading);
+  const noClasses = !referenceLoading && visibleClasses.length === 0;
   const hasSections = visibleClasses.some((c) => c.sections.length > 0);
   const scopeSelected = scope !== "";
 
@@ -543,7 +573,7 @@ export default function AttendancePage() {
             <select
               value={scope}
               onChange={(e) => setScope(e.target.value)}
-              disabled={loadingClasses || noClasses}
+              disabled={referenceLoading || noClasses}
               className={cn(
                 "h-10 w-full rounded-md border border-border bg-surface pl-9 pr-3 text-sm",
                 "focus:outline-none focus:ring-2 focus:ring-primary/25 focus:border-primary",
@@ -554,7 +584,7 @@ export default function AttendancePage() {
               <option value="">
                 {noClasses
                   ? "No classes yet"
-                  : loadingClasses
+                  : referenceLoading
                     ? "Loading classes…"
                     : "Choose a class or section…"}
               </option>
@@ -681,16 +711,34 @@ export default function AttendancePage() {
                 unmarked={stats.unmarked}
                 total={stats.total}
               />
-              <ul className="space-y-2" role="list">
-                {roster.map((r) => (
-                  <AttendanceRow
-                    key={r.studentId}
-                    row={r}
-                    saving={savingIds.has(r.studentId)}
-                    onMark={(status) => saveOne(r.studentId, status)}
-                  />
-                ))}
-              </ul>
+              {isMobile ? (
+                /* Phase 25 — mobile roster: compressed cards, tap-toggle,
+                   sticky bulk-action bar, per-row sync indicator. Reuses
+                   the same saveOne/markAll handlers as the desktop view
+                   so offline + sync semantics are identical. */
+                <MobileAttendanceList
+                  roster={roster}
+                  syncMap={
+                    new Map(
+                      [...savingIds].map((id) => [id, "syncing" as const]),
+                    )
+                  }
+                  onToggle={(studentId, status) => saveOne(studentId, status)}
+                  onMarkAll={(status) => markAll(status)}
+                  syncing={savingIds.size > 0}
+                />
+              ) : (
+                <ul className="space-y-2" role="list">
+                  {roster.map((r) => (
+                    <AttendanceRow
+                      key={r.studentId}
+                      row={r}
+                      saving={savingIds.has(r.studentId)}
+                      onMark={(status) => saveOne(r.studentId, status)}
+                    />
+                  ))}
+                </ul>
+              )}
             </div>
           ) : null}
         </>

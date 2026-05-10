@@ -11,30 +11,34 @@ import {
   Loader2,
   ShieldAlert,
 } from "lucide-react";
-import { ApiError } from "@/lib/api";
 import {
-  notificationsApi,
   pingNotificationsAcrossTabs,
-  useNotifications,
+  useMarkAllRead,
+  useMarkRead,
+  useNotificationList,
+  useNotificationsCrossTabSync,
+  useUnreadCount,
   type NotificationSeverity,
   type SchoolNotificationListRow,
 } from "@/lib/notifications";
 import { cn } from "@/lib/utils";
 
 // ---------------------------------------------------------------------------
-// NotificationsBell — Phase 20.
+// NotificationsBell — Phase 20 (rebuilt on React Query).
 //
-// Topbar bell with:
-//   • live unread badge (from NotificationsProvider, polled every 30s)
-//   • dropdown preview panel (latest 8 rows, fetched on first open
-//     and refreshed each subsequent open)
-//   • "Mark all read" affordance
-//   • "View all" link → /notifications
+// Single source of truth via shared query keys:
+//   • Unread badge → useUnreadCount() (60s poll, 30s stale)
+//   • Dropdown preview → useNotificationList({pageSize: 8}) — same
+//     key as inbox page when filters match.
 //
-// Optimistic mark-read on row click: we PATCH /notifications/:id/read,
-// flip local state immediately, AND bump the provider's counter so
-// the badge updates without a round-trip. Cross-tab nudge via
-// localStorage so other tabs converge.
+// No manual setInterval, no manual fetches, no cross-tab sentinel
+// in the bell itself. The sentinel listener lives in the bell only
+// because it's mounted on every dashboard page; another component
+// could host it just as well (idempotent).
+//
+// Optimistic mark-read via useMarkRead — flips cache immediately,
+// rolls back on error. The bell badge updates without a round-trip
+// because the mutation's onMutate decrements the cached count.
 // ---------------------------------------------------------------------------
 
 const PREVIEW_LIMIT = 8;
@@ -59,15 +63,34 @@ const SEVERITY_ICON: Record<
 };
 
 export function NotificationsBell() {
-  const { unreadCount, refresh, bumpUnread } = useNotifications();
   const [open, setOpen] = React.useState(false);
-  const [loading, setLoading] = React.useState(false);
-  const [error, setError] = React.useState<string | null>(null);
-  const [items, setItems] = React.useState<SchoolNotificationListRow[]>([]);
   const ref = React.useRef<HTMLDivElement | null>(null);
 
-  // Outside-click + Escape to close — same pattern as other topbar
-  // dropdowns.
+  // Cross-tab sync — mount once. Idempotent if mounted elsewhere too.
+  useNotificationsCrossTabSync();
+
+  // Live unread count — owned by the shared cache, polled every 60s.
+  const { data: unreadData } = useUnreadCount();
+  const unreadCount = unreadData?.count ?? 0;
+
+  // Dropdown preview list. `enabled: open` keeps the request lazy
+  // until the user actually clicks the bell. Same query key as the
+  // inbox page when filters happen to match → cache hit.
+  const {
+    data: listData,
+    isLoading,
+    isError,
+    error,
+  } = useNotificationList(
+    { pageSize: PREVIEW_LIMIT },
+    { enabled: open },
+  );
+  const items = listData?.rows ?? [];
+
+  const markRead = useMarkRead();
+  const markAllRead = useMarkAllRead();
+
+  // Outside-click + Escape to close.
   React.useEffect(() => {
     if (!open) return;
     const onClick = (e: MouseEvent) => {
@@ -84,70 +107,18 @@ export function NotificationsBell() {
     };
   }, [open]);
 
-  /**
-   * Fetch the preview list. Called on every open — cheap because
-   * we cap at PREVIEW_LIMIT and the table is well-indexed by
-   * (createdAt DESC).
-   */
-  const loadPreview = React.useCallback(async () => {
-    setLoading(true);
-    setError(null);
-    try {
-      const result = await notificationsApi.list({ pageSize: PREVIEW_LIMIT });
-      setItems(result.rows);
-    } catch (err) {
-      setError(
-        err instanceof ApiError
-          ? err.message
-          : "Failed to load notifications.",
-      );
-    } finally {
-      setLoading(false);
-    }
-  }, []);
-
-  React.useEffect(() => {
-    if (!open) return;
-    void loadPreview();
-  }, [open, loadPreview]);
-
-  const onRowClick = async (row: SchoolNotificationListRow) => {
-    if (row.readAt) return; // already read — nothing to do
-    // Optimistic flip on the local list + provider counter.
-    setItems((prev) =>
-      prev.map((r) =>
-        r.id === row.id ? { ...r, readAt: new Date().toISOString() } : r,
-      ),
-    );
-    bumpUnread(-1);
-    try {
-      await notificationsApi.markRead(row.id);
-      pingNotificationsAcrossTabs();
-    } catch {
-      // Roll back on failure — refresh from the server so we have
-      // ground truth.
-      void refresh();
-      void loadPreview();
-    }
+  const onRowClick = (row: SchoolNotificationListRow) => {
+    if (row.readAt) return;
+    markRead.mutate(row.id, {
+      onSuccess: () => pingNotificationsAcrossTabs(),
+    });
   };
 
-  const onMarkAllRead = async () => {
+  const onMarkAllRead = () => {
     if (unreadCount === 0) return;
-    // Optimistic — flip every row in the preview + zero the badge.
-    const previousUnread = unreadCount;
-    setItems((prev) =>
-      prev.map((r) =>
-        r.readAt ? r : { ...r, readAt: new Date().toISOString() },
-      ),
-    );
-    bumpUnread(-previousUnread);
-    try {
-      await notificationsApi.markAllRead();
-      pingNotificationsAcrossTabs();
-    } catch {
-      void refresh();
-      void loadPreview();
-    }
+    markAllRead.mutate(undefined, {
+      onSuccess: () => pingNotificationsAcrossTabs(),
+    });
   };
 
   return (
@@ -196,7 +167,8 @@ export function NotificationsBell() {
               <button
                 type="button"
                 onClick={onMarkAllRead}
-                className="text-[11px] font-medium text-primary hover:underline focus-ring rounded"
+                disabled={markAllRead.isPending}
+                className="text-[11px] font-medium text-primary hover:underline focus-ring rounded disabled:opacity-50"
               >
                 Mark all read
               </button>
@@ -204,18 +176,20 @@ export function NotificationsBell() {
           </div>
 
           <div className="max-h-[60vh] overflow-y-auto">
-            {loading && items.length === 0 && (
+            {isLoading && items.length === 0 && (
               <div className="flex items-center justify-center gap-2 py-10 text-xs text-muted-foreground">
                 <Loader2 className="h-4 w-4 animate-spin" />
                 Loading…
               </div>
             )}
 
-            {error && (
-              <div className="px-4 py-3 text-xs text-destructive">{error}</div>
+            {isError && (
+              <div className="px-4 py-3 text-xs text-destructive">
+                {error?.message ?? "Failed to load notifications."}
+              </div>
             )}
 
-            {!loading && !error && items.length === 0 && (
+            {!isLoading && !isError && items.length === 0 && (
               <div className="px-4 py-10 text-center">
                 <div className="mx-auto flex h-10 w-10 items-center justify-center rounded-full bg-muted text-muted-foreground">
                   <Inbox className="h-4 w-4" />
@@ -235,7 +209,7 @@ export function NotificationsBell() {
                   <PreviewRow
                     key={row.id}
                     row={row}
-                    onClick={() => void onRowClick(row)}
+                    onClick={() => onRowClick(row)}
                     onNavigate={() => setOpen(false)}
                   />
                 ))}

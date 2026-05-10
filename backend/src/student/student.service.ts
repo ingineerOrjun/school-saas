@@ -13,6 +13,7 @@ import {
 import { Gender } from '@prisma/client';
 import { CreateStudentDto } from './dto/create-student.dto';
 import { UpdateStudentDto } from './dto/update-student.dto';
+import { StudentRegistrationNumberService } from './services/student-registration-number.service';
 
 /** One failure entry in the bulk-import response. */
 export interface BulkFailure {
@@ -66,7 +67,10 @@ export interface StudentAnalytics {
 
 @Injectable()
 export class StudentService {
-  constructor(private readonly prisma: PrismaService) {}
+  constructor(
+    private readonly prisma: PrismaService,
+    private readonly registrationNumbers: StudentRegistrationNumberService,
+  ) {}
 
   async create(
     dto: CreateStudentDto,
@@ -84,30 +88,50 @@ export class StudentService {
       schoolId,
     );
 
+    // Permanent registration number — generated once at admission
+    // when a class is provided. Students admitted without a class
+    // (rare; usually the form requires one) get NULL for now and
+    // can have one assigned by re-creation if the workflow ever
+    // demands it. The number is IMMUTABLE after this insert.
+    const admissionDate = dto.admissionDate
+      ? new Date(dto.admissionDate)
+      : null;
+
+    const buildData = (registrationNumber: string | null) => ({
+      firstName: dto.firstName,
+      lastName: dto.lastName,
+      symbolNumber: dto.symbolNumber,
+      schoolId,
+      userId: dto.userId,
+      classId,
+      sectionId,
+      // Required demographic + contact fields. ISO date strings
+      // from the DTO get parsed into Date objects here so Prisma's
+      // @db.Date columns get clean values.
+      gender: dto.gender,
+      dateOfBirth: new Date(dto.dateOfBirth),
+      parentName: dto.parentName,
+      contactNumber: dto.contactNumber,
+      // Optional fields — `?? null` so an explicit empty string from
+      // the form isn't persisted as a meaningless empty value.
+      address: dto.address?.trim() ? dto.address.trim() : null,
+      admissionDate,
+      registrationNumber,
+    });
+
     try {
+      if (classId) {
+        return await this.registrationNumbers.withRetryOnCollision(
+          { schoolId, classId, admissionDate },
+          (registrationNumber) =>
+            this.prisma.student.create({
+              data: buildData(registrationNumber),
+              include: studentInclude,
+            }),
+        );
+      }
       return await this.prisma.student.create({
-        data: {
-          firstName: dto.firstName,
-          lastName: dto.lastName,
-          symbolNumber: dto.symbolNumber,
-          schoolId,
-          userId: dto.userId,
-          classId,
-          sectionId,
-          // Required demographic + contact fields. ISO date strings
-          // from the DTO get parsed into Date objects here so Prisma's
-          // @db.Date columns get clean values.
-          gender: dto.gender,
-          dateOfBirth: new Date(dto.dateOfBirth),
-          parentName: dto.parentName,
-          contactNumber: dto.contactNumber,
-          // Optional fields — `?? null` so an explicit empty string from
-          // the form isn't persisted as a meaningless empty value.
-          address: dto.address?.trim() ? dto.address.trim() : null,
-          admissionDate: dto.admissionDate
-            ? new Date(dto.admissionDate)
-            : null,
-        },
+        data: buildData(null),
         include: studentInclude,
       });
     } catch (e) {
@@ -348,24 +372,40 @@ export class StudentService {
       return { successCount: 0, failed: sortFailures(failed) };
     }
 
+    // Pre-compute registration numbers for the whole batch via the
+    // shared service. Returns a parallel array — `null` for any row
+    // whose class didn't resolve (those still insert successfully
+    // with registrationNumber=null; the operator can fix them later).
+    const resolvedClassIds = candidates.map((r) =>
+      r.className
+        ? (classByName.get(r.className.toLowerCase()) ?? null)
+        : null,
+    );
+    const registrationNumbers = await this.registrationNumbers.generateBatch(
+      candidates.map((r, i) => ({
+        schoolId,
+        classId: resolvedClassIds[i] ?? '',
+        admissionDate: r.admissionDate,
+      })),
+    );
+
     try {
       await this.prisma.$transaction(
-        candidates.map((r) =>
+        candidates.map((r, i) =>
           this.prisma.student.create({
             data: {
               firstName: r.firstName,
               lastName: r.lastName,
               symbolNumber: r.symbolNumber,
               schoolId,
-              classId: r.className
-                ? (classByName.get(r.className.toLowerCase()) ?? null)
-                : null,
+              classId: resolvedClassIds[i],
               gender: r.gender,
               dateOfBirth: r.dateOfBirth,
               parentName: r.parentName,
               contactNumber: r.contactNumber,
               address: r.address,
               admissionDate: r.admissionDate,
+              registrationNumber: registrationNumbers[i],
             },
             select: { id: true },
           }),
@@ -374,11 +414,25 @@ export class StudentService {
       return { successCount: candidates.length, failed: sortFailures(failed) };
     } catch (e) {
       // A race condition could still produce a P2002 (some other request
-      // grabbed a symbolNumber between our pre-check and the insert).
-      // Roll the whole batch back and report all surviving candidates as
-      // failed so the user can retry without partial data.
-      const reason =
-        e instanceof Prisma.PrismaClientKnownRequestError && e.code === 'P2002'
+      // grabbed a symbolNumber OR a registration number between our
+      // pre-check and the insert). Roll the whole batch back and
+      // report all surviving candidates as failed so the user can
+      // retry without partial data.
+      const isUniqueViolation =
+        e instanceof Prisma.PrismaClientKnownRequestError &&
+        e.code === 'P2002';
+      const meta = (
+        e instanceof Prisma.PrismaClientKnownRequestError ? e.meta : undefined
+      ) as { target?: unknown } | undefined;
+      const target = meta?.target;
+      const isRegNumberCollision =
+        isUniqueViolation &&
+        ((Array.isArray(target) && target.includes('registrationNumber')) ||
+          (typeof target === 'string' &&
+            target.includes('registrationNumber')));
+      const reason = isRegNumberCollision
+        ? 'A registration number collided during commit. Please retry.'
+        : isUniqueViolation
           ? 'A symbol number collided during commit. Please retry.'
           : 'Database transaction failed; no rows were imported.';
       for (const r of candidates) {

@@ -24,7 +24,7 @@ import { toast } from "sonner";
 import { ApiError } from "@/lib/api";
 import { getStoredUser, type Role } from "@/lib/auth";
 import { schoolApi, resolveLogoUrl, type SchoolDto } from "@/lib/school";
-import { subjectsApi, type SubjectDto } from "@/lib/subjects";
+import { subjectsApi, useSubjects, type SubjectDto } from "@/lib/subjects";
 import { usersApi, type UserDto } from "@/lib/users";
 import { Button } from "@/components/ui/Button";
 import { Input } from "@/components/ui/Input";
@@ -549,8 +549,16 @@ function LogoEditor({
  * the parent SettingsPage already gates the whole page on role.
  */
 function SubjectsSection() {
+  // Phase γ — subjects via shared cache hook. Reopening the
+  // settings page reuses the cache instead of refetching. Local
+  // `list` state mirrors query data so existing optimistic
+  // delete + add flows below stay untouched.
+  const subjectsQuery = useSubjects();
   const [list, setList] = React.useState<SubjectDto[]>([]);
-  const [loading, setLoading] = React.useState(true);
+  React.useEffect(() => {
+    if (subjectsQuery.data) setList(subjectsQuery.data);
+  }, [subjectsQuery.data]);
+  const loading = subjectsQuery.isLoading;
   const [draft, setDraft] = React.useState("");
   const [adding, setAdding] = React.useState(false);
   // Set instead of single id so multiple deletes can run in parallel
@@ -559,24 +567,18 @@ function SubjectsSection() {
     () => new Set(),
   );
 
+  // Phase γ — list state is fed by useSubjects() above; no
+  // imperative fetch needed here. Errors surface via the query;
+  // the optimistic mutations below own their own toast paths.
   React.useEffect(() => {
-    let cancelled = false;
-    (async () => {
-      try {
-        const data = await subjectsApi.list();
-        if (!cancelled) setList(data);
-      } catch (err) {
-        toast.error(
-          err instanceof ApiError ? err.message : "Failed to load subjects.",
-        );
-      } finally {
-        if (!cancelled) setLoading(false);
-      }
-    })();
-    return () => {
-      cancelled = true;
-    };
-  }, []);
+    if (subjectsQuery.error) {
+      toast.error(
+        subjectsQuery.error instanceof ApiError
+          ? subjectsQuery.error.message
+          : "Failed to load subjects.",
+      );
+    }
+  }, [subjectsQuery.error]);
 
   const trimmedDraft = draft.trim();
   // Inline duplicate detection — fire BEFORE the server returns 409 so

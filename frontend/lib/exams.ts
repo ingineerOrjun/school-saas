@@ -6,6 +6,12 @@ export interface ExamSubjectDto {
   name: string;
   theoryFullMarks: number;
   practicalFullMarks: number;
+  /**
+   * Credit-hour weight used in the credit-hour-weighted GPA (CDC
+   * progress-report formula). Optional in the typing for back-compat —
+   * older clients ignore it; new ones default missing values to 5.
+   */
+  creditHours?: number;
   examId: string;
   createdAt: string;
   updatedAt: string;
@@ -38,6 +44,12 @@ export interface ResultRow {
   letterGrade: LetterGrade;
   letterGradeLabel: string;
   gradePoint: number;
+  /**
+   * Credit-hour weight for this subject. Optional in the typing for
+   * back-compat with API responses that pre-date the field; consumers
+   * default missing values to 5.
+   */
+  creditHours?: number;
 }
 
 export interface StudentReport {
@@ -47,7 +59,26 @@ export interface StudentReport {
   studentFirstName: string;
   studentLastName: string;
   results: ResultRow[];
+  /**
+   * Credit-hour-weighted GPA (CDC progress-report formula). Always a
+   * number for back-compat with `.toFixed(2)` callers; the visual NG
+   * state is surfaced via `gpaLetterGrade === "NG"` and
+   * `hasFailingSubject`. The value is the sentinel `-1` (out-of-range
+   * for valid GPAs 0.0–4.0) when any subject is NG, distinguishing
+   * NG from a student who genuinely scored 0.0. Renderers should
+   * guard with `gpa < 0` (or check `gpaLetterGrade === "NG"`) before
+   * formatting.
+   */
   gpa: number;
+  /**
+   * Letter grade derived from `gpa` via the CDC overall-GPA mapping
+   * (3.6 → A+, 3.2 → A, ...). "NG" when any subject is NG. Optional in
+   * the typing so older API responses (without this field) don't crash
+   * the client; consumers should fall back to `overallLetterGradeLabel`.
+   */
+  gpaLetterGrade?: string;
+  /** Sum of credit hours used as the weighted-GPA denominator. */
+  totalCreditHours?: number;
   overallLetterGrade: LetterGrade;
   overallLetterGradeLabel: string;
   /** True when at least one subject's letter grade is NG. */
@@ -62,6 +93,12 @@ export interface CreateSubjectInput {
   name: string;
   theoryFullMarks: number;
   practicalFullMarks?: number;
+  /**
+   * Credit-hour weight (CDC weekly-period count). Optional — backend
+   * defaults missing values to 5, matching the schema column default.
+   * Range 0.5–20 enforced server-side by the DTO.
+   */
+  creditHours?: number;
 }
 
 export interface ResultEntry {
@@ -234,6 +271,8 @@ export const marksheetApi = {
 export interface LedgerSubject {
   id: string;
   name: string;
+  /** Credit-hour weight for this subject. Optional for back-compat. */
+  creditHours?: number;
 }
 
 export interface LedgerCell {

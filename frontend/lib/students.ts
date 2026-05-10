@@ -1,4 +1,8 @@
+import { useQuery } from "@tanstack/react-query";
 import { api } from "./api";
+import { useAuthReady } from "@/hooks/useAuthReady";
+import { qk } from "./query-keys";
+import { STALE } from "./query-client";
 import type { ClassDto } from "./classes";
 
 export type Gender = "MALE" | "FEMALE" | "OTHER";
@@ -175,3 +179,40 @@ export const studentsApi = {
   remove: (id: string) =>
     api<void>(`/students/${id}`, { method: "DELETE" }),
 };
+
+// ---------------------------------------------------------------------------
+// useStudents — Phase α follow-up shared hook.
+//
+// Replaces the legacy `useEffect(() => studentsApi.list().then(setState), [])`
+// pattern. Routes through React Query so multiple consumers on the
+// same page (or fast back/forward navigation between /students and
+// /attendance) collapse to one underlying request.
+//
+// Filter normalisation lives in qk.students(): equivalent inputs
+// produce the same key, so two pages calling `useStudents({ classId })`
+// share the cache.
+//
+// Auth gating: queries don't fire until the auth-store publishes
+// authReady=true. Fixes the user=<anon> 429 storm — protected
+// requests no longer fan out during the bootstrap window before
+// localStorage is restored.
+// ---------------------------------------------------------------------------
+
+export function useStudents(filter?: ListStudentsFilter) {
+  const { authReady, isAuthenticated } = useAuthReady();
+  return useQuery({
+    queryKey: qk.students(filter),
+    queryFn: () => studentsApi.list(filter),
+    enabled: authReady && isAuthenticated,
+    // 1m staleTime — student data moves with enrolment; the heavy
+    // /students endpoint shouldn't refetch on every modal mount.
+    staleTime: STALE.SEMI_STATIC,
+    refetchOnWindowFocus: false,
+    refetchOnMount: false,
+    retry: (failureCount, error) => {
+      const status = (error as { status?: number } | null)?.status;
+      if (status === 401 || status === 403) return false;
+      return failureCount < 1;
+    },
+  });
+}

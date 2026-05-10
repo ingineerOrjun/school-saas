@@ -1,11 +1,11 @@
 import {
-  ConflictException,
   ForbiddenException,
   Injectable,
+  Logger,
   UnauthorizedException,
 } from '@nestjs/common';
 import { JwtService } from '@nestjs/jwt';
-import { Role, School, User } from '@prisma/client';
+import { PlatformAuditAction, Role, School, User } from '@prisma/client';
 import { randomBytes } from 'crypto';
 import { ConfigService } from '@nestjs/config';
 import { HashingService } from '../common/hashing/hashing.service';
@@ -13,6 +13,8 @@ import { PrismaService } from '../database/prisma.service';
 import { HealthService } from '../health/health.service';
 import { NotificationService } from '../notifications/notification.service';
 import { PlatformService } from '../platform/platform.service';
+import { PlatformAuditService } from '../platform/platform-audit.service';
+import { SchoolCodeService } from '../platform/services/school-code.service';
 import { SessionService } from '../sessions/session.service';
 import { LoginDto } from './dto/login.dto';
 import { RegisterAdminDto } from './dto/register-admin.dto';
@@ -60,6 +62,8 @@ export type RegisterAdminResult = AuthResult;
 
 @Injectable()
 export class AuthService {
+  private readonly logger = new Logger(AuthService.name);
+
   constructor(
     private readonly prisma: PrismaService,
     private readonly hashing: HashingService,
@@ -68,6 +72,8 @@ export class AuthService {
     private readonly notifications: NotificationService,
     private readonly config: ConfigService,
     private readonly sessions: SessionService,
+    private readonly schoolCodes: SchoolCodeService,
+    private readonly platformAudit: PlatformAuditService,
   ) {}
 
   /**
@@ -83,29 +89,67 @@ export class AuthService {
     dto: RegisterAdminDto,
     ctx: { ip?: string | null; userAgent?: string | null } = {},
   ): Promise<RegisterAdminResult> {
-    const { email, password, schoolName } = dto;
+    const { email, password, schoolName, schoolCode: desiredSchoolCode } = dto;
 
-    await this.assertEmailAvailable(email);
+    // No global email check anymore — User.email is tenant-scoped
+    // (`@@unique([schoolId, email])`). The new school is empty by
+    // definition, so there's no in-tenant conflict to pre-check;
+    // the unique constraint catches any concurrent insert.
 
     const passwordHash = await this.hashing.hash(password);
     const slug = await this.resolveUniqueSlug(schoolName);
 
-    const { school, user } = await this.prisma.$transaction(async (tx) => {
-      const school = await tx.school.create({
-        data: { name: schoolName, slug },
-      });
+    // Resolve the school code BEFORE the transaction so a custom-code
+    // collision surfaces as a clean ConflictException rather than a
+    // half-applied transaction. The retry-on-collision wrapper
+    // protects against the race where two simultaneous default-code
+    // creations both grab the same SCH-NNNN suffix.
+    const { school, user } = await this.schoolCodes.withRetryOnCollision(
+      desiredSchoolCode ?? null,
+      async (resolvedSchoolCode) => {
+        return this.prisma.$transaction(async (tx) => {
+          const school = await tx.school.create({
+            data: {
+              name: schoolName,
+              slug,
+              schoolCode: resolvedSchoolCode,
+            },
+          });
 
-      const user = await tx.user.create({
-        data: {
-          email,
-          password: passwordHash,
-          role: Role.ADMIN,
-          schoolId: school.id,
-        },
-      });
+          const user = await tx.user.create({
+            data: {
+              email,
+              password: passwordHash,
+              role: Role.ADMIN,
+              schoolId: school.id,
+            },
+          });
 
-      return { school, user };
-    });
+          return { school, user };
+        });
+      },
+    );
+
+    // Audit the schoolCode assignment. Best-effort: a failure here
+    // doesn't roll back the just-created tenant — registration
+    // succeeded, the audit trail just has one missing row.
+    void this.platformAudit
+      .record({
+        action: PlatformAuditAction.SCHOOL_CODE_ASSIGNED,
+        actor: { userId: user.id, email: user.email, role: user.role },
+        target: { type: 'School', id: school.id, label: school.name },
+        before: null,
+        after: { schoolCode: school.schoolCode },
+        ip: ctx.ip ?? null,
+        userAgent: ctx.userAgent ?? null,
+      })
+      .catch((err) => {
+        this.logger.error(
+          `[audit] SCHOOL_CODE_ASSIGNED failed for school=${school.id}: ${
+            err instanceof Error ? err.message : String(err)
+          }`,
+        );
+      });
 
     // Phase 3 (maturity) — welcome email to the new school admin.
     // Best-effort: a delivery failure does NOT roll back the
@@ -159,24 +203,42 @@ export class AuthService {
     ip: string | null = null,
     userAgent: string | null = null,
   ): Promise<AuthResult> {
-    const user = await this.prisma.user.findUnique({
-      where: { email: dto.email },
-      include: { school: true },
+    // ---- Step 1: tenant resolution by school code ----
+    // The DTO already trims + uppercases schoolCode; we re-normalize
+    // here defensively in case some path bypasses the DTO.
+    const normalizedCode = this.schoolCodes.normalize(dto.schoolCode);
+    const school = await this.prisma.school.findUnique({
+      where: { schoolCode: normalizedCode },
     });
+
+    // ---- Step 2: user lookup within tenant ----
+    // Even when the school doesn't exist, we still hash-compare so the
+    // failure path takes the same wall-clock time as a real password
+    // mismatch — defends against tenant-existence enumeration.
+    const user = school
+      ? await this.prisma.user.findUnique({
+          where: {
+            schoolId_email: { schoolId: school.id, email: dto.email },
+          },
+        })
+      : null;
 
     const passwordOk =
       !!user && (await this.hashing.compare(dto.password, user.password));
 
-    if (!user || !passwordOk) {
+    if (!school || !user || !passwordOk) {
       this.health.recordLoginFailure({
         email: dto.email,
         ip,
         reason: 'invalid_credentials',
       });
-      throw new UnauthorizedException('Invalid email or password.');
+      // Generic message for ALL three failure modes (unknown school,
+      // unknown user, wrong password) so the response cannot be used
+      // to enumerate which tenants or accounts exist.
+      throw new UnauthorizedException('Invalid credentials.');
     }
 
-    const { school, ...userWithoutSchool } = user;
+    const userWithoutSchool = user;
 
     // Tenant gate: a SUSPENDED or EXPIRED school blocks ALL of its
     // users from logging in (including the school's own ADMIN). The
@@ -254,6 +316,9 @@ export class AuthService {
       ip: ctx.ip ?? null,
       userAgent: ctx.userAgent ?? null,
     });
+    // Phase 22 — new-device detection is signalled inside
+    // SessionService via a structured WARN log; ops can alert on
+    // the `new device detected` substring. No further action here.
     const payload: JwtPayload = {
       userId: user.id,
       role: user.role,
@@ -261,13 +326,6 @@ export class AuthService {
       sid: session.id,
     };
     return this.jwt.sign(payload);
-  }
-
-  private async assertEmailAvailable(email: string): Promise<void> {
-    const existing = await this.prisma.user.findUnique({ where: { email } });
-    if (existing) {
-      throw new ConflictException('An account with this email already exists.');
-    }
   }
 
   private async resolveUniqueSlug(name: string): Promise<string> {

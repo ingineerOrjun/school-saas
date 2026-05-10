@@ -1,5 +1,6 @@
 import {
   BadRequestException,
+  ConflictException,
   Injectable,
   Logger,
   NotFoundException,
@@ -7,11 +8,13 @@ import {
 import { ConfigService } from '@nestjs/config';
 import {
   BillingCycle,
+  Prisma,
   Role,
   SchoolStatus,
   SubscriptionPlan,
 } from '@prisma/client';
 import { PrismaService } from '../database/prisma.service';
+import { SchoolCodeService } from './services/school-code.service';
 import { NotificationService } from '../notifications/notification.service';
 import { PlatformAuditService } from './platform-audit.service';
 
@@ -113,6 +116,7 @@ export class PlatformService {
     private readonly audit: PlatformAuditService,
     private readonly notifications: NotificationService,
     private readonly config: ConfigService,
+    private readonly schoolCodes: SchoolCodeService,
   ) {}
 
   // -------------------------------------------------------------------------
@@ -363,6 +367,94 @@ export class PlatformService {
   // platform_audit_events row containing actor, target, before+after
   // status, reason, IP, and timestamp.
   // -------------------------------------------------------------------------
+
+  /**
+   * SUPER_ADMIN-only — change a school's public schoolCode after
+   * creation. Validates format + uniqueness via SchoolCodeService,
+   * persists the new value, and writes a SCHOOL_CODE_UPDATED audit
+   * row carrying both the old and new codes. School admins cannot
+   * call this; the controller layer enforces that with @Roles.
+   *
+   * Operator UX consequence: after this call lands, the school's
+   * users must use the new code on the login form. Existing
+   * sessions remain valid (the JWT carries `schoolId`, not the
+   * code).
+   */
+  async updateSchoolCode(
+    schoolId: string,
+    input: { schoolCode: string; reason?: string | null },
+    actor: {
+      userId: string;
+      email?: string | null;
+      role?: string | null;
+      ip?: string | null;
+      userAgent?: string | null;
+    },
+  ): Promise<PlatformSchoolRow> {
+    const normalized = this.schoolCodes.normalize(input.schoolCode);
+    this.schoolCodes.validate(normalized);
+
+    const before = await this.prisma.school.findUnique({
+      where: { id: schoolId },
+      select: { id: true, schoolCode: true, name: true },
+    });
+    if (!before) throw new NotFoundException('School not found.');
+
+    if (before.schoolCode === normalized) {
+      // No-op write — nothing changed, no audit row, no event.
+      return this.getSchool(schoolId);
+    }
+
+    // Check uniqueness BEFORE the update so we can surface a clean
+    // ConflictException instead of a P2002. The DB unique index is
+    // still the authoritative guard against the race.
+    if (await this.schoolCodes.exists(normalized)) {
+      throw new ConflictException('This School ID is already assigned.');
+    }
+
+    try {
+      await this.prisma.school.update({
+        where: { id: schoolId },
+        data: { schoolCode: normalized },
+      });
+    } catch (err) {
+      if (
+        err instanceof Prisma.PrismaClientKnownRequestError &&
+        err.code === 'P2002'
+      ) {
+        throw new ConflictException('This School ID is already assigned.');
+      }
+      throw err;
+    }
+
+    await this.audit.record({
+      action: 'SCHOOL_CODE_UPDATED',
+      actor: {
+        userId: actor.userId,
+        email: actor.email,
+        role: actor.role,
+      },
+      target: {
+        type: 'School',
+        id: schoolId,
+        label: before.name,
+      },
+      before: { schoolCode: before.schoolCode },
+      after: { schoolCode: normalized },
+      reason: input.reason ?? null,
+      ip: actor.ip,
+      userAgent: actor.userAgent,
+    });
+
+    this.logger.warn(
+      `[platform] school code changed ` +
+        `school=${before.name}(${schoolId}) ` +
+        `from=${before.schoolCode} to=${normalized} ` +
+        `actor=${actor.userId}`,
+    );
+
+    return this.getSchool(schoolId);
+  }
 
   async updateSchoolStatus(
     schoolId: string,

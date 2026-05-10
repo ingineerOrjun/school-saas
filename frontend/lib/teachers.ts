@@ -1,4 +1,8 @@
+import { useQuery } from "@tanstack/react-query";
 import { api } from "./api";
+import { useAuthReady } from "@/hooks/useAuthReady";
+import { qk } from "./query-keys";
+import { STALE } from "./query-client";
 
 /**
  * Distinct counts for a teacher's TeachingAssignment rows. Returned
@@ -106,3 +110,32 @@ export const teachersApi = {
   assignmentSummary: (id: string) =>
     api<TeacherAssignmentCounts>(`/teachers/${id}/assignment-summary`),
 };
+
+// ---------------------------------------------------------------------------
+// useTeachers — Phase γ canonical reference hook.
+//
+// Reference data (operator-driven changes only — invitations + manual
+// admin edits). 10m staleTime + no polling + no refetch on mount =
+// every teacher picker / list page reuses the cache.
+//
+// Mutations (createWithUser/update/remove) call teachersApi.*
+// directly + invalidate qk.teachers() targeted only.
+// ---------------------------------------------------------------------------
+
+export function useTeachers() {
+  const { authReady, isAuthenticated } = useAuthReady();
+  return useQuery({
+    queryKey: qk.teachers(),
+    queryFn: () => teachersApi.list(),
+    enabled: authReady && isAuthenticated,
+    staleTime: STALE.REFERENCE_DATA,
+    gcTime: 30 * 60_000,
+    refetchOnWindowFocus: false,
+    refetchOnMount: false,
+    retry: (failureCount, error) => {
+      const status = (error as { status?: number } | null)?.status;
+      if (status === 401 || status === 403) return false;
+      return failureCount < 1;
+    },
+  });
+}

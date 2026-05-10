@@ -1,5 +1,6 @@
 import { Injectable, Logger, NotFoundException } from '@nestjs/common';
 import { Session } from '@prisma/client';
+import { createHash } from 'node:crypto';
 import { PrismaService } from '../database/prisma.service';
 
 // ---------------------------------------------------------------------------
@@ -48,19 +49,60 @@ export class SessionService {
   /**
    * Create a new session row at login. Caller embeds the returned
    * `id` in the JWT's `sid` claim.
+   *
+   * Phase 22:
+   *   • Computes a coarse device fingerprint (SHA-256 of UA +
+   *     IP /24 prefix) and stores it for new-device detection.
+   *   • Records the IP/UA on `lastIp` / `lastUserAgent` too so
+   *     `touch()` has somewhere to write current network info.
+   *   • Logs a WARN line when the fingerprint hasn't been seen
+   *     for this user in the last 30 days — operations can alert
+   *     on the structured log signal.
+   *
+   * Return shape kept backward-compatible (raw Session) so existing
+   * callers + tests don't need a surface change. The new-device
+   * signal flows out via the log line, not the return value.
    */
   async create(input: {
     userId: string;
     ip?: string | null;
     userAgent?: string | null;
   }): Promise<Session> {
-    return this.prisma.session.create({
+    const fingerprint = computeFingerprint({
+      ip: input.ip ?? null,
+      userAgent: input.userAgent ?? null,
+    });
+    // "New device" = no recent (last 30d) ACTIVE session with the
+    // same fingerprint. Quick check via index on
+    // (userId, deviceFingerprint).
+    let isNewDevice = false;
+    if (fingerprint) {
+      const existing = await this.prisma.session.findFirst({
+        where: {
+          userId: input.userId,
+          deviceFingerprint: fingerprint,
+          createdAt: { gte: new Date(Date.now() - 30 * 24 * 60 * 60_000) },
+        },
+        select: { id: true },
+      });
+      isNewDevice = !existing;
+    }
+    const session = await this.prisma.session.create({
       data: {
         userId: input.userId,
         ip: input.ip ?? null,
         userAgent: input.userAgent ?? null,
+        deviceFingerprint: fingerprint,
+        lastIp: input.ip ?? null,
+        lastUserAgent: input.userAgent ?? null,
       },
     });
+    if (isNewDevice) {
+      this.logger.warn(
+        `[security] new device detected user=${input.userId} ip=${input.ip ?? '?'} sessionId=${session.id} fingerprint=${fingerprint ?? '?'}`,
+      );
+    }
+    return session;
   }
 
   /**
@@ -170,6 +212,158 @@ export class SessionService {
     });
     return rows.map(toRow);
   }
+
+  /**
+   * Operator-tier — count active sessions across the platform,
+   * with an "online in the last 15 minutes" sub-count for the
+   * Operations Center KPI row. Both numbers are bounded by an
+   * indexed scan on (revokedAt IS NULL).
+   */
+  async countActiveAcrossPlatform(): Promise<{
+    active: number;
+    onlineLast15m: number;
+  }> {
+    const now = Date.now();
+    const cutoff15m = new Date(now - 15 * 60_000);
+    const [active, onlineLast15m] = await this.prisma.$transaction([
+      this.prisma.session.count({ where: { revokedAt: null } }),
+      this.prisma.session.count({
+        where: { revokedAt: null, lastActiveAt: { gte: cutoff15m } },
+      }),
+    ]);
+    return { active, onlineLast15m };
+  }
+
+  /**
+   * Operator-tier — paginated active sessions across every tenant.
+   * Joins the user + school for the cockpit table. Filters:
+   *
+   *   • q          — free-text contains across user.email + school.name
+   *   • schoolId   — single-tenant drill-in
+   *   • onlyOnline — last-active in the last 15 minutes
+   *
+   * Result shape carries the joined fields so the UI doesn't need a
+   * second round-trip per row. Response capped at 100 rows; the UI
+   * uses the q/schoolId filters when narrowing matters.
+   */
+  async listActiveForOps(input: {
+    q?: string;
+    schoolId?: string;
+    onlyOnline?: boolean;
+    limit?: number;
+  }): Promise<
+    Array<{
+      id: string;
+      createdAt: string;
+      lastActiveAt: string;
+      ip: string | null;
+      userAgent: string | null;
+      user: {
+        id: string;
+        email: string;
+        role: string;
+      };
+      school: {
+        id: string;
+        name: string;
+        slug: string;
+      } | null;
+    }>
+  > {
+    const limit = Math.min(100, Math.max(1, input.limit ?? 50));
+    const where: Record<string, unknown> = { revokedAt: null };
+    if (input.onlyOnline) {
+      where.lastActiveAt = { gte: new Date(Date.now() - 15 * 60_000) };
+    }
+    if (input.schoolId) {
+      where.user = { schoolId: input.schoolId };
+    }
+    if (input.q && input.q.trim().length > 0) {
+      const q = input.q.trim();
+      where.user = {
+        ...((where.user as object) ?? {}),
+        OR: [
+          { email: { contains: q, mode: 'insensitive' } },
+          { school: { name: { contains: q, mode: 'insensitive' } } },
+        ],
+      };
+    }
+    const rows = await this.prisma.session.findMany({
+      where: where as never,
+      orderBy: { lastActiveAt: 'desc' },
+      take: limit,
+      select: {
+        id: true,
+        createdAt: true,
+        lastActiveAt: true,
+        ip: true,
+        userAgent: true,
+        user: {
+          select: {
+            id: true,
+            email: true,
+            role: true,
+            school: { select: { id: true, name: true, slug: true } },
+          },
+        },
+      },
+    });
+    return rows.map((r) => ({
+      id: r.id,
+      createdAt: r.createdAt.toISOString(),
+      lastActiveAt: r.lastActiveAt.toISOString(),
+      ip: r.ip,
+      userAgent: r.userAgent,
+      user: {
+        id: r.user.id,
+        email: r.user.email,
+        role: r.user.role as string,
+      },
+      school: r.user.school
+        ? {
+            id: r.user.school.id,
+            name: r.user.school.name,
+            slug: r.user.school.slug,
+          }
+        : null,
+    }));
+  }
+}
+
+/**
+ * Phase 22 — coarse device fingerprint.
+ *
+ * SHA-256 of:
+ *   • full user-agent string
+ *   • IP /24 prefix (first three octets) so a roaming client on the
+ *     same NAT hash to the same fingerprint without exposing the
+ *     full IP in the hash input
+ *
+ * Returns null when both ip + userAgent are missing — no signal,
+ * no fingerprint. Stable across the life of a session under the
+ * same browser; changes when the user moves to a new device or
+ * rolls IP into a different /24.
+ *
+ * Trade-offs:
+ *   • Coarse on purpose. A real fingerprint (FingerprintJS-style)
+ *     needs client-side JS. Server-side we only have UA + IP.
+ *   • False positives possible (two users on the same NAT with the
+ *     same browser). The "new device detected" UI needs to be soft —
+ *     a notification, not a forced re-auth.
+ */
+function computeFingerprint(input: {
+  ip: string | null;
+  userAgent: string | null;
+}): string | null {
+  if (!input.ip && !input.userAgent) return null;
+  const ipPrefix = input.ip
+    ? input.ip.split('.').slice(0, 3).join('.')
+    : '';
+  const ua = input.userAgent ?? '';
+  return createHash('sha256')
+    .update(`${ua}::${ipPrefix}`, 'utf8')
+    .digest('hex')
+    .slice(0, 32); // 128-bit prefix is plenty
 }
 
 function toRow(row: Session): SessionRow {

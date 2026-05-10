@@ -30,7 +30,7 @@ import {
 import { studentsApi, type StudentDto } from "@/lib/students";
 import { getStoredUser } from "@/lib/auth";
 import {
-  teachingAssignmentsApi,
+  useMyTeachingAssignments,
   type TeachingAssignmentDto,
 } from "@/lib/teaching-assignments";
 import { useAcademicSession } from "@/components/academic-session/AcademicSessionProvider";
@@ -44,9 +44,30 @@ export default function ExamsPage() {
   const [exams, setExams] = React.useState<ExamDto[] | null>(null);
   const [students, setStudents] = React.useState<StudentDto[]>([]);
   // Teacher-only filter set. ADMIN keeps it null → no filtering applied.
-  const [assignments, setAssignments] = React.useState<
-    TeachingAssignmentDto[] | null
-  >(null);
+  // Backed by the shared React Query cache via `useMyTeachingAssignments`
+  // — admins/staff are gated out via `enabled: isTeacher` so they
+  // never burn a request that would always 403.
+  const isTeacher = React.useMemo(
+    () => getStoredUser()?.role === "TEACHER",
+    [],
+  );
+  const {
+    data: rawAssignments,
+    isLoading: assignmentsLoading,
+    error: assignmentsError,
+  } = useMyTeachingAssignments({ enabled: isTeacher });
+  const assignments: TeachingAssignmentDto[] | null = React.useMemo(() => {
+    if (!isTeacher) return null; // ADMIN/STAFF — no filter
+    if (
+      assignmentsError instanceof ApiError &&
+      assignmentsError.status === 403
+    ) {
+      return [];
+    }
+    // While loading, surface as `[]` rather than null so we don't
+    // momentarily expand the picker to the unfiltered admin set.
+    return rawAssignments ?? [];
+  }, [isTeacher, rawAssignments, assignmentsError]);
   const [selectedExamId, setSelectedExamId] = React.useState<string>("");
   const [selectedStudentId, setSelectedStudentId] = React.useState<string>("");
   const [marksByStudent, setMarksByStudent] = React.useState<
@@ -65,24 +86,14 @@ export default function ExamsPage() {
     setLoading(true);
     setError(null);
     try {
-      // For TEACHER users, also pull their assignments so the student
-      // picker and exam-subject list collapse to what they're allowed
-      // to grade. Admins skip the request entirely.
-      const role = getStoredUser()?.role ?? null;
-      const [examList, studentList, myAssignments] = await Promise.all([
+      // Assignments now flow through `useMyTeachingAssignments()`
+      // above — refresh() is responsible only for exams + students.
+      const [examList, studentList] = await Promise.all([
         examsApi.list(selectedSession?.id),
         studentsApi.list(),
-        role === "TEACHER"
-          ? teachingAssignmentsApi.listMine().catch((err) => {
-              // 403 means "not a teacher row yet" — treat as no scope.
-              if (err instanceof ApiError && err.status === 403) return [];
-              throw err;
-            })
-          : Promise.resolve(null),
       ]);
       setExams(examList);
       setStudents(studentList);
-      setAssignments(myAssignments);
     } catch (err) {
       if (err instanceof ApiError && err.status === 401) {
         router.replace("/login");
@@ -388,14 +399,19 @@ export default function ExamsPage() {
     return s ? `${s.firstName} ${s.lastName}` : "";
   }, [students, selectedStudentId]);
 
-  const noStudents = !loading && students.length === 0;
-  const noExams = !loading && exams?.length === 0;
+  // Combined "reference data not ready yet" flag — the imperative
+  // exams/students fetch and the assignments hook resolve independently
+  // now (used to share a Promise.all). Gate skeletons on both so the
+  // body never renders mid-load with a partially-filtered picker.
+  const referenceLoading = loading || (isTeacher && assignmentsLoading);
+  const noStudents = !referenceLoading && students.length === 0;
+  const noExams = !referenceLoading && exams?.length === 0;
 
   return (
     <div className="space-y-6">
       <Header onRefresh={refresh} />
 
-      {loading ? (
+      {referenceLoading ? (
         <ExamsSkeleton />
       ) : error ? (
         <ErrorBanner message={error} onRetry={refresh} />

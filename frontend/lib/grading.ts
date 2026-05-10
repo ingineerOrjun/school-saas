@@ -143,3 +143,60 @@ function round(n: number, places: number): number {
   const p = 10 ** places;
   return Math.round(n * p) / p;
 }
+
+/**
+ * Credit-hour-weighted GPA — client-side mirror of the backend
+ * GradingService.calculateWeightedGPA. Used for instant preview as the
+ * teacher types marks; the backend remains authoritative on save.
+ *
+ * Returns null when:
+ *   • the input is empty, or
+ *   • any subject is NG / has no grade point yet (per NEB rule, ANY NG
+ *     = overall NG — surfaced as null so the UI renders "NG" instead
+ *     of a misleading averaged number).
+ *
+ * Coexists with the legacy `gpa(gradePoints)` above; that one is a
+ * simple arithmetic mean and remains for callers that haven't moved to
+ * the weighted formula yet.
+ */
+export function calculateWeightedGPA(
+  results: Array<{
+    gradePoint: number | null | undefined;
+    creditHours: number | null | undefined;
+    letterGrade: string | null | undefined;
+  }>,
+): number | null {
+  if (!results || results.length === 0) return null;
+  const hasNG = results.some(
+    (r) => !r.letterGrade || r.letterGrade === "NG" || r.gradePoint == null,
+  );
+  if (hasNG) return null;
+  const totalCredits = results.reduce(
+    (sum, r) => sum + (r.creditHours ?? 5),
+    0,
+  );
+  if (totalCredits === 0) return null;
+  const weightedSum = results.reduce(
+    (sum, r) => sum + (r.gradePoint as number) * (r.creditHours ?? 5),
+    0,
+  );
+  return Math.round((weightedSum / totalCredits) * 100) / 100;
+}
+
+/**
+ * Maps a computed GPA to a letter grade — the official CDC overall-GPA
+ * mapping (3.6 → A+, 3.2 → A, ...). Intentionally different from the
+ * per-subject `grade(percentage)` scale: those agree at the endpoints
+ * but diverge in the middle bands.
+ */
+export function gpaToLetterGrade(gpa: number | null | undefined): string {
+  if (gpa == null) return "NG";
+  if (gpa >= 3.6) return "A+";
+  if (gpa >= 3.2) return "A";
+  if (gpa >= 2.8) return "B+";
+  if (gpa >= 2.4) return "B";
+  if (gpa >= 2.0) return "C+";
+  if (gpa >= 1.6) return "C";
+  if (gpa >= 1.2) return "D";
+  return "NG";
+}

@@ -1,12 +1,17 @@
 "use client";
 
 import * as React from "react";
+import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { ApiError } from "./api";
 import { getStoredSchool } from "./auth";
 import {
   dashboardApi,
   type DashboardSummary,
 } from "./dashboard";
+import { useAuthReady } from "@/hooks/useAuthReady";
+import { qk } from "./query-keys";
+import { STALE } from "./query-client";
+import { shouldAllowRequest } from "./request-cooldown";
 import type { StudentDto } from "./students";
 import { studentsApi } from "./students";
 import type {
@@ -15,6 +20,30 @@ import type {
   Student,
   StudentStatus,
 } from "./types";
+
+// ---------------------------------------------------------------------------
+// useDashboardData — Phase α fix (was: raw useEffect+fetch).
+//
+// Backed by React Query so multiple components on the same page +
+// React 18 StrictMode dev double-mounts collapse to ONE underlying
+// /dashboard/summary fetch. Public API is unchanged from the prior
+// implementation — every consumer (AdminDashboardView,
+// TeacherDashboardView, analytics OverviewTab) keeps working.
+//
+// Why this was 429-ing:
+//   The previous version did `useEffect(() => fetch(), [])` which
+//   in dev double-fires because of StrictMode, and which has no
+//   shared cache so every component using the hook ran its own
+//   request. Two-three consumers + a fast nav between /dashboard
+//   and /analytics rapidly hit the default 600/min throttle bucket
+//   on dev sessions where the same JWT bursts requests on multiple
+//   tabs.
+//
+// Now: shared `qk.dashboardSummary` key, 60s staleTime so a
+// refresh during the freshness window returns from cache, and
+// `refresh()` triggers an explicit `refetch()` for the
+// pull-to-refresh affordance.
+// ---------------------------------------------------------------------------
 
 export type DashboardState = "loading" | "empty" | "ready" | "error";
 
@@ -49,150 +78,114 @@ export interface UseDashboardData {
 
 const FALLBACK_SCHOOL_NAME = "your school";
 
-/**
- * Dashboard data layer backed by a single aggregate endpoint.
- *
- * Fetches `GET /dashboard/summary` once on mount, and again on demand
- * via `refresh()`. The JWT is attached automatically by the `api()`
- * client (it reads `scholaris:token` from localStorage).
- *
- * The response shape is used directly — there's no `{ data: ... }`
- * envelope on this backend.
- */
 export function useDashboardData(): UseDashboardData {
-  const [state, setState] = React.useState<DashboardState>("loading");
-  const [summary, setSummary] = React.useState<DashboardSummary | null>(null);
-  const [schoolName, setSchoolName] = React.useState<string>(
-    FALLBACK_SCHOOL_NAME,
-  );
-  const [error, setError] = React.useState<string | null>(null);
-  const [refreshing, setRefreshing] = React.useState(false);
-  const [allStudents, setAllStudents] = React.useState<StudentDto[]>([]);
-  const [loadingStudents, setLoadingStudents] = React.useState(false);
+  const qc = useQueryClient();
+  const { authReady, isAuthenticated } = useAuthReady();
 
-  // Seed the school name from localStorage so the greeting shows
-  // immediately, before the API responds.
-  React.useEffect(() => {
-    const stored = getStoredSchool();
-    if (stored?.name) setSchoolName(stored.name);
-  }, []);
+  // Seed school name from localStorage so the greeting renders
+  // immediately, before the query resolves.
+  const [schoolName, setSchoolName] = React.useState<string>(() => {
+    if (typeof window === "undefined") return FALLBACK_SCHOOL_NAME;
+    return getStoredSchool()?.name ?? FALLBACK_SCHOOL_NAME;
+  });
 
-  const load = React.useCallback(
-    async (isRefresh: boolean): Promise<void> => {
-      if (isRefresh) setRefreshing(true);
-      else setState("loading");
-      setError(null);
-
-      try {
-        const data = await dashboardApi.getSummary();
-
-        // REQUIREMENT: log the response so the shape is verifiable in
-        // the browser console.
-        console.log("[dashboard] /dashboard/summary response:", data);
-
-        setSummary(data);
-
-        // Prefer the live school name over the one in localStorage —
-        // the backend is the source of truth.
-        if (data.school?.name) setSchoolName(data.school.name);
-
-        const hasAnyContent =
-          data.stats.totalStudents > 0 || data.stats.totalTeachers > 0;
-        setState(hasAnyContent ? "ready" : "empty");
-      } catch (err) {
-        console.error("[dashboard] failed to load summary:", err);
-
-        // 401 intentionally propagates — the page uses it to redirect
-        // to /login.
-        if (err instanceof ApiError && err.status === 401) {
-          setState("error");
-          throw err;
-        }
-        const msg =
-          err instanceof ApiError
-            ? err.message
-            : err instanceof Error
-              ? err.message
-              : "Failed to load dashboard.";
-        setError(msg);
-        setState("error");
-      } finally {
-        if (isRefresh) setRefreshing(false);
-      }
+  const summary = useQuery<DashboardSummary, ApiError>({
+    queryKey: qk.dashboardSummary,
+    queryFn: () => dashboardApi.getSummary(),
+    // Phase α follow-up — gate on the subscribable auth-store. The
+    // previous version fired on first render which on a cold reload
+    // raced the localStorage restore + produced user=<anon> 429s.
+    enabled: authReady && isAuthenticated,
+    staleTime: STALE.SEMI_STATIC,
+    refetchOnWindowFocus: false,
+    refetchOnMount: false,
+    retry: (failureCount, error) => {
+      // 401 → user is logged out, no point retrying.
+      if (error?.status === 401 || error?.status === 403) return false;
+      return failureCount < 1;
     },
-    [],
-  );
+  });
 
+  // Prefer the live school name when the query lands.
   React.useEffect(() => {
-    let cancelled = false;
-    (async () => {
-      try {
-        await load(false);
-      } catch {
-        if (!cancelled) setState("error");
-      }
-    })();
-    return () => {
-      cancelled = true;
-    };
-  }, [load]);
-
-  const refresh = React.useCallback(async () => {
-    try {
-      await load(true);
-    } catch {
-      /* component already reflects the error state */
+    if (summary.data?.school?.name) {
+      setSchoolName(summary.data.school.name);
     }
-  }, [load]);
+  }, [summary.data?.school?.name]);
 
-  /**
-   * On-demand fetch of the full student list. The dashboard endpoint
-   * only returns the 5 most-recent students to keep the payload small;
-   * the full list is needed for the "Export CSV" action and is fetched
-   * only when the user asks for it.
-   */
+  // On-demand student-list fetch for CSV export. Kept as a separate
+  // mutation so it doesn't run on dashboard mount (keeps the
+  // critical-path payload small).
+  const studentsMutation = useMutation({
+    mutationFn: () => studentsApi.list(),
+  });
   const ensureStudentsLoaded = React.useCallback(async () => {
-    if (allStudents.length > 0) return allStudents;
-    setLoadingStudents(true);
-    try {
-      const list = await studentsApi.list();
-      setAllStudents(list);
-      return list;
-    } finally {
-      setLoadingStudents(false);
+    if (studentsMutation.data && studentsMutation.data.length > 0) {
+      return studentsMutation.data;
     }
-  }, [allStudents]);
+    return studentsMutation.mutateAsync();
+  }, [studentsMutation]);
 
-  // Translate the backend summary into the UI's DashboardData shape.
+  // Two-layer suppression so the Refresh button can't be weaponised:
+  //   1. `isFetching` guard — if a fetch is already in flight, the
+  //      click is a no-op (no point invalidating; the result will
+  //      land momentarily anyway).
+  //   2. 2s cooldown — if the user clicks again within 2s of the
+  //      previous fire, the click is also a no-op (covers the race
+  //      where setState hasn't committed yet so isFetching reads
+  //      stale).
+  // The explicit `summary.refetch()` is gone: invalidateQueries
+  // already triggers a refetch for active observers, so the second
+  // call was redundant request pressure.
+  const isFetching = summary.isFetching;
+  const refresh = React.useCallback(async () => {
+    if (isFetching) return;
+    if (!shouldAllowRequest("dashboard-summary-refresh", 2000)) return;
+    await qc.invalidateQueries({ queryKey: qk.dashboardSummary });
+  }, [qc, isFetching]);
+
+  // Translate backend → UI shape. Memoised to avoid re-creating the
+  // inner arrays on every render.
   const data: DashboardData | null = React.useMemo(() => {
-    if (!summary) return null;
+    const s = summary.data;
+    if (!s) return null;
     return {
       stats: {
-        totalStudents: summary.stats.totalStudents,
-        totalTeachers: summary.stats.totalTeachers,
-        attendanceTodayPct: summary.stats.attendanceTodayPct,
-        feesCollected: summary.stats.feesCollected,
-        totalCredit: summary.stats.totalCredit,
-        studentsDelta: summary.stats.studentsDelta,
-        teachersDelta: summary.stats.teachersDelta,
-        attendanceDelta: summary.stats.attendanceDelta,
-        feesDelta: summary.stats.feesDelta,
+        totalStudents: s.stats.totalStudents,
+        totalTeachers: s.stats.totalTeachers,
+        attendanceTodayPct: s.stats.attendanceTodayPct,
+        feesCollected: s.stats.feesCollected,
+        totalCredit: s.stats.totalCredit,
+        studentsDelta: s.stats.studentsDelta,
+        teachersDelta: s.stats.teachersDelta,
+        attendanceDelta: s.stats.attendanceDelta,
+        feesDelta: s.stats.feesDelta,
       },
-      recentStudents: summary.recentStudents.map<Student>((s) => ({
-        id: s.id,
-        firstName: s.firstName,
-        lastName: s.lastName,
-        grade: s.className ?? "Unassigned",
-        section: s.sectionName ?? "Whole class",
+      recentStudents: s.recentStudents.map<Student>((row) => ({
+        id: row.id,
+        firstName: row.firstName,
+        lastName: row.lastName,
+        grade: row.className ?? "Unassigned",
+        section: row.sectionName ?? "Whole class",
         status: "Active" as StudentStatus,
-        fees: s.feeStatus as FeeStatus,
+        fees: row.feeStatus as FeeStatus,
       })),
     };
-  }, [summary]);
+  }, [summary.data]);
+
+  const state: DashboardState = React.useMemo(() => {
+    if (summary.isLoading) return "loading";
+    if (summary.error) return "error";
+    if (!summary.data) return "loading";
+    const hasAnyContent =
+      summary.data.stats.totalStudents > 0 ||
+      summary.data.stats.totalTeachers > 0;
+    return hasAnyContent ? "ready" : "empty";
+  }, [summary.isLoading, summary.error, summary.data]);
 
   const onboarding = React.useMemo(
-    () => buildOnboarding(state, summary),
-    [state, summary],
+    () => buildOnboarding(state, summary.data ?? null),
+    [state, summary.data],
   );
 
   return {
@@ -200,12 +193,12 @@ export function useDashboardData(): UseDashboardData {
     data,
     school: { name: schoolName },
     onboarding,
-    error,
-    allStudents,
-    loadingStudents,
+    error: summary.error?.message ?? null,
+    allStudents: studentsMutation.data ?? [],
+    loadingStudents: studentsMutation.isPending,
     ensureStudentsLoaded,
     refresh,
-    refreshing,
+    refreshing: summary.isFetching && !summary.isLoading,
   };
 }
 

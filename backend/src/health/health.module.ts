@@ -1,5 +1,7 @@
 import { Global, Module } from '@nestjs/common';
 import { DatabaseModule } from '../database/database.module';
+import { StartupDiagnosticsService } from '../common/observability/startup-diagnostics.service';
+import { HealthController } from './health.controller';
 import { HealthService } from './health.service';
 
 // ---------------------------------------------------------------------------
@@ -18,7 +20,8 @@ import { HealthService } from './health.service';
 @Global()
 @Module({
   imports: [DatabaseModule],
-  providers: [HealthService],
-  exports: [HealthService],
+  controllers: [HealthController],
+  providers: [HealthService, StartupDiagnosticsService],
+  exports: [HealthService, StartupDiagnosticsService],
 })
 export class HealthModule {}

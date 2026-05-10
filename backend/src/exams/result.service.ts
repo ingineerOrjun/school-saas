@@ -30,6 +30,8 @@ export interface ResultRow {
   letterGrade: LetterGrade;
   letterGradeLabel: string;
   gradePoint: number;
+  /** Credit-hour weight used in the subject's contribution to weighted GPA. */
+  creditHours: number;
 }
 
 export interface StudentReport {
@@ -39,7 +41,29 @@ export interface StudentReport {
   studentFirstName: string;
   studentLastName: string;
   results: ResultRow[];
+  /**
+   * Credit-hour-weighted GPA per the Nepal CDC progress-report formula:
+   *   GPA = Σ(gradePoint × creditHours) / Σ(creditHours)
+   * Returns the sentinel `-1` when any subject is NG (overall is NG in
+   * that case — see `gpaLetterGrade` and `hasFailingSubject` for the
+   * authoritative pass status). `-1` is outside the valid 0.0–4.0 GPA
+   * range so it cannot collide with a real value, distinguishing NG
+   * from a student who genuinely scored 0.0. Field shape (`number`) is
+   * preserved for back-compat with existing callers; renderers should
+   * guard with `gpa < 0` (or check `gpaLetterGrade === "NG"`) before
+   * calling `.toFixed(2)`.
+   */
   gpa: number;
+  /**
+   * Letter grade derived from `gpa` via the CDC overall-GPA mapping
+   * (3.6 → A+, 3.2 → A, ...). Returns "NG" when any subject is NG.
+   * This is the field UIs should render as the headline "Final
+   * Result" — `overallLetterGrade` / `overallLetterGradeLabel` use
+   * the older percentage-based mapping and remain for back-compat.
+   */
+  gpaLetterGrade: string;
+  /** Sum of credit hours used as the weighted-GPA denominator. */
+  totalCreditHours: number;
   /**
    * Final letter grade after NEB rules.
    * If any subject is NG, this is forced to NG regardless of the computed GPA.
@@ -54,6 +78,8 @@ export interface StudentReport {
 export interface LedgerSubject {
   id: string;
   name: string;
+  /** Credit-hour weight used in the per-student weighted GPA. */
+  creditHours: number;
 }
 
 /** Per-subject cell on a student's ledger row. */
@@ -201,6 +227,7 @@ export class ResultService {
         name: true,
         theoryFullMarks: true,
         practicalFullMarks: true,
+        creditHours: true,
       },
     });
     if (subjects.length !== subjectIds.length) {
@@ -283,6 +310,13 @@ export class ResultService {
       }),
     );
 
+    // Phase γ — re-sync the StudentAcademicRecord GPA snapshot for the
+    // session this exam lives in. Fire-and-forget: a stale snapshot is
+    // recoverable; a rolled-back marks save isn't.
+    void this.recalculateStudentGPA(dto.studentId, sessionId).catch(() => {
+      // Intentional no-op — see helper docstring.
+    });
+
     return this.getStudentReport(dto.examId, dto.studentId, schoolId);
   }
 
@@ -350,6 +384,7 @@ export class ResultService {
         name: true,
         theoryFullMarks: true,
         practicalFullMarks: true,
+        creditHours: true,
       },
     });
     if (!subject) {
@@ -458,6 +493,15 @@ export class ResultService {
       }),
     );
 
+    // Phase γ — fan out a fire-and-forget GPA snapshot recompute for
+    // every student touched. updateMany on each is cheap (no row-found
+    // is the no-op happy path for the unpromoted current session).
+    for (const studentId of uniqueIds) {
+      void this.recalculateStudentGPA(studentId, sessionId).catch(() => {
+        // Intentional no-op — see helper docstring.
+      });
+    }
+
     return { successCount: dto.entries.length };
   }
 
@@ -531,6 +575,7 @@ export class ResultService {
         name: true,
         theoryFullMarks: true,
         practicalFullMarks: true,
+        creditHours: true,
       },
     });
     if (!subject) {
@@ -689,6 +734,7 @@ export class ResultService {
         name: true,
         theoryFullMarks: true,
         practicalFullMarks: true,
+        creditHours: true,
       },
     });
     if (!subject) {
@@ -815,6 +861,16 @@ export class ResultService {
       }),
     );
 
+    // Phase γ — fire-and-forget GPA snapshot recompute for every
+    // student in the writable batch. See helper for why this is
+    // safe to ignore on failure.
+    const touchedStudents = new Set(writable.map((w) => w.studentId));
+    for (const studentId of touchedStudents) {
+      void this.recalculateStudentGPA(studentId, sessionId).catch(() => {
+        // Intentional no-op — see helper docstring.
+      });
+    }
+
     return { success: true, updatedCount: writable.length };
   }
 
@@ -838,6 +894,7 @@ export class ResultService {
             name: true,
             theoryFullMarks: true,
             practicalFullMarks: true,
+            creditHours: true,
           },
         },
       },
@@ -869,11 +926,32 @@ export class ResultService {
         letterGrade: r.letterGrade,
         letterGradeLabel: labelOf(r.letterGrade),
         gradePoint: r.gradePoint,
+        creditHours: r.subject.creditHours ?? 5,
       };
     });
 
-    const gpa = this.grading.gpa(results.map((r) => r.gradePoint));
+    // Credit-hour-weighted GPA (CDC progress-report formula). Returns null
+    // when any subject is NG; we surface that as gpa=-1 (out-of-range
+    // sentinel — 0 was ambiguous with a genuine 0.0 GPA) plus
+    // gpaLetterGrade='NG'. Existing UIs that call `.toFixed(2)` must
+    // guard with `gpa < 0` before formatting.
+    const weightedGpa = this.grading.calculateWeightedGPA(
+      rows.map((r) => ({
+        gradePoint: r.gradePoint,
+        creditHours: r.subject.creditHours ?? 5,
+        letterGrade: labelOf(r.letterGrade),
+      })),
+    );
+    const gpa = weightedGpa ?? -1;
+    const gpaLetterGrade = this.grading.gpaToLetterGrade(weightedGpa);
+    const totalCreditHours = rows.reduce(
+      (sum, r) => sum + (r.subject.creditHours ?? 5),
+      0,
+    );
+
     // NEB rule: if any subject is NG, the final result is NG regardless of GPA.
+    // Kept on the legacy fields below for back-compat with any UI that still
+    // reads them.
     const hasFailingSubject = results.some(
       (r) => r.letterGrade === LetterGrade.NG,
     );
@@ -889,6 +967,8 @@ export class ResultService {
       studentLastName: student.lastName,
       results,
       gpa,
+      gpaLetterGrade,
+      totalCreditHours,
       overallLetterGrade: overall.letterGrade,
       overallLetterGradeLabel: overall.letterGradeLabel,
       hasFailingSubject,
@@ -980,7 +1060,7 @@ export class ResultService {
     const [subjects, students] = await Promise.all([
       this.prisma.examSubject.findMany({
         where: { examId },
-        select: { id: true, name: true },
+        select: { id: true, name: true, creditHours: true },
         orderBy: { name: 'asc' },
       }),
       this.prisma.student.findMany({
@@ -1040,6 +1120,10 @@ export class ResultService {
       resultByKey.set(`${r.studentId}:${r.subjectId}`, r);
     }
 
+    // Index subjects by id for O(1) creditHours lookup when computing
+    // each student's weighted GPA below.
+    const subjectById = new Map(subjects.map((s) => [s.id, s]));
+
     const studentRows: LedgerStudentRow[] = students.map((student) => {
       const cells: LedgerCell[] = subjects.map((subj) => {
         const r = resultByKey.get(`${student.id}:${subj.id}`);
@@ -1057,13 +1141,18 @@ export class ResultService {
       let gpa = 0;
       let finalResult: string | null = null;
       if (recordedCells.length > 0) {
-        const points = recordedCells.map((c) => c.gradePoint ?? 0);
-        gpa = this.grading.gpa(points);
-        // NEB rule: any NG forces overall to NG, regardless of GPA.
-        const hasNg = recordedCells.some((c) => c.grade === 'NG');
-        finalResult = hasNg
-          ? 'NG'
-          : this.grading.grade(gpa * 25).letterGradeLabel;
+        // Credit-hour-weighted GPA — same formula as getStudentReport.
+        // calculateWeightedGPA returns null when ANY subject is NG, which
+        // is exactly the NEB rule we want for `finalResult`.
+        const weightedGpa = this.grading.calculateWeightedGPA(
+          recordedCells.map((c) => ({
+            gradePoint: c.gradePoint,
+            creditHours: subjectById.get(c.subjectId)?.creditHours ?? 5,
+            letterGrade: c.grade ?? 'NG',
+          })),
+        );
+        gpa = weightedGpa ?? 0;
+        finalResult = this.grading.gpaToLetterGrade(weightedGpa);
       }
 
       return {
@@ -1084,6 +1173,68 @@ export class ResultService {
       students: studentRows,
       generatedAt: new Date().toISOString(),
     };
+  }
+
+  /**
+   * Recompute the credit-hour-weighted GPA snapshot stored on
+   * `StudentAcademicRecord` for the given (student, session) pair, using
+   * EVERY result the student has across every exam in that session.
+   *
+   * Called after a result save so that — if the student's session has
+   * already been promoted (i.e. a StudentAcademicRecord row exists) —
+   * any retroactive marks correction immediately re-syncs the archived
+   * GPA. For the CURRENT (unpromoted) session, no row exists yet and
+   * `updateMany` is a 0-row no-op; that's fine and intentional. The
+   * row that gets created at promotion time will pick up whatever the
+   * latest results say.
+   *
+   * Errors here are swallowed by the caller (fire-and-forget) — a
+   * transient DB hiccup must not roll back the marks the teacher just
+   * entered. Worst case: the cached GPA snapshot is stale until the
+   * next save or until the promotion service rebuilds it.
+   */
+  private async recalculateStudentGPA(
+    studentId: string,
+    sessionId: string | null,
+  ): Promise<void> {
+    if (!sessionId) return;
+
+    // Pull every result for this student where the parent exam sits in
+    // this session. We filter via the relation so cross-session leaks
+    // aren't possible even if a Result row's denormalized sessionId is
+    // out of step with its exam.
+    const results = await this.prisma.result.findMany({
+      where: {
+        studentId,
+        exam: { sessionId },
+      },
+      include: {
+        subject: { select: { creditHours: true } },
+      },
+    });
+
+    if (results.length === 0) return;
+
+    const gpaInputs = results.map((r) => ({
+      gradePoint: r.gradePoint,
+      creditHours: r.subject?.creditHours ?? 5,
+      letterGrade: labelOf(r.letterGrade),
+    }));
+
+    const gpa = this.grading.calculateWeightedGPA(gpaInputs);
+    const gpaLetterGrade = this.grading.gpaToLetterGrade(gpa);
+    const totalCreditHours = results.reduce(
+      (sum, r) => sum + (r.subject?.creditHours ?? 5),
+      0,
+    );
+
+    // Only update if a StudentAcademicRecord exists; do not create one.
+    // updateMany returns 0 affected rows for the unpromoted current
+    // session — that's the intended no-op path.
+    await this.prisma.studentAcademicRecord.updateMany({
+      where: { studentId, sessionId },
+      data: { gpa, gpaLetterGrade, totalCreditHours },
+    });
   }
 }
 

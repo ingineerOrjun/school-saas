@@ -16,7 +16,7 @@ import {
   Sparkles,
 } from "lucide-react";
 import { ApiError } from "@/lib/api";
-import { getStoredUser } from "@/lib/auth";
+import { shouldAllowRequest } from "@/lib/request-cooldown";
 import { Button } from "@/components/ui/Button";
 import { Skeleton } from "@/components/ui/Skeleton";
 import { Table, THead, TBody, Tr, Th, Td } from "@/components/ui/Table";
@@ -27,7 +27,7 @@ import {
   type TeacherDashboardSummary,
 } from "@/lib/dashboard";
 import {
-  teachingAssignmentsApi,
+  useMyTeachingAssignments,
   type TeachingAssignmentDto,
 } from "@/lib/teaching-assignments";
 import {
@@ -51,17 +51,36 @@ import { cn } from "@/lib/utils";
 export function TeacherDashboardView() {
   const router = useRouter();
   const [data, setData] = React.useState<TeacherDashboardSummary | null>(null);
-  // Source of truth for "what am I assigned to?". Fetched in parallel
-  // with the summary so a freshly-added assignment is reflected on the
-  // very next refresh — no waiting for the dashboard aggregator to
-  // re-derive its own copy. Permission checks server-side use the same
-  // table, so the two views can never disagree.
-  const [myAssignments, setMyAssignments] = React.useState<
-    TeachingAssignmentDto[] | null
-  >(null);
+  // Source of truth for "what am I assigned to?". Backed by the shared
+  // `useMyTeachingAssignments()` React Query cache (10m staleTime /
+  // 30m gcTime, no refetch-on-mount/focus) so multiple tabs and the
+  // other ~4 callers across the app share one underlying request and
+  // don't burn rate-limit quota. The legacy fast-burst polling that
+  // used to drive this state was removed alongside the migration —
+  // assignments change rarely (admin reassign, days/weeks apart), so
+  // the long staleTime is deliberate. No refetch path is wired here:
+  // the cache updates naturally when staleTime expires; an admin
+  // reassign that needs to land sooner is surfaced by full-page
+  // navigation/reload (which mounts a fresh QueryClient state).
+  const {
+    data: rawAssignments,
+    isLoading: assignmentsLoading,
+    error: assignmentsError,
+  } = useMyTeachingAssignments();
   const [loading, setLoading] = React.useState(true);
   const [refreshing, setRefreshing] = React.useState(false);
   const [error, setError] = React.useState<string | null>(null);
+
+  // 403 here means "no Teacher row / role mismatch" — the existing UX
+  // is to render the unassigned hero, NOT the page-level error banner.
+  // Other errors fall through to the error-banner branch in the early
+  // returns below.
+  const myAssignments = React.useMemo<TeachingAssignmentDto[] | null>(() => {
+    if (assignmentsError instanceof ApiError && assignmentsError.status === 403) {
+      return [];
+    }
+    return rawAssignments ?? null;
+  }, [rawAssignments, assignmentsError]);
   // Class-scoped attendance trend for the sparkline. Fetched
   // alongside the summary so the dashboard renders in one pass.
   // Falls back to null on error / no-assignment — the StatCard then
@@ -69,48 +88,32 @@ export function TeacherDashboardView() {
   const [trend, setTrend] = React.useState<AttendanceTrend | null>(null);
 
   const load = React.useCallback(async (isRefresh: boolean) => {
-    if (isRefresh) setRefreshing(true);
-    else setLoading(true);
+    if (isRefresh) {
+      // Two-layer suppression for repeated Refresh / "Check again"
+      // taps + UnassignedHero's 7s self-poll while the user is
+      // mashing buttons:
+      //   1. shared-module cooldown (2s) catches the rapid-click
+      //      race where setRefreshing(true) hasn't committed yet
+      //      so the button briefly stays clickable.
+      //   2. setRefreshing(true) drives the button's loading state
+      //      so subsequent clicks are visually blocked too.
+      if (!shouldAllowRequest("teacher-summary-refresh", 2000)) return;
+      setRefreshing(true);
+    } else {
+      setLoading(true);
+    }
     setError(null);
     try {
-      // GUARD: only call /teachers/me/assignments when the caller is
-      // actually a TEACHER. The endpoint is gated by @Roles(TEACHER)
-      // and 403s everyone else. With the current 401-only auto-logout
-      // policy, a 403 from this call doesn't log the user out — but
-      // we still avoid firing it for non-TEACHER cached users so the
-      // network panel stays clean.
-      const cachedUser = getStoredUser();
-      const isTeacher = cachedUser?.role === "TEACHER";
-
-      // Tolerate a 403 from listMine specifically — the call CAN 403
-      // legitimately (no Teacher profile linked, role mismatch on a
-      // stale token, etc.) and the right response is "render the
-      // empty hero," NOT propagate to the page-level error state and
-      // NOT log out. 401s still propagate to the catch below where
-      // they get turned into a /login redirect.
-      const safeListMine = async (): Promise<TeachingAssignmentDto[]> => {
-        try {
-          return await teachingAssignmentsApi.listMine();
-        } catch (err) {
-          if (err instanceof ApiError && err.status === 403) {
-            return [];
-          }
-          throw err;
-        }
-      };
-
-      const [summary, assignments] = await Promise.all([
-        dashboardApi.getTeacherSummary(),
-        isTeacher
-          ? safeListMine()
-          : Promise.resolve<TeachingAssignmentDto[]>([]),
-      ]);
+      // Assignments flow through the React Query cache
+      // (`useMyTeachingAssignments`) above — load() is responsible
+      // only for the dashboard summary. Refreshing the assignments
+      // cache is intentionally NOT triggered from here so that
+      // background pollers (e.g. UnassignedHero's 7s self-poll) only
+      // re-check the unassigned state via the summary endpoint and
+      // never burn quota re-pulling reference data. The assignments
+      // cache updates naturally when its 10m staleTime expires.
+      const summary = await dashboardApi.getTeacherSummary();
       setData(summary);
-      setMyAssignments(assignments);
-      // Diagnostic — pair with the admin-side "Assignments (admin
-      // save result)" log to spot mismatches between "what was saved"
-      // and "what the teacher's dashboard reads back".
-      console.log("Assignments:", assignments);
     } catch (err) {
       // 401 — token expired/invalid. Global handler in api.ts already
       // started the redirect; keep the early return so this view
@@ -143,15 +146,32 @@ export function TeacherDashboardView() {
   // doesn't re-collapse to the skeleton — content stays visible
   // and the hero's spinner is the only signal of work.
   //
-  // Both `visibilitychange` and `focus` are wired so we catch
-  // tab-switch (visibility) AND window-switch / alt-tab (focus).
-  // The dedupe is implicit: load() ignores the in-flight call's
-  // result if the component unmounts between fire and resolve.
+  // Both `visibilitychange` (document-level per the HTML spec) and
+  // `focus` (window-level) are wired so we catch tab-switch
+  // (visibility) AND window-switch / alt-tab (focus).
+  //
+  // Two filters protect the throttle bucket from focus-event storms:
+  //   1. Visibility filter — DevTools attach/detach, OS notifications
+  //      stealing focus, etc. fire `focus` even while the tab is
+  //      hidden. Skip when not visible.
+  //   2. 2s cooldown — a single user-visible alt-tab can fire
+  //      visibilitychange + focus back-to-back; without coalescing
+  //      that's two `load(true)` calls per real "the user came back"
+  //      event. The cooldown is captured in a closure so the timer
+  //      survives across both listeners.
   React.useEffect(() => {
+    let lastFire = 0;
     const onWake = () => {
-      if (document.visibilityState === "visible") {
-        void load(true);
+      if (
+        typeof document !== "undefined" &&
+        document.visibilityState !== "visible"
+      ) {
+        return;
       }
+      const now = Date.now();
+      if (now - lastFire < 2_000) return;
+      lastFire = now;
+      void load(true);
     };
     document.addEventListener("visibilitychange", onWake);
     window.addEventListener("focus", onWake);
@@ -161,74 +181,21 @@ export function TeacherDashboardView() {
     };
   }, [load]);
 
-  // Two-phase background polling.
+  // Removed: the two-phase background polling effect (5s fast-burst
+  // for the first 12s, 45s thereafter). It was the single largest
+  // source of redundant /teachers/me/assignments traffic and the
+  // primary cause of the 429s on that endpoint. Assignments are
+  // reference data — admin reassigns happen days/weeks apart — so
+  // they're now cached for 10 min via `useMyTeachingAssignments()`.
   //
-  //   Phase 1 — FAST burst (5s) for the first ~12s after mount.
-  //   Phase 2 — SLOW (45s) thereafter, until unmount.
-  //
-  // The burst exists to catch the most common race: admin assigns a
-  // teacher, then the teacher (or you, on the teacher's behalf)
-  // immediately opens / refreshes the dashboard. Polling at 45s would
-  // mean a 45-second wait to confirm the change landed; 5s feels
-  // instantaneous. After ~12s we drop to 45s so we don't hammer the
-  // API for a tab the teacher is just glancing at.
-  //
-  // Pause when the tab is hidden; restart when it's visible again.
-  // The phase-swap timer fires REGARDLESS of visibility — if the
-  // tab was hidden when 12s elapsed we still flip the flag, so a
-  // hidden-then-visible cycle resumes at the slow rate.
-  //
-  // Focus / visibility wake also runs an immediate one-shot refresh
-  // (separate effect above), which covers the "tab was hidden during
-  // the burst" gap.
-  React.useEffect(() => {
-    const FAST_MS = 5_000;
-    const SLOW_MS = 45_000;
-    const FAST_BURST_MS = 12_000;
-
-    let intervalId: number | undefined;
-    let isFastPhase = true;
-
-    const startInterval = () => {
-      if (intervalId !== undefined) return;
-      intervalId = window.setInterval(
-        () => void load(true),
-        isFastPhase ? FAST_MS : SLOW_MS,
-      );
-    };
-
-    const stopInterval = () => {
-      if (intervalId === undefined) return;
-      window.clearInterval(intervalId);
-      intervalId = undefined;
-    };
-
-    // After the burst window, swap to slow. Fires regardless of
-    // visibility so the phase flag is always correct on the next
-    // visibility-resume.
-    const switchTimeoutId = window.setTimeout(() => {
-      isFastPhase = false;
-      if (intervalId !== undefined) {
-        // Already polling — restart so the new cadence takes effect.
-        stopInterval();
-        startInterval();
-      }
-    }, FAST_BURST_MS);
-
-    if (document.visibilityState === "visible") startInterval();
-
-    const onVisibility = () => {
-      if (document.visibilityState === "visible") startInterval();
-      else stopInterval();
-    };
-    document.addEventListener("visibilitychange", onVisibility);
-
-    return () => {
-      document.removeEventListener("visibilitychange", onVisibility);
-      window.clearTimeout(switchTimeoutId);
-      stopInterval();
-    };
-  }, [load]);
+  // Refresh paths in this file (Refresh button, visibility wake,
+  // UnassignedHero's 7s self-poll, error-banner Try Again) all flow
+  // through `load(true)`, which now refreshes ONLY the dashboard
+  // summary — assignments are deliberately NOT re-fetched. The
+  // unassigned-state poll exists only to detect "did my admin assign
+  // me yet?" via the summary; reference-data refetches would burn
+  // quota for no UX benefit. The assignments cache updates naturally
+  // when its staleTime expires or on full-page reload.
 
   // Derived assignment list, built via useMemo so the reference
   // is stable across renders that don't actually change the inputs.
@@ -298,17 +265,29 @@ export function TeacherDashboardView() {
 
   // ---- Early-return states (rendered AFTER all hooks have run) ----
 
-  if (loading) {
+  // Both data sources must finish loading before we render the page —
+  // otherwise the skeleton would briefly flicker as one side resolves
+  // and the other hasn't.
+  if (loading || assignmentsLoading) {
     return <TeacherDashboardSkeleton />;
   }
 
-  if (error || !data || myAssignments === null) {
+  // 403 from assignments is handled inside the useMemo above (renders
+  // as empty → UnassignedHero). Any OTHER error from the assignments
+  // hook propagates to the page-level banner alongside summary errors.
+  const assignmentsErrorBlocking =
+    assignmentsError &&
+    !(assignmentsError instanceof ApiError && assignmentsError.status === 403);
+
+  if (error || assignmentsErrorBlocking || !data || myAssignments === null) {
+    const msg =
+      error ??
+      (assignmentsErrorBlocking && assignmentsError instanceof Error
+        ? assignmentsError.message
+        : "Failed to load dashboard.");
     return (
       <div className="space-y-6">
-        <ErrorBanner
-          message={error ?? "Failed to load dashboard."}
-          onRetry={() => load(true)}
-        />
+        <ErrorBanner message={msg} onRetry={() => load(true)} />
       </div>
     );
   }

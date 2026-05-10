@@ -12,8 +12,11 @@ import {
   ShieldAlert,
   Timer,
 } from "lucide-react";
+import { useQuery } from "@tanstack/react-query";
 import { ApiError } from "@/lib/api";
 import { platformApi, type HealthPayload } from "@/lib/platform";
+import { qk } from "@/lib/query-keys";
+import { STALE } from "@/lib/query-client";
 import { cn } from "@/lib/utils";
 import {
   PageHeader,
@@ -48,47 +51,44 @@ import {
 //   clue.
 // ---------------------------------------------------------------------------
 
-const POLL_INTERVAL_MS = 30_000;
-
+// Live operator pulse — fast-lane query.
+//   • staleTime: 15s — within the window, repeat reads return cached.
+//   • refetchInterval: 30s — background poll keeps the page live
+//     without the operator clicking Refresh.
+//   • Multiple operators (or multiple tabs of the same operator)
+//     share ONE underlying poll because the query key is shared.
+//
+// Compare to /platform/analytics (slow lane) below: that one is
+// staleTime 2m, no polling. The two queries are deliberately split
+// so health doesn't drag the heavier analytics scan with it.
 export default function PlatformHealthPage() {
-  const [data, setData] = React.useState<HealthPayload | null>(null);
-  const [loading, setLoading] = React.useState(true);
-  const [refreshing, setRefreshing] = React.useState(false);
-  const [error, setError] = React.useState<string | null>(null);
+  const {
+    data,
+    isLoading: loading,
+    isFetching,
+    isError,
+    error,
+    refetch,
+  } = useQuery<HealthPayload, ApiError>({
+    queryKey: qk.platform.health,
+    queryFn: () => platformApi.getHealth(),
+    staleTime: STALE.LIVE_HEALTH,
+    refetchInterval: 30_000,
+    refetchIntervalInBackground: false,
+  });
 
-  const load = React.useCallback(async (initial: boolean) => {
-    if (initial) setLoading(true);
-    else setRefreshing(true);
-    setError(null);
-    try {
-      const result = await platformApi.getHealth();
-      setData(result);
-    } catch (err) {
-      setError(
-        err instanceof ApiError ? err.message : "Failed to load health.",
-      );
-    } finally {
-      if (initial) setLoading(false);
-      setRefreshing(false);
-    }
-  }, []);
+  // `isFetching` covers both initial + background refetch — the
+  // refresh button uses it to spin during a background tick.
+  const refreshing = isFetching && !loading;
 
-  React.useEffect(() => {
-    void load(true);
-    const id = window.setInterval(() => {
-      void load(false);
-    }, POLL_INTERVAL_MS);
-    return () => window.clearInterval(id);
-  }, [load]);
-
-  if (loading) {
+  if (loading && !data) {
     return <PanelLoadingState />;
   }
-  if (error || !data) {
+  if ((isError || !data) && !data) {
     return (
       <PanelErrorState
-        message={error ?? "Could not load health."}
-        onRetry={() => void load(true)}
+        message={error?.message ?? "Could not load health."}
+        onRetry={() => void refetch()}
       />
     );
   }
@@ -102,7 +102,7 @@ export default function PlatformHealthPage() {
         actions={
           <button
             type="button"
-            onClick={() => void load(false)}
+            onClick={() => void refetch()}
             disabled={refreshing}
             className="inline-flex h-9 items-center gap-1.5 rounded-md border border-slate-200 bg-white px-3 text-sm font-medium text-slate-700 hover:bg-slate-50 disabled:opacity-50"
           >

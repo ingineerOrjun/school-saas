@@ -13,6 +13,7 @@ import { PlatformAuditService } from './platform-audit.service';
 import { ImpersonationController } from './impersonation.controller';
 import { ImpersonationService } from './impersonation.service';
 import { PlatformAnalyticsService } from './platform-analytics.service';
+import { SchoolCodeService } from './services/school-code.service';
 import { SchoolSnapshotService } from './school-snapshot.service';
 import { SecurityService } from './security.service';
 import { SubscriptionExpiringJob } from './subscription-expiring.job';
@@ -70,6 +71,7 @@ import { SubscriptionService } from './subscription.service';
     PlatformAnalyticsService,
     PlatformAuditService,
     ImpersonationService,
+    SchoolCodeService,
     SchoolSnapshotService,
     SecurityService,
     SubscriptionExpiringJob,
@@ -80,6 +82,7 @@ import { SubscriptionService } from './subscription.service';
     PlatformService,
     PlatformAnalyticsService,
     PlatformAuditService,
+    SchoolCodeService,
     SchoolSnapshotService,
     SecurityService,
     SubscriptionService,

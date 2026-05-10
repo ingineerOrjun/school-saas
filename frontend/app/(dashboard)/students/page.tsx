@@ -2,12 +2,18 @@
 
 import * as React from "react";
 import { useRouter } from "next/navigation";
+import { useQueryClient } from "@tanstack/react-query";
 import { Plus, Search, UserPlus, RotateCw, AlertCircle, Filter, Upload } from "lucide-react";
 import { toast } from "sonner";
 import { ApiError } from "@/lib/api";
 import { getStoredUser, type Role } from "@/lib/auth";
-import { studentsApi, type StudentDto } from "@/lib/students";
-import { classesApi, type ClassWithSections } from "@/lib/classes";
+import {
+  studentsApi,
+  useStudents,
+  type StudentDto,
+} from "@/lib/students";
+import { useClasses, type ClassWithSections } from "@/lib/classes";
+import { qk } from "@/lib/query-keys";
 import { Button } from "@/components/ui/Button";
 import { Skeleton } from "@/components/ui/Skeleton";
 import { EmptyState } from "@/components/ui/EmptyState";
@@ -43,10 +49,44 @@ interface PendingDeletion {
 
 export default function StudentsPage() {
   const router = useRouter();
+  const qc = useQueryClient();
+
+  // Phase Ω migration — was: useEffect+Promise.all loading + local
+  // list/classes state. Now driven by shared React Query hooks so
+  // multiple consumers + StrictMode double-mount + back/forward
+  // navigation collapse to ONE underlying request per stale window.
+  // Local optimistic state below stays untouched — we mirror the
+  // query data into `list` via useEffect so the existing
+  // delete-with-undo + add-highlight machinery keeps working.
+  const studentsQuery = useStudents();
+  const classesQuery = useClasses();
   const [list, setList] = React.useState<StudentDto[] | null>(null);
-  const [classes, setClasses] = React.useState<ClassWithSections[]>([]);
-  const [loading, setLoading] = React.useState(true);
-  const [error, setError] = React.useState<string | null>(null);
+  const classes: ClassWithSections[] = classesQuery.data ?? [];
+  const loading = studentsQuery.isLoading;
+  const error =
+    studentsQuery.error instanceof ApiError
+      ? studentsQuery.error.message
+      : studentsQuery.error
+        ? "Failed to load students."
+        : null;
+
+  // Mirror query data into local state for the existing optimistic
+  // mutations (delete-with-undo, add-highlight). React Query cache
+  // is the source of truth; `list` is a temporary mutation surface
+  // that re-syncs whenever the query refetches.
+  React.useEffect(() => {
+    if (studentsQuery.data) setList(studentsQuery.data);
+  }, [studentsQuery.data]);
+
+  // 401 redirect — the React Query retry layer rejects 401 (we
+  // configured retry to abort), so the error landing here that
+  // matters is "session genuinely gone." Same behaviour as the
+  // original try/catch.
+  React.useEffect(() => {
+    if (studentsQuery.error instanceof ApiError && studentsQuery.error.status === 401) {
+      router.replace("/login");
+    }
+  }, [studentsQuery.error, router]);
   const [query, setQuery] = React.useState("");
   const [classFilter, setClassFilter] = React.useState<string>(CLASS_FILTER_ALL);
   const [addOpen, setAddOpen] = React.useState(false);
@@ -77,37 +117,15 @@ export default function StudentsPage() {
     new Map(),
   );
 
+  // Phase Ω — refresh now invalidates the shared cache instead of
+  // re-running a manual fetch. Other consumers of the same query
+  // keys (sidebar count, modal pickers) stay in sync automatically.
   const refresh = React.useCallback(async () => {
-    setLoading(true);
-    setError(null);
-    try {
-      const [students, classList] = await Promise.all([
-        studentsApi.list(),
-        classesApi.list(),
-      ]);
-      setList(students);
-      setClasses(classList);
-    } catch (err) {
-      if (err instanceof ApiError && err.status === 401) {
-        router.replace("/login");
-        return;
-      }
-      const msg =
-        err instanceof ApiError
-          ? err.message
-          : err instanceof Error
-            ? err.message
-            : "Failed to load students.";
-      setError(msg);
-      setList([]);
-    } finally {
-      setLoading(false);
-    }
-  }, [router]);
-
-  React.useEffect(() => {
-    refresh();
-  }, [refresh]);
+    await Promise.all([
+      qc.invalidateQueries({ queryKey: qk.students() }),
+      qc.invalidateQueries({ queryKey: qk.classes() }),
+    ]);
+  }, [qc]);
 
   const filtered = React.useMemo(() => {
     if (!list) return [];

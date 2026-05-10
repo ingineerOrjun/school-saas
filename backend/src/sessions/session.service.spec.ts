@@ -50,6 +50,12 @@ function buildHarness() {
       findUnique: jest.fn(async ({ where }: any) =>
         sessions.get(where.id) ?? null,
       ),
+      // Phase 22 — new-device detection probe in create(). The
+      // tests don't care about the device-fingerprint signal; the
+      // mock just returns null (= "no prior match", every login is
+      // a "new device" but the only side effect is a log line we
+      // intentionally suppress here).
+      findFirst: jest.fn(async () => null),
       update: jest.fn(async ({ where, data }: any) => {
         const row = sessions.get(where.id);
         if (!row) throw new Error('not found');

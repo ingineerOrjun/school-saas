@@ -1,12 +1,14 @@
 "use client";
 
 import * as React from "react";
-import { ApiError } from "@/lib/api";
-import { getToken } from "@/lib/auth";
+import { useQuery } from "@tanstack/react-query";
+import { useAuthReady } from "@/hooks/useAuthReady";
 import {
   academicSessionsApi,
   type AcademicSessionDto,
 } from "@/lib/academic-sessions";
+import { qk } from "@/lib/query-keys";
+import { STALE } from "@/lib/query-client";
 
 /**
  * Holds the user's currently-selected academic session for the
@@ -53,58 +55,53 @@ export function AcademicSessionProvider({
 }: {
   children: React.ReactNode;
 }) {
-  const [sessions, setSessions] = React.useState<AcademicSessionDto[]>([]);
-  const [selectedId, setSelectedIdState] = React.useState<string | null>(
-    null,
-  );
-  const [loading, setLoading] = React.useState(true);
+  // Reference data — operator-driven changes only. 10m staleTime
+  // means the topbar selector + every page that filters by session
+  // share ONE underlying fetch over the full SPA navigation cycle.
+  //
+  // Phase α follow-up — gate on the subscribable auth-store. The
+  // synchronous getToken() check raced bootstrap and produced
+  // user=<anon> 429s on /academic-sessions during cold reloads.
+  const { authReady, isAuthenticated } = useAuthReady();
+  const query = useQuery<AcademicSessionDto[]>({
+    queryKey: qk.academicSessions(),
+    queryFn: () => academicSessionsApi.list(),
+    enabled: authReady && isAuthenticated,
+    // Phase γ — academic sessions change at most a few times per
+    // year. 30m stale + 30m gc — the topbar selector + every page
+    // share one fetch across the entire SPA navigation cycle.
+    staleTime: 30 * 60_000,
+    gcTime: 30 * 60_000,
+    refetchOnWindowFocus: false,
+    refetchOnMount: false,
+    retry: (failureCount, error) => {
+      const status = (error as { status?: number } | null)?.status;
+      if (status === 401 || status === 403) return false;
+      return failureCount < 1;
+    },
+  });
 
-  const refresh = React.useCallback(async () => {
-    // The provider sits at the root layout level — above /login — so
-    // it mounts before the user has a token. Firing an authenticated
-    // request in that state used to throw a noisy 401 in the console
-    // every time the login page loaded, AND now (with the global 401
-    // handler) was being treated as a session failure even though the
-    // user simply hadn't logged in yet. Skip the call when there's no
-    // token and let the next remount (after login → hard reload) kick
-    // off a real fetch.
-    if (!getToken()) {
-      setSessions([]);
-      setLoading(false);
-      return;
-    }
-    setLoading(true);
-    try {
-      const list = await academicSessionsApi.list();
-      setSessions(list);
-      // Resolve the selected session: stored preference wins if it
-      // still exists; otherwise fall back to the active session;
-      // otherwise the most recent by startDate; otherwise null.
-      setSelectedIdState((prev) => {
-        const stored = prev ?? readStoredId();
-        if (stored && list.some((s) => s.id === stored)) return stored;
-        const active = list.find((s) => s.isActive);
-        if (active) return active.id;
-        return list[0]?.id ?? null;
-      });
-    } catch (err) {
-      // 401 → page-level guard handles it. Anything else → empty
-      // list so the selector renders "no sessions yet" instead of
-      // crashing the topbar.
-      if (err instanceof ApiError && err.status === 401) return;
-      setSessions([]);
-    } finally {
-      setLoading(false);
-    }
-  }, []);
+  const sessions = query.data ?? [];
+  const loading = query.isLoading;
 
-  // Initial load — once on mount.
+  const [selectedId, setSelectedIdState] = React.useState<string | null>(null);
+
+  // Resolve the selected session ID once data lands:
+  //   stored preference (if still in the list) → active → first → null
+  // Computed in an effect so it only runs when sessions change.
   React.useEffect(() => {
-    void refresh();
-  }, [refresh]);
+    if (sessions.length === 0) return;
+    setSelectedIdState((prev) => {
+      const stored = prev ?? readStoredId();
+      if (stored && sessions.some((s) => s.id === stored)) return stored;
+      const active = sessions.find((s) => s.isActive);
+      if (active) return active.id;
+      return sessions[0]?.id ?? null;
+    });
+  }, [sessions]);
 
-  // Persist the selection. Skip when null so we don't overwrite a
-  // legit stored value during the initial-loading window.
+  // Persist the selection. Skip null to avoid stomping a legit
+  // stored value during the initial-loading window.
   React.useEffect(() => {
     if (selectedId == null) return;
     try {
@@ -113,6 +110,13 @@ export function AcademicSessionProvider({
       /* no-op */
     }
   }, [selectedId]);
+
+  // Expose `refresh` for code paths that just created / activated
+  // a session and want immediate read-after-write. Goes through
+  // the React Query cache so other consumers get the update too.
+  const refresh = React.useCallback(async () => {
+    await query.refetch();
+  }, [query]);
 
   const value = React.useMemo<AcademicSessionContextValue>(() => {
     const selected = sessions.find((s) => s.id === selectedId) ?? null;

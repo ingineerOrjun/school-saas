@@ -10,6 +10,7 @@ import {
   Query,
   UseGuards,
 } from '@nestjs/common';
+import { Throttle } from '@nestjs/throttler';
 import { NotificationSeverity } from '@prisma/client';
 import { JwtAuthGuard } from '../auth/guards/jwt-auth.guard';
 import { CurrentUser } from '../common/decorators/current-user.decorator';
@@ -61,6 +62,26 @@ const VALID_SEVERITIES: ReadonlySet<string> = new Set([
 
 @Controller('notifications')
 @UseGuards(JwtAuthGuard)
+// Phase 20 follow-up — every route on this controller pulls from
+// the dedicated `notifications` bucket (30/min/user). This is a
+// per-route OVERRIDE of the global default 600/min: notifications
+// get their own budget so polling traffic doesn't compete with
+// general dashboard requests, and a runaway client is contained
+// to a measurable ceiling.
+//
+// Rationale for 30/min/user:
+//   • unread-count: 1 req/min steady-state per tab (60s poll).
+//     Even 5 open tabs only spends 5/min.
+//   • list:        user-initiated (open inbox, change filter,
+//     paginate). React Query dedupes identical query keys within
+//     30s staleTime, so rapid filter toggles coalesce.
+//   • mark-read et al: optimistic on the client; one network
+//     round-trip per user action.
+//
+// 30/min comfortably covers all of the above with margin for
+// React StrictMode dev double-fires. If a real client legitimately
+// needs more, raise the limit here — don't add a SkipThrottle.
+@Throttle({ notifications: { limit: 120, ttl: 60_000 } })
 export class MeNotificationsController {
   constructor(private readonly center: NotificationCenterService) {}
 
@@ -83,6 +104,12 @@ export class MeNotificationsController {
     );
   }
 
+  /**
+   * Bell-badge polling endpoint. Hit by every authenticated tab
+   * every 60s by React Query's interval. Falls under the
+   * controller-level `notifications` bucket (30/min/user) — well
+   * above the steady-state polling rate even with 5+ open tabs.
+   */
   @Get('unread-count')
   async unreadCount(@CurrentUser() user: AuthenticatedUser) {
     const count = await this.center.unreadCountForSchoolUser({

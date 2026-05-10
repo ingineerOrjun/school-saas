@@ -97,13 +97,22 @@ export interface AuthResult {
 }
 
 export async function login(
+  schoolCode: string,
   email: string,
   password: string,
 ): Promise<AuthResult> {
+  // Normalize the school code client-side (trim + uppercase) so the
+  // request body matches the format the backend stores. The backend
+  // re-normalizes defensively, so this is belt-and-suspenders.
+  const normalizedSchoolCode = schoolCode.trim().toUpperCase();
   const result = await api<AuthResult>("/auth/login", {
     auth: false,
     method: "POST",
-    body: JSON.stringify({ email, password }),
+    body: JSON.stringify({
+      schoolCode: normalizedSchoolCode,
+      email,
+      password,
+    }),
   });
   storeAuth(result);
   return result;
@@ -113,11 +122,19 @@ export async function registerAdmin(
   email: string,
   password: string,
   schoolName: string,
+  schoolCode?: string,
 ): Promise<AuthResult> {
+  // Optional schoolCode — when omitted the backend auto-generates the
+  // next default (SCH-NNNN). When supplied, it's auto-normalized
+  // (trim + uppercase) and validated against the platform format.
+  const body: Record<string, string> = { email, password, schoolName };
+  if (schoolCode && schoolCode.trim().length > 0) {
+    body.schoolCode = schoolCode.trim().toUpperCase();
+  }
   const result = await api<AuthResult>("/auth/register", {
     auth: false,
     method: "POST",
-    body: JSON.stringify({ email, password, schoolName }),
+    body: JSON.stringify(body),
   });
   storeAuth(result);
   return result;
@@ -141,6 +158,10 @@ function clearLocalAuth(): void {
     // user fetches fresh. Stale cache between accounts would cause
     // sidebar entries to flicker on/off on first paint.
     window.localStorage.removeItem("scholaris:features");
+    // Phase α follow-up — publish the cleared auth state so React
+    // Query gates (useAuthReady) immediately stop firing protected
+    // queries.
+    void import('./auth-store').then(({ refresh }) => refresh());
   } catch {
     /* no-op */
   }
@@ -320,6 +341,11 @@ function storeAuth(result: AuthResult) {
         "[auth] Token write did not persist to localStorage. Subsequent API calls will return 401. Likely cause: private browsing or third-party storage blocked.",
       );
     }
+    // Phase α follow-up — notify the auth-store so React subscribers
+    // (useAuthReady, etc.) re-render with the new authenticated
+    // snapshot. Without this, login resolves but the dashboard
+    // queries stay parked on `enabled: false`.
+    void import('./auth-store').then(({ refresh }) => refresh());
   } catch (e) {
     // eslint-disable-next-line no-console
     console.warn("[auth] Failed to write auth state to localStorage:", e);

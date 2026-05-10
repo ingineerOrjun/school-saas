@@ -23,7 +23,7 @@ import {
 } from "@/lib/exams";
 import { studentsApi, type StudentDto } from "@/lib/students";
 import {
-  teachingAssignmentsApi,
+  useMyTeachingAssignments,
   type TeachingAssignmentDto,
 } from "@/lib/teaching-assignments";
 import { Button } from "@/components/ui/Button";
@@ -64,10 +64,32 @@ export default function BulkMarksPage() {
   const [classes, setClasses] = React.useState<ClassWithSections[]>([]);
   // null when the caller is ADMIN — no filter applied. Empty array means
   // "TEACHER with zero assignments". A populated array narrows the
-  // class + subject dropdowns.
-  const [assignments, setAssignments] = React.useState<
-    TeachingAssignmentDto[] | null
-  >(null);
+  // class + subject dropdowns. Backed by the shared React Query cache
+  // via `useMyTeachingAssignments` — admins/staff are gated out via
+  // `enabled: isTeacher` so they never burn a request that would 403.
+  const isTeacher = React.useMemo(
+    () => getStoredUser()?.role === "TEACHER",
+    [],
+  );
+  const {
+    data: rawAssignments,
+    isLoading: assignmentsLoading,
+    error: assignmentsError,
+  } = useMyTeachingAssignments({ enabled: isTeacher });
+  const assignments: TeachingAssignmentDto[] | null = React.useMemo(() => {
+    if (!isTeacher) return null; // ADMIN/STAFF — unfiltered catalog
+    if (
+      assignmentsError instanceof ApiError &&
+      assignmentsError.status === 403
+    ) {
+      return [];
+    }
+    // Mid-load: surface as `[]` so we never briefly leak the admin
+    // catalog into a teacher's pickers. The combined loading flag
+    // below also keeps the page in its disabled state until the
+    // hook settles.
+    return rawAssignments ?? [];
+  }, [isTeacher, rawAssignments, assignmentsError]);
   const [loading, setLoading] = React.useState(true);
   const [refError, setRefError] = React.useState<string | null>(null);
 
@@ -83,28 +105,21 @@ export default function BulkMarksPage() {
   const [marks, setMarks] = React.useState<MarksMap>({});
   const [saving, setSaving] = React.useState(false);
 
-  // ----- Initial load: exams + classes + (teacher) assignments -----
+  // ----- Initial load: exams + classes (assignments come from the
+  // hook above, so they're not part of the Promise.all anymore) -----
   React.useEffect(() => {
     let cancelled = false;
     (async () => {
       setLoading(true);
       setRefError(null);
       try {
-        const role = getStoredUser()?.role ?? null;
-        const [examList, classList, myAssignments] = await Promise.all([
+        const [examList, classList] = await Promise.all([
           examsApi.list(),
           classesApi.list(),
-          role === "TEACHER"
-            ? teachingAssignmentsApi.listMine().catch((err) => {
-                if (err instanceof ApiError && err.status === 403) return [];
-                throw err;
-              })
-            : Promise.resolve(null),
         ]);
         if (cancelled) return;
         setExams(examList);
         setClasses(classList);
-        setAssignments(myAssignments);
       } catch (err) {
         if (cancelled) return;
         if (err instanceof ApiError && err.status === 401) {
@@ -349,6 +364,12 @@ export default function BulkMarksPage() {
   };
 
   // ----- Render -----
+  // Combined "reference data not ready yet" flag — exams/classes
+  // come from the imperative fetch above and assignments come from
+  // the React Query hook. Gate the pickers on BOTH so a teacher
+  // never momentarily sees the unfiltered admin catalog while the
+  // assignments cache is hydrating.
+  const referenceLoading = loading || (isTeacher && assignmentsLoading);
   const allSelected =
     !!examId && !!classId && sectionId !== "" && !!examSubjectId;
 
@@ -378,10 +399,12 @@ export default function BulkMarksPage() {
                 setExamId(e.target.value);
                 setClassId("");
               }}
-              disabled={loading || saving}
+              disabled={referenceLoading || saving}
               className={selectClasses}
             >
-              <option value="">{loading ? "Loading…" : "Choose exam…"}</option>
+              <option value="">
+                {referenceLoading ? "Loading…" : "Choose exam…"}
+              </option>
               {exams.map((e) => (
                 <option key={e.id} value={e.id}>
                   {e.name}
@@ -394,7 +417,7 @@ export default function BulkMarksPage() {
             <select
               value={classId}
               onChange={(e) => setClassId(e.target.value)}
-              disabled={loading || saving || !examId}
+              disabled={referenceLoading || saving || !examId}
               className={selectClasses}
             >
               <option value="">
@@ -416,7 +439,7 @@ export default function BulkMarksPage() {
             <select
               value={sectionId}
               onChange={(e) => setSectionId(e.target.value)}
-              disabled={loading || saving || !classId}
+              disabled={referenceLoading || saving || !classId}
               className={selectClasses}
             >
               <option value="">
@@ -435,7 +458,7 @@ export default function BulkMarksPage() {
             <select
               value={examSubjectId}
               onChange={(e) => setExamSubjectId(e.target.value)}
-              disabled={loading || saving || !classId || sectionId === ""}
+              disabled={referenceLoading || saving || !classId || sectionId === ""}
               className={selectClasses}
             >
               <option value="">

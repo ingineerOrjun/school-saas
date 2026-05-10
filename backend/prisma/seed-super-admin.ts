@@ -47,26 +47,33 @@ async function main(): Promise<void> {
     process.exit(1);
   }
 
-  const existing = await prisma.user.findUnique({ where: { email } });
-  if (existing) {
-    if (existing.role === Role.SUPER_ADMIN) {
-      console.log(`SUPER_ADMIN ${email} already exists. No changes made.`);
-      return;
-    }
-    console.error(
-      `User ${email} already exists with role ${existing.role}. ` +
-        `Cannot promote via this script — drop the row manually or pick a different email.`,
-    );
-    process.exit(1);
-  }
-
   // FK target — pick the oldest school as the placeholder tenant.
+  // We resolve this BEFORE the email-existence check because emails
+  // are now tenant-scoped (`@@unique([schoolId, email])`); the check
+  // needs to be "is this email taken at the placeholder school?"
+  // not "is this email taken anywhere on the platform?"
   const school = await prisma.school.findFirst({
     orderBy: { createdAt: 'asc' },
   });
   if (!school) {
     console.error(
       'No schools exist yet. Register at least one school via /auth/register-admin before seeding the SUPER_ADMIN.',
+    );
+    process.exit(1);
+  }
+
+  const existing = await prisma.user.findUnique({
+    where: { schoolId_email: { schoolId: school.id, email } },
+  });
+  if (existing) {
+    if (existing.role === Role.SUPER_ADMIN) {
+      console.log(`SUPER_ADMIN ${email} already exists. No changes made.`);
+      return;
+    }
+    console.error(
+      `User ${email} already exists at the placeholder school ` +
+        `(${school.name}) with role ${existing.role}. ` +
+        `Cannot promote via this script — drop the row manually or pick a different email.`,
     );
     process.exit(1);
   }

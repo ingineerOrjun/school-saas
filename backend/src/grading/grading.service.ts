@@ -66,6 +66,68 @@ export class GradingService {
   getScale() {
     return GRADE_SCALE;
   }
+
+  /**
+   * Calculates credit-hour-weighted GPA per the Nepal CDC progress-report
+   * formula:
+   *   GPA = Σ(gradePoint_i × creditHours_i) / Σ(creditHours_i)
+   *
+   * Returns null when:
+   *   • the input is empty (nothing to summarize), or
+   *   • any subject is graded NG (per NEB rule, ANY NG = overall NG —
+   *     surfaced as null so the caller can render "NG" rather than a
+   *     misleading averaged number).
+   *
+   * Coexists with the legacy `gpa(gradePoints)` method above; that one
+   * is kept for any caller that hasn't been migrated yet to the weighted
+   * formula.
+   */
+  calculateWeightedGPA(
+    results: Array<{
+      gradePoint: number | null;
+      creditHours: number;
+      letterGrade: string;
+    }>,
+  ): number | null {
+    if (!results || results.length === 0) return null;
+    // One NG = entire result is NG.
+    const hasNG = results.some(
+      (r) => r.letterGrade === 'NG' || r.gradePoint === null,
+    );
+    if (hasNG) return null;
+    const totalCredits = results.reduce(
+      (sum, r) => sum + (r.creditHours ?? 5),
+      0,
+    );
+    if (totalCredits === 0) return null;
+    const weightedSum = results.reduce(
+      (sum, r) => sum + (r.gradePoint as number) * (r.creditHours ?? 5),
+      0,
+    );
+    const gpa = weightedSum / totalCredits;
+    return Math.round(gpa * 100) / 100; // 2 decimal places
+  }
+
+  /**
+   * Maps a computed GPA number directly to a letter grade — the official
+   * CDC overall-GPA mapping, NOT the per-subject percentage scale.
+   *
+   * Important: this is intentionally different from `grade(percentage)`.
+   * The per-subject scale maps marks → letter at the boundaries
+   * (90% → A+); this maps the GPA range itself (3.6 → A+). The two
+   * agree at endpoints but diverge in the middle bands.
+   */
+  gpaToLetterGrade(gpa: number | null): string {
+    if (gpa === null) return 'NG';
+    if (gpa >= 3.6) return 'A+';
+    if (gpa >= 3.2) return 'A';
+    if (gpa >= 2.8) return 'B+';
+    if (gpa >= 2.4) return 'B';
+    if (gpa >= 2.0) return 'C+';
+    if (gpa >= 1.6) return 'C';
+    if (gpa >= 1.2) return 'D';
+    return 'NG';
+  }
 }
 
 function clamp(n: number, min: number, max: number): number {

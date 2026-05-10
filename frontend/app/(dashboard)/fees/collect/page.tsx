@@ -27,6 +27,8 @@ import { Input } from "@/components/ui/Input";
 import { StudentSearchPicker } from "@/components/fees/collect/StudentSearchPicker";
 import { CashierStatsBar } from "@/components/fees/collect/CashierStatsBar";
 import { PaymentSuccessPanel } from "@/components/fees/collect/PaymentSuccessPanel";
+import { useIsMobile } from "@/hooks/useMediaQuery";
+import { MobileFeeCollect } from "@/components/mobile/MobileFeeCollect";
 
 // ---------------------------------------------------------------------------
 // /fees/collect — the cashier workspace.
@@ -77,7 +79,32 @@ interface RecentActivity {
   at: number; // Date.now() ms
 }
 
+/**
+ * Phase 25 — top-level page is a thin selector between the mobile
+ * and desktop trees. Each variant owns its own hook tree, so React's
+ * rule-of-hooks holds across renders even when the breakpoint flips
+ * mid-session (orientation change, devtools resize). The desktop
+ * logic below is unchanged from the original page.
+ */
 export default function CashierWorkspacePage() {
+  const isMobile = useIsMobile();
+  if (isMobile) {
+    return (
+      <div className="space-y-3">
+        <div>
+          <p className="text-[11px] font-bold uppercase tracking-wider text-muted-foreground">
+            Cashier
+          </p>
+          <h1 className="text-xl font-semibold mt-0.5">Collect payment</h1>
+        </div>
+        <MobileFeeCollect />
+      </div>
+    );
+  }
+  return <DesktopCashierWorkspace />;
+}
+
+function DesktopCashierWorkspace() {
   const [summary, setSummary] = React.useState<CashierSummary | null>(null);
   const [summaryLoading, setSummaryLoading] = React.useState(true);
   const [selected, setSelected] = React.useState<StudentDto | null>(null);

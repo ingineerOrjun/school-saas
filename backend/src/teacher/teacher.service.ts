@@ -126,21 +126,24 @@ export class TeacherService {
 
     try {
       const result = await this.prisma.$transaction(async (tx) => {
-        // Single read inside the transaction. Race-safe because the
-        // unique-index error path below catches anything that slips
-        // between this read and the writes.
+        // Single read inside the transaction, scoped to THIS tenant
+        // via the (schoolId, email) compound unique key. Emails are
+        // no longer globally unique — a user with the same email at
+        // another school is a different person and is invisible
+        // here. Race-safe because the unique-index error path below
+        // catches anything that slips between this read and the
+        // writes.
         const existing = await tx.user.findUnique({
-          where: { email: dto.email },
+          where: {
+            schoolId_email: { schoolId, email: dto.email },
+          },
           include: { teacher: { select: { id: true } } },
         });
 
         if (existing) {
-          // Case 2: tenant boundary.
-          if (existing.schoolId !== schoolId) {
-            throw new ConflictException(
-              'An account with this email already exists.',
-            );
-          }
+          // (Old "Case 2: tenant boundary" guard is no longer needed
+          // — the compound unique key above can never return a user
+          // from another school, so there's nothing to reject here.)
           // Case 3: account exists but it's an admin/staff/student.
           if (existing.role !== Role.TEACHER) {
             throw new BadRequestException(

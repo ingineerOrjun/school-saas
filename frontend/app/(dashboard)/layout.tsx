@@ -5,11 +5,18 @@ import { usePathname, useRouter } from "next/navigation";
 import { Sparkles } from "lucide-react";
 import { Sidebar } from "@/components/layout/Sidebar";
 import { Topbar } from "@/components/layout/Topbar";
+import { AnnouncementBanner } from "@/components/AnnouncementBanner";
+import { CommandPalette } from "@/components/command-palette/CommandPalette";
 import { ImpersonationBanner } from "@/components/impersonation/ImpersonationBanner";
+import { LowDataModeProvider } from "@/components/LowDataModeProvider";
 import { MaintenanceBanner } from "@/components/maintenance/MaintenanceBanner";
+import { OfflineBanner } from "@/components/OfflineBanner";
+import { QuickActionFab } from "@/components/QuickActionFab";
+import { RequestPressurePanel } from "@/components/dev/RequestPressurePanel";
+import { ServiceWorkerRegister } from "@/components/ServiceWorkerRegister";
+import { useQueueAwareBeforeUnload } from "@/hooks/useQueueAwareGuards";
 import { getStoredUser, getToken } from "@/lib/auth";
 import { FeaturesProvider } from "@/lib/features";
-import { NotificationsProvider } from "@/lib/notifications";
 
 const TOKEN_KEY = "scholaris:token";
 const USER_KEY = "scholaris:user";
@@ -83,7 +90,46 @@ export default function DashboardLayout({
 
   return (
     <FeaturesProvider>
-      <NotificationsProvider>
+      <LowDataModeProvider>
+      <DashboardShell
+        collapsed={collapsed}
+        setCollapsed={setCollapsed}
+        mobileOpen={mobileOpen}
+        setMobileOpen={setMobileOpen}
+      >
+        {children}
+      </DashboardShell>
+      </LowDataModeProvider>
+    </FeaturesProvider>
+  );
+}
+
+/**
+ * Inner shell — extracted so we can call hooks (useQueueAwareBeforeUnload)
+ * that depend on providers higher in the tree without rule-of-hooks
+ * issues. Phase 26.
+ */
+function DashboardShell({
+  collapsed,
+  setCollapsed,
+  mobileOpen,
+  setMobileOpen,
+  children,
+}: {
+  collapsed: boolean;
+  setCollapsed: React.Dispatch<React.SetStateAction<boolean>>;
+  mobileOpen: boolean;
+  setMobileOpen: React.Dispatch<React.SetStateAction<boolean>>;
+  children: React.ReactNode;
+}) {
+  // Phase 26 — surface the browser "Leave site?" prompt only when
+  // the offline queue has unsynced writes. No queue → no prompt
+  // (regular refresh/close stays silent).
+  useQueueAwareBeforeUnload();
+
+  return (
+    <>
+      <ServiceWorkerRegister />
       <div className="flex h-screen w-full overflow-hidden bg-app">
         {mobileOpen && (
           <div
@@ -112,12 +158,26 @@ export default function DashboardLayout({
           <Topbar onMobileMenuClick={() => setMobileOpen(true)} />
           <main className="flex-1 overflow-y-auto">
             <div className="mx-auto w-full max-w-[1400px] px-4 py-5 sm:px-6 sm:py-6">
+              {/* Phase 26 — sticky offline / queue-pending banner.
+                  Self-hides when online + no pending writes. */}
+              <OfflineBanner />
+              {/* Phase 23 — operator-published banners (release notes,
+                  scheduled maintenance, etc). Self-hides when there
+                  are none. Per-user dismissal via the X button. */}
+              <AnnouncementBanner />
               {children}
             </div>
           </main>
         </div>
+        {/* Phase 24 — universal Cmd+K palette + role-aware FAB.
+            Both render once per dashboard mount; the palette is
+            hidden until triggered. */}
+        <CommandPalette />
+        <QuickActionFab />
+        {/* Phase performance governance — dev-only request pressure
+            panel. Production builds short-circuit to null. */}
+        <RequestPressurePanel />
       </div>
-      </NotificationsProvider>
-    </FeaturesProvider>
+    </>
   );
 }

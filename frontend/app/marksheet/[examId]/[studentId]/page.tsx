@@ -14,6 +14,7 @@ import { cn } from "@/lib/utils";
 import { ApiError } from "@/lib/api";
 import { getToken } from "@/lib/auth";
 import { marksheetApi, type Marksheet } from "@/lib/exams";
+import { gpaToLetterGrade } from "@/lib/grading";
 import { DocumentLogo } from "@/components/documents/DocumentLogo";
 import { formatDual } from "@/lib/date";
 
@@ -242,9 +243,12 @@ function Body({ data }: { data: Marksheet }) {
       <table className="w-full border-collapse text-sm">
         <thead>
           {/* Numeric columns right-align so figures column up neatly
-              under the digits — standard for any marks/grade ledger. */}
+              under the digits — standard for any marks/grade ledger.
+              "Credit Hrs" sits right after Subject so it reads as the
+              subject's weight before the marks numbers begin. */}
           <tr className="border-y-2 border-slate-900">
             <Th align="left">Subject</Th>
+            <Th align="right">Credit Hrs</Th>
             <Th align="right">Full Marks</Th>
             <Th align="right">Marks Obtained</Th>
             <Th align="right">Percentage</Th>
@@ -256,7 +260,7 @@ function Body({ data }: { data: Marksheet }) {
           {data.results.length === 0 ? (
             <tr>
               <td
-                colSpan={6}
+                colSpan={7}
                 className="border-b border-slate-200 py-6 text-center text-sm italic text-slate-500"
               >
                 No marks recorded for this exam.
@@ -267,6 +271,11 @@ function Body({ data }: { data: Marksheet }) {
               <tr key={r.id} className="border-b border-slate-200">
                 <Td align="left" className="font-medium">
                   {r.subjectName}
+                </Td>
+                {/* Credit hours — falls back to 5 (the schema default)
+                    if the API response pre-dates the field. */}
+                <Td align="right" className="tabular-nums text-slate-600">
+                  {(r.creditHours ?? 5).toString()}
                 </Td>
                 <Td align="right" className="tabular-nums text-slate-600">
                   {r.fullMarks}
@@ -291,9 +300,70 @@ function Body({ data }: { data: Marksheet }) {
               </tr>
             ))
           )}
+          {data.results.length > 0 && <TableSummaryRow data={data} />}
         </tbody>
       </table>
     </section>
+  );
+}
+
+/**
+ * Bottom-of-table totals row. Sums the per-subject Credit Hours, Full
+ * Marks, and Marks Obtained columns, shows the overall percentage, and
+ * surfaces the credit-hour-weighted GPA in the Grade / Grade Point
+ * columns so it reads as a natural footer for the table.
+ *
+ * No prior summary-row pattern existed in this component, so styling
+ * uses a heavy top border + bg-slate-50 + font-semibold to set it apart
+ * from data rows — consistent in spirit with the table's existing
+ * use of border-y-2 on the header. (Distinct from `SummaryRow` lower
+ * in the file, which is a label/value KV row used inside the Footer.)
+ */
+function TableSummaryRow({ data }: { data: Marksheet }) {
+  const totalCreditHrs = data.results.reduce(
+    (sum, r) => sum + (r.creditHours ?? 5),
+    0,
+  );
+  const totalFullMarks = data.results.reduce((sum, r) => sum + r.fullMarks, 0);
+  const totalMarks = data.results.reduce((sum, r) => sum + r.marks, 0);
+  const overallPct = totalFullMarks > 0 ? (totalMarks / totalFullMarks) * 100 : 0;
+  // Backend's data.gpa is the weighted GPA (the out-of-range sentinel
+  // -1 when failing — 0 in the legacy response shape); we surface the
+  // NG state via gpaLetterGrade. The `data.gpa < 0` defense mirrors
+  // the Footer's guard so the totals row never renders "-1.00".
+  const isNG = data.hasFailingSubject || data.gpa < 0;
+  const gpaValue = isNG ? null : data.gpa;
+  const gpaLabel =
+    data.gpaLetterGrade ??
+    (gpaValue !== null ? gpaToLetterGrade(gpaValue) : "NG");
+
+  return (
+    <tr className="border-t-2 border-slate-900 bg-slate-50 font-semibold">
+      <Td align="left">Total</Td>
+      <Td align="right" className="tabular-nums">
+        {totalCreditHrs}
+      </Td>
+      <Td align="right" className="tabular-nums">
+        {totalFullMarks}
+      </Td>
+      <Td align="right" className="tabular-nums">
+        {totalMarks}
+      </Td>
+      <Td align="right" className="tabular-nums">
+        {overallPct.toFixed(2)}%
+      </Td>
+      <Td
+        className={cn(
+          "font-bold tracking-wide",
+          gpaLabel === "NG" && "text-red-600",
+        )}
+      >
+        {gpaLabel}
+      </Td>
+      <Td align="right" className="tabular-nums">
+        {gpaValue !== null ? gpaValue.toFixed(2) : "NG"}
+      </Td>
+    </tr>
   );
 }
 
@@ -346,13 +416,24 @@ function Td({
 
 function Footer({ data }: { data: Marksheet }) {
   const failing = data.hasFailingSubject;
+  // Weighted GPA — backend sends -1 (out-of-range sentinel) when
+  // failing; surface as null for display so we render "NG" rather
+  // than a misleading "-1.00" or "0.00". The `data.gpa < 0` arm
+  // also catches the legacy `0` sentinel, keeping older API
+  // responses rendering correctly. The gpaLetterGrade fallback uses
+  // the new CDC overall-GPA mapping when the API response pre-dates
+  // that field.
+  const gpa = (failing || data.gpa < 0) ? null : data.gpa;
+  const gpaGrade =
+    data.gpaLetterGrade ??
+    (gpa !== null ? gpaToLetterGrade(gpa) : "NG");
   const remark = failing
     ? "Student has not passed all subjects."
-    : data.overallLetterGradeLabel === "A+"
+    : gpaGrade === "A+"
       ? "Outstanding performance."
-      : data.overallLetterGradeLabel === "A"
+      : gpaGrade === "A"
         ? "Excellent performance."
-        : data.overallLetterGradeLabel === "NG"
+        : gpaGrade === "NG"
           ? "Result not graded."
           : "Qualified.";
 
@@ -369,7 +450,7 @@ function Footer({ data }: { data: Marksheet }) {
                   failing && "line-through text-slate-500",
                 )}
               >
-                {data.gpa.toFixed(2)}
+                {gpa !== null ? `${gpa.toFixed(2)} (${gpaGrade})` : `NG (${gpaGrade})`}
               </span>
             }
           />
@@ -379,14 +460,10 @@ function Footer({ data }: { data: Marksheet }) {
               <span
                 className={cn(
                   "text-lg font-bold tracking-wide",
-                  failing
-                    ? "text-red-600"
-                    : data.overallLetterGradeLabel === "NG"
-                      ? "text-red-600"
-                      : "text-slate-900",
+                  gpaGrade === "NG" ? "text-red-600" : "text-slate-900",
                 )}
               >
-                {data.overallLetterGradeLabel}
+                {gpaGrade}
               </span>
             }
           />

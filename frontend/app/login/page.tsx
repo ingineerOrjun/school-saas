@@ -79,6 +79,11 @@ export default function LoginPage() {
   const [email, setEmail] = React.useState("");
   const [password, setPassword] = React.useState("");
   const [schoolName, setSchoolName] = React.useState("");
+  // School ID — REQUIRED on sign-in (the new tenant selector).
+  // OPTIONAL on sign-up (backend auto-generates SCH-NNNN if blank).
+  // Auto-uppercased + trimmed in the change handler so the operator
+  // never has to hold Shift while typing.
+  const [schoolCode, setSchoolCode] = React.useState("");
   const [error, setError] = React.useState<string | null>(null);
 
   const isSignIn = mode === "signin";
@@ -91,10 +96,15 @@ export default function LoginPage() {
     try {
       let result: AuthResult;
       if (mode === "signin") {
-        result = await login(email, password);
+        result = await login(schoolCode, email, password);
         toast.success(`Welcome back to ${result.school.name}`);
       } else {
-        result = await registerAdmin(email, password, schoolName);
+        result = await registerAdmin(
+          email,
+          password,
+          schoolName,
+          schoolCode || undefined,
+        );
         toast.success(`Workspace ready — welcome to ${result.school.name}`);
       }
       // Hard navigation, NOT router.push. Two reasons:
@@ -153,6 +163,38 @@ export default function LoginPage() {
                   disabled={loading}
                 />
               )}
+              {/*
+                School ID — the new tenant selector. Required on sign-in
+                (must match an existing school's public code), optional
+                on sign-up (backend auto-generates SCH-NNNN if blank).
+                Auto-uppercased + restricted to A-Z / 0-9 / dash via the
+                onChange filter so a typo can't pass the regex on the
+                server side. Pattern attribute mirrors the DTO regex so
+                browsers can preview the validation hint natively.
+              */}
+              <Input
+                label="School ID"
+                placeholder="SCH-0001"
+                autoComplete="organization"
+                value={schoolCode}
+                onChange={(e) =>
+                  setSchoolCode(
+                    e.target.value
+                      .toUpperCase()
+                      .replace(/[^A-Z0-9-]/g, ""),
+                  )
+                }
+                required={isSignIn}
+                pattern="[A-Z0-9-]+"
+                maxLength={40}
+                autoFocus={isSignIn}
+                disabled={loading}
+                hint={
+                  isSignIn
+                    ? "Your School ID is provided by the platform administrator."
+                    : "Optional — leave blank and we'll generate one (SCH-0002, SCH-0003, …)."
+                }
+              />
               <Input
                 label="Email"
                 type="email"
@@ -161,7 +203,6 @@ export default function LoginPage() {
                 value={email}
                 onChange={(e) => setEmail(e.target.value)}
                 required
-                autoFocus={isSignIn}
                 disabled={loading}
               />
               <Input

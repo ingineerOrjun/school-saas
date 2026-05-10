@@ -10,7 +10,7 @@ import {
   type FeeStructureDto,
   type FeeFrequency,
 } from "@/lib/fees";
-import { classesApi, type ClassWithSections } from "@/lib/classes";
+import { useClasses, type ClassWithSections } from "@/lib/classes";
 import { Button } from "@/components/ui/Button";
 import { Input } from "@/components/ui/Input";
 import { Modal } from "@/components/ui/Modal";
@@ -31,7 +31,10 @@ export function ManageStructuresDialog({
   onChanged,
 }: ManageStructuresDialogProps) {
   const [list, setList] = React.useState<FeeStructureDto[]>([]);
-  const [classes, setClasses] = React.useState<ClassWithSections[]>([]);
+  // Phase Ω migration — classes now flow through the shared
+  // useClasses() hook. Reopening the dialog re-uses the cache.
+  const classesQuery = useClasses();
+  const classes: ClassWithSections[] = classesQuery.data ?? [];
   const [loading, setLoading] = React.useState(false);
   const [name, setName] = React.useState("");
   const [amount, setAmount] = React.useState("");
@@ -40,16 +43,12 @@ export function ManageStructuresDialog({
   const [submitting, setSubmitting] = React.useState(false);
 
   const refresh = React.useCallback(async () => {
+    // Phase Ω — classes come from the shared useClasses() hook
+    // above. Only fee structures need an imperative refresh here.
     setLoading(true);
     try {
-      // Load fees + classes in parallel so the class picker is populated
-      // the instant the dialog opens.
-      const [s, c] = await Promise.all([
-        feesApi.listStructures(),
-        classesApi.list(),
-      ]);
+      const s = await feesApi.listStructures();
       setList(s);
-      setClasses(c);
     } catch (err) {
       toast.error(err instanceof ApiError ? err.message : "Failed to load fees.");
     } finally {

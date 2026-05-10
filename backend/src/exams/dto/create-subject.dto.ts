@@ -1,5 +1,6 @@
 import {
   IsInt,
+  IsNumber,
   IsOptional,
   IsString,
   Max,
@@ -29,4 +30,17 @@ export class CreateSubjectDto {
   @Min(0)
   @Max(1000)
   practicalFullMarks?: number;
+
+  /**
+   * Optional. Credit hours used to weight this subject in the
+   * credit-hour-weighted GPA (per Nepal CDC progress-report formula).
+   * Defaults to 5 — the most common CDC weekly-period allocation —
+   * matching the database default. Range covers half-credits up to
+   * intensive blocks.
+   */
+  @IsOptional()
+  @IsNumber()
+  @Min(0.5)
+  @Max(20)
+  creditHours?: number = 5;
 }

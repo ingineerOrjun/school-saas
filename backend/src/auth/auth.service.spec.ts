@@ -7,13 +7,18 @@ import type { HashingService } from '../common/hashing/hashing.service';
 import type { PrismaService } from '../database/prisma.service';
 import type { HealthService } from '../health/health.service';
 import type { NotificationService } from '../notifications/notification.service';
+import type { PlatformAuditService } from '../platform/platform-audit.service';
+import type { SchoolCodeService } from '../platform/services/school-code.service';
 
 // ---------------------------------------------------------------------------
-// AuthService.login — Phase 11 maturity tests.
+// AuthService.login — Phase 11 maturity tests, refreshed for the
+// schoolCode + email + password login flow.
 //
 // Focus on the security-critical branches:
 //   • Bad password → 401, NO token issued, login failure recorded.
 //   • Unknown email → 401, login failure recorded.
+//   • Unknown schoolCode → 401, login failure recorded (tenant
+//     existence isn't leaked — same generic 401 as bad password).
 //   • SUSPENDED school → 400 with the suspension copy, login failure
 //     recorded with reason="school_blocked" (not "invalid_credentials"
 //     — the password WAS correct).
@@ -28,31 +33,65 @@ import type { NotificationService } from '../notifications/notification.service'
 // tests upstream in @nestjs/jwt).
 // ---------------------------------------------------------------------------
 
+interface SchoolRow {
+  id: string;
+  name: string;
+  slug: string;
+  schoolCode: string;
+  status: 'ACTIVE' | 'TRIAL' | 'SUSPENDED' | 'EXPIRED';
+}
+
 interface UserRow {
   id: string;
   email: string;
   password: string;
   role: Role;
   schoolId: string;
-  school: {
-    id: string;
-    name: string;
-    slug: string;
-    status: 'ACTIVE' | 'TRIAL' | 'SUSPENDED' | 'EXPIRED';
-  };
   createdAt: Date;
   updatedAt: Date;
 }
 
-function buildHarness() {
+const DEFAULT_SCHOOL: SchoolRow = {
+  id: 's-1',
+  name: 'School A',
+  slug: 'school-a',
+  schoolCode: 'SCH-0001',
+  status: 'ACTIVE',
+};
+
+function buildHarness(opts?: { school?: SchoolRow }) {
+  const schools = new Map<string, SchoolRow>();
+  schools.set('SCH-0001', opts?.school ?? DEFAULT_SCHOOL);
+
   const users = new Map<string, UserRow>();
-  const loginFailures: Array<{ email: string; ip: string | null; reason: string }> = [];
+  const loginFailures: Array<{
+    email: string;
+    ip: string | null;
+    reason: string;
+  }> = [];
 
   const prisma: Partial<PrismaService> = {
     user: {
       findUnique: jest.fn(async ({ where }: any) => {
-        for (const u of users.values()) {
-          if (u.email === where.email) return u;
+        // The new login flow uses the `schoolId_email` compound
+        // unique key. We accept either the legacy `where.email`
+        // shape (defensive) or the compound shape — the production
+        // code only sends the compound shape.
+        if (where?.schoolId_email) {
+          for (const u of users.values()) {
+            if (
+              u.email === where.schoolId_email.email &&
+              u.schoolId === where.schoolId_email.schoolId
+            ) {
+              return u;
+            }
+          }
+          return null;
+        }
+        if (where?.email) {
+          for (const u of users.values()) {
+            if (u.email === where.email) return u;
+          }
         }
         return null;
       }),
@@ -62,14 +101,24 @@ function buildHarness() {
       findFirst: jest.fn(async () => null),
     } as any,
     school: {
-      findUnique: jest.fn(),
+      findUnique: jest.fn(async ({ where }: any) => {
+        if (where?.schoolCode) return schools.get(where.schoolCode) ?? null;
+        if (where?.id) {
+          for (const s of schools.values()) {
+            if (s.id === where.id) return s;
+          }
+        }
+        return null;
+      }),
     } as any,
     $transaction: jest.fn(),
   };
 
   const hashing: Partial<HashingService> = {
     hash: jest.fn(async (p: string) => `hashed:${p}`),
-    compare: jest.fn(async (plain: string, hashed: string) => hashed === `hashed:${plain}`),
+    compare: jest.fn(
+      async (plain: string, hashed: string) => hashed === `hashed:${plain}`,
+    ),
   };
 
   const jwt: Partial<JwtService> = {
@@ -105,6 +154,26 @@ function buildHarness() {
     })),
   } as any;
 
+  // SchoolCodeService — we only exercise normalize() in the login
+  // path. The real implementation is trim+uppercase, idempotent;
+  // the mock mirrors that.
+  const schoolCodes: Partial<SchoolCodeService> = {
+    normalize: jest.fn((input: string) => input.trim().toUpperCase()),
+    // Login doesn't call these but they round out the type.
+    validate: jest.fn(),
+    exists: jest.fn(),
+    generateNextSchoolCode: jest.fn(),
+    resolveForCreate: jest.fn(),
+    withRetryOnCollision: jest.fn(),
+  };
+
+  // PlatformAuditService — only registerAdmin emits, login does not.
+  // Stubbed to satisfy the constructor; the real `record` resolves
+  // to the audit row id (or null on swallow).
+  const platformAudit: Partial<PlatformAuditService> = {
+    record: jest.fn(async () => null),
+  };
+
   const service = new AuthService(
     prisma as PrismaService,
     hashing as HashingService,
@@ -113,9 +182,11 @@ function buildHarness() {
     notifications as NotificationService,
     config as ConfigService,
     sessions,
+    schoolCodes as SchoolCodeService,
+    platformAudit as PlatformAuditService,
   );
 
-  return { service, users, loginFailures };
+  return { service, users, schools, loginFailures };
 }
 
 const makeUser = (overrides: Partial<UserRow> = {}): UserRow => ({
@@ -124,12 +195,6 @@ const makeUser = (overrides: Partial<UserRow> = {}): UserRow => ({
   password: 'hashed:correct-pw',
   role: Role.ADMIN,
   schoolId: 's-1',
-  school: {
-    id: 's-1',
-    name: 'School A',
-    slug: 'school-a',
-    status: 'ACTIVE',
-  },
   createdAt: new Date(),
   updatedAt: new Date(),
   ...overrides,
@@ -137,10 +202,39 @@ const makeUser = (overrides: Partial<UserRow> = {}): UserRow => ({
 
 describe('AuthService.login', () => {
   describe('credential checks', () => {
-    it('rejects unknown email with a generic 401 + records login failure', async () => {
+    it('rejects unknown school code with a generic 401 + records login failure', async () => {
+      const h = buildHarness();
+      // No user matches; even if one did, the schoolCode lookup
+      // returns null first.
+      await expect(
+        h.service.login(
+          {
+            schoolCode: 'SCH-9999',
+            email: 'alice@example.edu',
+            password: 'pw',
+          },
+          '10.0.0.1',
+        ),
+      ).rejects.toBeInstanceOf(UnauthorizedException);
+      expect(h.loginFailures).toHaveLength(1);
+      expect(h.loginFailures[0]).toMatchObject({
+        email: 'alice@example.edu',
+        ip: '10.0.0.1',
+        reason: 'invalid_credentials',
+      });
+    });
+
+    it('rejects unknown email within a real tenant with a generic 401 + records failure', async () => {
       const h = buildHarness();
       await expect(
-        h.service.login({ email: 'unknown@x', password: 'pw' }, '10.0.0.1'),
+        h.service.login(
+          {
+            schoolCode: 'SCH-0001',
+            email: 'unknown@x',
+            password: 'pw',
+          },
+          '10.0.0.1',
+        ),
       ).rejects.toBeInstanceOf(UnauthorizedException);
       expect(h.loginFailures).toHaveLength(1);
       expect(h.loginFailures[0]).toMatchObject({
@@ -155,7 +249,11 @@ describe('AuthService.login', () => {
       h.users.set('u-1', makeUser());
       await expect(
         h.service.login(
-          { email: 'alice@example.edu', password: 'wrong' },
+          {
+            schoolCode: 'SCH-0001',
+            email: 'alice@example.edu',
+            password: 'wrong',
+          },
           '10.0.0.2',
         ),
       ).rejects.toBeInstanceOf(UnauthorizedException);
@@ -163,26 +261,37 @@ describe('AuthService.login', () => {
       expect(h.loginFailures[0].reason).toBe('invalid_credentials');
     });
 
-    it('uses the SAME error message for unknown email and wrong password', async () => {
+    it('uses the SAME error message for unknown school, unknown email, and wrong password', async () => {
       const h = buildHarness();
       h.users.set('u-1', makeUser());
-      let unknownMsg = '';
-      let wrongMsg = '';
-      try {
-        await h.service.login({ email: 'unknown@x', password: 'pw' });
-      } catch (e) {
-        unknownMsg = (e as Error).message;
-      }
-      try {
-        await h.service.login({
-          email: 'alice@example.edu',
-          password: 'wrong',
-        });
-      } catch (e) {
-        wrongMsg = (e as Error).message;
-      }
+      const collect = async (
+        body: { schoolCode: string; email: string; password: string },
+      ): Promise<string> => {
+        try {
+          await h.service.login(body);
+          return '';
+        } catch (e) {
+          return (e as Error).message;
+        }
+      };
+      const unknownSchool = await collect({
+        schoolCode: 'SCH-9999',
+        email: 'alice@example.edu',
+        password: 'correct-pw',
+      });
+      const unknownEmail = await collect({
+        schoolCode: 'SCH-0001',
+        email: 'ghost@x',
+        password: 'pw',
+      });
+      const wrongPassword = await collect({
+        schoolCode: 'SCH-0001',
+        email: 'alice@example.edu',
+        password: 'wrong',
+      });
       // Critical: don't leak which side failed.
-      expect(unknownMsg).toBe(wrongMsg);
+      expect(unknownSchool).toBe(unknownEmail);
+      expect(unknownEmail).toBe(wrongPassword);
     });
   });
 
@@ -190,22 +299,18 @@ describe('AuthService.login', () => {
     it.each(['SUSPENDED', 'EXPIRED'] as const)(
       'BLOCKS login when the school is %s — even with the right password',
       async (status) => {
-        const h = buildHarness();
-        h.users.set(
-          'u-1',
-          makeUser({
-            school: {
-              id: 's-1',
-              name: 'School A',
-              slug: 'school-a',
-              status,
-            },
-          }),
-        );
+        const h = buildHarness({
+          school: { ...DEFAULT_SCHOOL, status },
+        });
+        h.users.set('u-1', makeUser());
 
         await expect(
           h.service.login(
-            { email: 'alice@example.edu', password: 'correct-pw' },
+            {
+              schoolCode: 'SCH-0001',
+              email: 'alice@example.edu',
+              password: 'correct-pw',
+            },
             '10.0.0.5',
           ),
         ).rejects.toThrow();
@@ -222,23 +327,28 @@ describe('AuthService.login', () => {
       // SUPER_ADMINs aren't tenant-bound — the gate is for tenants
       // only. The platform owner must be able to sign in to FIX a
       // suspended school.
-      const h = buildHarness();
+      const platformSchool: SchoolRow = {
+        id: 's-platform',
+        name: 'Platform',
+        slug: 'platform',
+        schoolCode: 'SCH-PLATFORM',
+        status: 'SUSPENDED',
+      };
+      const h = buildHarness({ school: platformSchool });
+      h.schools.set('SCH-PLATFORM', platformSchool);
+      h.schools.delete('SCH-0001');
       h.users.set(
         'super-1',
         makeUser({
           id: 'super-1',
           email: 'op@platform',
           role: Role.SUPER_ADMIN,
-          school: {
-            id: 's-platform',
-            name: 'Platform',
-            slug: 'platform',
-            status: 'SUSPENDED',
-          },
+          schoolId: 's-platform',
         }),
       );
 
       const result = await h.service.login({
+        schoolCode: 'SCH-PLATFORM',
         email: 'op@platform',
         password: 'correct-pw',
       });
@@ -254,12 +364,27 @@ describe('AuthService.login', () => {
       const h = buildHarness();
       h.users.set('u-1', makeUser());
       const result = await h.service.login(
-        { email: 'alice@example.edu', password: 'correct-pw' },
+        {
+          schoolCode: 'SCH-0001',
+          email: 'alice@example.edu',
+          password: 'correct-pw',
+        },
         '10.0.0.1',
       );
       expect(result.accessToken).toBe('signed-token');
       expect(result.user.email).toBe('alice@example.edu');
       expect(h.loginFailures).toHaveLength(0);
+    });
+
+    it('normalizes lowercase / whitespace school codes before lookup', async () => {
+      const h = buildHarness();
+      h.users.set('u-1', makeUser());
+      const result = await h.service.login({
+        schoolCode: '  sch-0001  ',
+        email: 'alice@example.edu',
+        password: 'correct-pw',
+      });
+      expect(result.accessToken).toBe('signed-token');
     });
   });
 });

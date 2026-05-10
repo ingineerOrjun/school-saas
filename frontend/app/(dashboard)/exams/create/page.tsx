@@ -47,6 +47,8 @@ interface DraftSubject {
   name: string;
   theoryFullMarks: string; // string in state so empty fields don't read as 0
   practicalFullMarks: string;
+  /** CDC weekly-period count; blank → backend defaults to 5. */
+  creditHours: string;
 }
 
 const newDraft = (): DraftSubject => ({
@@ -54,6 +56,7 @@ const newDraft = (): DraftSubject => ({
   name: "",
   theoryFullMarks: "100",
   practicalFullMarks: "0",
+  creditHours: "5",
 });
 
 function cryptoRandom(): string {
@@ -118,7 +121,7 @@ export default function CreateExamPage() {
       prev.length === 1
         ? // Always keep one row visible; clearing it instead is closer
           // to the user's intent than vanishing the form.
-          [{ ...prev[0], name: "", theoryFullMarks: "100", practicalFullMarks: "0" }]
+          [{ ...prev[0], name: "", theoryFullMarks: "100", practicalFullMarks: "0", creditHours: "5" }]
         : prev.filter((s) => s.uid !== uid),
     );
   };
@@ -140,6 +143,15 @@ export default function CreateExamPage() {
       }
       if (!Number.isFinite(practical) || practical < 0 || practical > 1000) {
         return `"${s.name}": practical full marks must be between 0 and 1000.`;
+      }
+      // Credit hours — blank is fine (backend defaults to 5). When
+      // present, must be in the same 0.5–20 range the DTO enforces.
+      const trimmedCredit = s.creditHours.trim();
+      if (trimmedCredit !== "") {
+        const credit = Number(trimmedCredit);
+        if (!Number.isFinite(credit) || credit < 0.5 || credit > 20) {
+          return `"${s.name}": credit hours must be between 0.5 and 20.`;
+        }
       }
     }
     // Catch duplicate subject names (case-insensitive) — the backend
@@ -211,10 +223,15 @@ export default function CreateExamPage() {
       //    typed on screen.
       const created: ExamSubjectDto[] = [];
       for (const s of namedSubjects) {
+        // Blank credit hours → omit the field so the backend default
+        // (5) kicks in. Otherwise pass the parsed numeric value.
+        const trimmedCredit = s.creditHours.trim();
+        const creditHours = trimmedCredit === "" ? undefined : Number(trimmedCredit);
         const row = await examsApi.addSubject(exam.id, {
           name: s.name.trim(),
           theoryFullMarks: Number(s.theoryFullMarks),
           practicalFullMarks: Number(s.practicalFullMarks) || 0,
+          ...(creditHours !== undefined ? { creditHours } : {}),
         });
         created.push(row);
         addedCount = created.length;
@@ -337,6 +354,15 @@ export default function CreateExamPage() {
                   <Th>Subject name</Th>
                   <Th className="w-[140px]">Theory full marks</Th>
                   <Th className="w-[140px]">Practical full marks</Th>
+                  {/* Nepali label keeps the form readable for school
+                      operators familiar with the CDC term. Tooltip lives
+                      on the inner span because the local <Th> wrapper
+                      only forwards `className`. */}
+                  <Th className="w-[160px]">
+                    <span title="Weekly teaching periods allocated to this subject">
+                      Credit Hours (पाठ्यघण्टा)
+                    </span>
+                  </Th>
                   <Th className="w-12" />
                 </tr>
               </thead>
@@ -386,6 +412,28 @@ export default function CreateExamPage() {
                           })
                         }
                         disabled={submitting}
+                        className="h-9 w-full rounded-md border border-border bg-surface px-2.5 text-sm tabular-nums focus:outline-none focus:ring-2 focus:ring-primary/25 focus:border-primary"
+                      />
+                    </Td>
+                    <Td>
+                      {/* Credit hours allows half-credits (0.5 step), so
+                          this uses type=number rather than the integer-
+                          only text+inputMode=numeric pattern above. Blank
+                          → backend default of 5. */}
+                      <input
+                        type="number"
+                        min={0.5}
+                        max={20}
+                        step={0.5}
+                        placeholder="5"
+                        value={s.creditHours}
+                        onChange={(e) =>
+                          updateSubject(s.uid, {
+                            creditHours: e.target.value,
+                          })
+                        }
+                        disabled={submitting}
+                        title="Weekly teaching periods allocated to this subject"
                         className="h-9 w-full rounded-md border border-border bg-surface px-2.5 text-sm tabular-nums focus:outline-none focus:ring-2 focus:ring-primary/25 focus:border-primary"
                       />
                     </Td>

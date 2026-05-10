@@ -4,6 +4,7 @@ import { Toaster } from "@/components/ui/Toaster";
 import { ThemeProvider, themeScript } from "@/components/theme/ThemeProvider";
 import { CalendarProvider } from "@/components/calendar/CalendarProvider";
 import { AcademicSessionProvider } from "@/components/academic-session/AcademicSessionProvider";
+import { QueryProvider } from "@/components/query-provider";
 import "./globals.css";
 
 const inter = Inter({
@@ -57,23 +58,31 @@ export default function RootLayout({
         />
       </head>
       <body>
-        <ThemeProvider>
-          {/* CalendarProvider sits inside ThemeProvider so dark-mode
-              toggles don't unmount it (and lose the preference state).
-              Inverse nesting wouldn't matter for correctness — pure
-              ergonomics. */}
-          <CalendarProvider>
-            {/* AcademicSessionProvider fetches the session list from
-                the API on mount, so it sits inside the auth-token-
-                aware layer. The provider tolerates 401 (returns empty
-                list) so it doesn't crash for unauthenticated visitors
-                landing on /login. */}
-            <AcademicSessionProvider>
-              {children}
-              <Toaster />
-            </AcademicSessionProvider>
-          </CalendarProvider>
-        </ThemeProvider>
+        {/* QueryProvider is the OUTERMOST app provider so every other
+            provider + every page can use shared React Query cache
+            with one set of defaults (lib/query-client.ts). The
+            previous ad-hoc QueryProvider in the dashboard layout
+            scoped the cache to the school side only — moving it
+            here means platform pages get the same dedupe + caching. */}
+        <QueryProvider>
+          <ThemeProvider>
+            {/* CalendarProvider sits inside ThemeProvider so dark-mode
+                toggles don't unmount it (and lose the preference state).
+                Inverse nesting wouldn't matter for correctness — pure
+                ergonomics. */}
+            <CalendarProvider>
+              {/* AcademicSessionProvider fetches the session list from
+                  the API on mount, so it sits inside the auth-token-
+                  aware layer. The provider tolerates 401 (returns empty
+                  list) so it doesn't crash for unauthenticated visitors
+                  landing on /login. */}
+              <AcademicSessionProvider>
+                {children}
+                <Toaster />
+              </AcademicSessionProvider>
+            </CalendarProvider>
+          </ThemeProvider>
+        </QueryProvider>
       </body>
     </html>
   );

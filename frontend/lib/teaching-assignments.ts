@@ -1,4 +1,6 @@
+import { useQuery } from "@tanstack/react-query";
 import { api } from "./api";
+import { qk } from "./query-keys";
 
 export interface AssignmentClassRef {
   id: string;
@@ -108,3 +110,40 @@ export const teachingAssignmentsApi = {
       redirectOn403: false,
     }),
 };
+
+// ---------------------------------------------------------------------------
+// useMyTeachingAssignments — shared cache for the teacher-self endpoint.
+//
+// Reference data: assignments only change when an admin reassigns a
+// teacher (days/weeks between changes). This hook caches the result for
+// 10 min and skips refetch-on-mount/focus, so multiple callers in the
+// same session share one underlying request and don't burn rate-limit
+// quota. Mirrors the staleTime convention used by useSubjects.
+//
+// Auth errors (401/403) are NEVER retried — the teacher is either
+// assigned (200), unauthenticated (401, redirected by api.ts), or
+// not-a-teacher (403, caller renders "no assignments" empty state).
+//
+// `enabled` (default: true) lets non-TEACHER callers (admin/staff
+// pages that share the same render tree as teachers) skip the fetch
+// entirely instead of always 403-ing. Without this, every admin
+// page-load would burn a request whose only purpose is to cache an
+// expected error.
+// ---------------------------------------------------------------------------
+export function useMyTeachingAssignments(options?: { enabled?: boolean }) {
+  return useQuery({
+    queryKey: qk.myAssignments(),
+    queryFn: () => teachingAssignmentsApi.listMine(),
+    enabled: options?.enabled ?? true,
+    staleTime: 10 * 60 * 1000, // 10 minutes
+    gcTime: 30 * 60 * 1000, // 30 minutes
+    refetchOnWindowFocus: false,
+    refetchOnMount: false,
+    retry: (failureCount, error) => {
+      // Never retry auth errors — teacher is either assigned or not.
+      const status = (error as { status?: number } | null)?.status;
+      if (status === 401 || status === 403) return false;
+      return failureCount < 2;
+    },
+  });
+}

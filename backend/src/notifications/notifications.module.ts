@@ -89,7 +89,7 @@ import { EMAIL_PROVIDER } from './providers/email-provider.token';
       },
     },
   ],
-  exports: [NotificationService, NotificationCenterService],
+  exports: [NotificationService, NotificationCenterService, EmailChannel],
 })
 export class NotificationsModule implements OnModuleInit {
   constructor(

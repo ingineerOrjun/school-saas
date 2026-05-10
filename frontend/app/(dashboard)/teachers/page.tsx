@@ -11,9 +11,11 @@ import {
 } from "lucide-react";
 import { toast } from "sonner";
 import { ApiError } from "@/lib/api";
-import { teachersApi, type TeacherDto } from "@/lib/teachers";
-import { classesApi, type ClassWithSections } from "@/lib/classes";
-import { subjectsApi, type SubjectDto } from "@/lib/subjects";
+import { teachersApi, useTeachers, type TeacherDto } from "@/lib/teachers";
+import { useClasses, type ClassWithSections } from "@/lib/classes";
+import { useSubjects, type SubjectDto } from "@/lib/subjects";
+import { useQueryClient } from "@tanstack/react-query";
+import { qk } from "@/lib/query-keys";
 import { Button } from "@/components/ui/Button";
 import { Skeleton } from "@/components/ui/Skeleton";
 import { EmptyState } from "@/components/ui/EmptyState";
@@ -36,11 +38,33 @@ interface PendingDeletion {
 
 export default function TeachersPage() {
   const router = useRouter();
+  const qc = useQueryClient();
+  // Phase γ — three reference datasets via shared hooks. Mounting
+  // this page no longer triggers Promise.all of three fetches; the
+  // cache (10m+ stale) serves repeat visits + dialog mounts.
+  const teachersQuery = useTeachers();
+  const classesQuery = useClasses();
+  const subjectsQuery = useSubjects();
   const [list, setList] = React.useState<TeacherDto[] | null>(null);
-  const [classes, setClasses] = React.useState<ClassWithSections[]>([]);
-  const [subjects, setSubjects] = React.useState<SubjectDto[]>([]);
-  const [loading, setLoading] = React.useState(true);
-  const [error, setError] = React.useState<string | null>(null);
+  const classes: ClassWithSections[] = classesQuery.data ?? [];
+  const subjects: SubjectDto[] = subjectsQuery.data ?? [];
+  const loading = teachersQuery.isLoading;
+  const error =
+    teachersQuery.error instanceof ApiError
+      ? teachersQuery.error.message
+      : teachersQuery.error
+        ? "Failed to load teachers."
+        : null;
+  // Mirror query data into local list state for the existing
+  // optimistic delete + add-highlight machinery.
+  React.useEffect(() => {
+    if (teachersQuery.data) setList(teachersQuery.data);
+  }, [teachersQuery.data]);
+  React.useEffect(() => {
+    if (teachersQuery.error instanceof ApiError && teachersQuery.error.status === 401) {
+      router.replace("/login");
+    }
+  }, [teachersQuery.error, router]);
   const [query, setQuery] = React.useState("");
   const [addOpen, setAddOpen] = React.useState(false);
   const [editTarget, setEditTarget] = React.useState<TeacherDto | null>(null);
@@ -62,42 +86,16 @@ export default function TeachersPage() {
     new Map(),
   );
 
+  // Phase γ — refresh now invalidates the shared cache. Other
+  // consumers of these query keys (sidebar pickers, assignment
+  // dialogs) stay in sync automatically.
   const refresh = React.useCallback(async () => {
-    setLoading(true);
-    setError(null);
-    try {
-      // Pull teachers + the classes catalog + the subject catalog in
-      // parallel — all three feed the page (subjects is needed by the
-      // assignments dialog's "Subject" dropdown).
-      const [data, cls, subs] = await Promise.all([
-        teachersApi.list(),
-        classesApi.list(),
-        subjectsApi.list(),
-      ]);
-      setList(data);
-      setClasses(cls);
-      setSubjects(subs);
-    } catch (err) {
-      if (err instanceof ApiError && err.status === 401) {
-        router.replace("/login");
-        return;
-      }
-      const msg =
-        err instanceof ApiError
-          ? err.message
-          : err instanceof Error
-            ? err.message
-            : "Failed to load teachers.";
-      setError(msg);
-      setList([]);
-    } finally {
-      setLoading(false);
-    }
-  }, [router]);
-
-  React.useEffect(() => {
-    refresh();
-  }, [refresh]);
+    await Promise.all([
+      qc.invalidateQueries({ queryKey: qk.teachers() }),
+      qc.invalidateQueries({ queryKey: qk.classes() }),
+      qc.invalidateQueries({ queryKey: qk.subjects() }),
+    ]);
+  }, [qc]);
 
   const filtered = React.useMemo(() => {
     if (!list) return [];

@@ -1,4 +1,4 @@
-import { Module } from '@nestjs/common';
+import { MiddlewareConsumer, Module, NestModule } from '@nestjs/common';
 import { ConfigModule } from '@nestjs/config';
 import { APP_FILTER, APP_GUARD } from '@nestjs/core';
 import { ServeStaticModule } from '@nestjs/serve-static';
@@ -7,9 +7,15 @@ import { join } from 'node:path';
 import { AllExceptionsFilter } from './common/filters/http-exception.filter';
 import { JobsModule } from './common/jobs/jobs.module';
 import { MaintenanceModeGuard } from './common/maintenance/maintenance-mode.guard';
+import { ObservabilityModule } from './common/observability/observability.module';
+import { RequestIdMiddleware } from './common/observability/request-id.middleware';
+import { RequestMetricsMiddleware } from './common/observability/request-metrics.middleware';
 import { UserAwareThrottlerGuard } from './common/throttle/user-aware-throttler.guard';
 import { HealthModule } from './health/health.module';
 import { NotificationsModule } from './notifications/notifications.module';
+import { OperationsModule } from './operations/operations.module';
+import { ExperienceModule } from './experience/experience.module';
+import { ProductizationModule } from './productization/productization.module';
 import { SessionsModule } from './sessions/sessions.module';
 import { AcademicSessionModule } from './academic-session/academic-session.module';
 import { AnnouncementModule } from './announcement/announcement.module';
@@ -72,24 +78,60 @@ import { UserModule } from './user/user.module';
     //   add a steady baseline, and the operator may have multiple
     //   tabs open during incident response. 600/min/user is comfortably
     //   above legitimate usage and still catches a runaway client.
+    // Named throttle buckets — each surface gets its own budget
+    // so traffic from one (e.g. notification polling) doesn't
+    // exhaust the user's allowance for another (e.g. dashboard
+    // navigation).
+    //
+    // Sizing rationale:
+    //   • default (general)   — 600/min/user. Wide safety net for
+    //     the long tail of dashboard endpoints. Per-user keying
+    //     via UserAwareThrottlerGuard means one busy admin doesn't
+    //     starve another at the same NAT.
+    //   • notifications       — 120/min/user. Per spec. Handles
+    //     polling (1/min unread + list fetches) plus optimistic
+    //     mutations comfortably.
+    //   • platform            — 300/min/user. SUPER_ADMIN traffic
+    //     is bursty (open the ops cockpit + drill into a school +
+    //     check audit log + open notifications all in one minute).
+    //   • auth                — 10/min/IP. Login. Per-IP because
+    //     the user has no identity yet. Strict on purpose.
+    //   • register            — 5/hour/IP. Tenant creation is
+    //     low-volume + high-impact — strict guards against
+    //     enumeration / spam.
     ThrottlerModule.forRoot([
       {
         name: 'default',
-        ttl: 60_000, // 60s
+        ttl: 60_000,
         limit: 600,
       },
       {
+        name: 'notifications',
+        ttl: 60_000,
+        limit: 120,
+      },
+      {
+        name: 'platform',
+        ttl: 60_000,
+        limit: 300,
+      },
+      {
         name: 'auth',
-        ttl: 60_000, // 60s
-        limit: 10, // login attempts per IP per minute
+        ttl: 60_000,
+        limit: 10,
       },
       {
         name: 'register',
-        ttl: 60 * 60_000, // 1h
-        limit: 5, // tenant registrations per IP per hour
+        ttl: 60 * 60_000,
+        limit: 5,
       },
     ]),
     DatabaseModule,
+    // Phase α fix — @Global() observability primitives. Holds
+    // RequestMetricsService + StructuredLogger + the two middleware
+    // classes that AppModule.configure() references. Mounted early
+    // so every downstream module can inject from it.
+    ObservabilityModule,
     AuthModule,
     TeacherScopeModule,
     AcademicSessionModule,
@@ -136,6 +178,24 @@ import { UserModule } from './user/user.module';
     // JwtStrategy can inject SessionService for per-token tracking
     // (login creates, strategy looks up + touches, logout revokes).
     SessionsModule,
+    // Operations Center — Phase 21. SUPER_ADMIN-only cockpit
+    // surface (request monitoring, queue monitor, subsystem health,
+    // security feed, session monitor, school health grid, event
+    // ticker, incident broadcast). Mounted AFTER PlatformModule +
+    // SessionsModule + NotificationsModule because it consumes
+    // SecurityService, SessionService, and NotificationService.
+    OperationsModule,
+    // Productization — Phase 23. School-side onboarding wizard,
+    // staff invitations, per-tenant branding, support notes,
+    // announcement banners, guardian foundations, data exports +
+    // imports, deployment + adoption telemetry. Independent of
+    // OperationsModule (no shared state); mounted last because
+    // it consumes the broadest set of global services.
+    ProductizationModule,
+    // Experience — Phase 24. Tenant-side UX polish surface
+    // (unified /me/search powering the Cmd+K palette). Pure
+    // read-side; no new schema, no new dependencies.
+    ExperienceModule,
     // Future feature modules will be added here
   ],
   controllers: [],
@@ -169,6 +229,25 @@ import { UserModule } from './user/user.module';
       provide: APP_GUARD,
       useClass: MaintenanceModeGuard,
     },
+    // RequestMetricsService + StructuredLogger + the two middleware
+    // classes were moved to ObservabilityModule (@Global). The
+    // previous "AppModule providers are global" assumption was wrong
+    // — child modules (Operations, Productization) couldn't inject
+    // them, breaking boot. The @Global module makes them visible
+    // everywhere.
   ],
 })
-export class AppModule {}
+export class AppModule implements NestModule {
+  // Middleware order matters:
+  //   1. RequestIdMiddleware — must run FIRST so the rest of the
+  //      pipeline (auth, throttler, metrics, controllers, services)
+  //      observes a populated RequestContext via AsyncLocalStorage.
+  //   2. RequestMetricsMiddleware — runs second, captures duration +
+  //      status on `res.on('finish')`, stamps the matched route /
+  //      userId / schoolId onto the active context.
+  configure(consumer: MiddlewareConsumer): void {
+    consumer
+      .apply(RequestIdMiddleware, RequestMetricsMiddleware)
+      .forRoutes('*');
+  }
+}

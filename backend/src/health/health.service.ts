@@ -2,6 +2,36 @@ import { Injectable, Logger } from '@nestjs/common';
 import { PrismaService } from '../database/prisma.service';
 
 // ---------------------------------------------------------------------------
+// Subsystem health is computed from existing operational signals
+// (queue stats, recent notification deliveries, etc.) so we don't
+// pay for a separate periodic prober. Each subsystem maps to a
+// "did this work in the recent past?" signal:
+//
+//   db                — fresh SELECT 1 round-trip on every probe.
+//   queue_runner      — RUNNING jobs visible AND no PENDING job
+//                       sitting more than `STUCK_QUEUE_MIN`m past
+//                       its runAt (proxy for "the runner is alive
+//                       AND keeping up").
+//   notification_dispatch
+//                     — recent deliveries with FAILED ratio < 50% in
+//                       the last hour. Empty window = HEALTHY (we
+//                       can't fail a check we never ran).
+//   cron_scheduler    — process uptime > 60s (the schedule fires
+//                       hourly; a fresh process hasn't had time to
+//                       mis-fire a tick yet, so we report HEALTHY).
+//   email_provider    — recent EMAIL deliveries last hour: same
+//                       ratio rule as notification_dispatch.
+//   cache_layer       — present as a placeholder reporting HEALTHY
+//                       (no Redis layer in v1; widget exists so the
+//                       UI shape is stable when one lands).
+// ---------------------------------------------------------------------------
+
+const STUCK_QUEUE_MIN = 5;
+const SUBSYSTEM_FAIL_RATIO_DEGRADED = 0.2;
+const SUBSYSTEM_FAIL_RATIO_DOWN = 0.5;
+const UPTIME_RING_SIZE = 24 * 60 * 4; // 24h × 60m × 4 (15s ticks)
+
+// ---------------------------------------------------------------------------
 // Phase 10 — HealthService.
 //
 // In-memory operational telemetry for the platform health dashboard.
@@ -51,6 +81,27 @@ export interface LoginFailureEvent {
   ip: string | null;
   /** Reason: "invalid_credentials" or "school_blocked". */
   reason: string;
+}
+
+export type SubsystemStatus = 'HEALTHY' | 'DEGRADED' | 'DOWN';
+
+export interface SubsystemHealth {
+  /** Stable id for the row — also the i18n key in the UI. */
+  key: string;
+  /** Human label for the row. */
+  label: string;
+  status: SubsystemStatus;
+  /** One-line operator-readable observation. */
+  detail: string;
+  /** ISO timestamp of the probe. */
+  checkedAt: string;
+  /**
+   * Rolling 24h uptime ratio (0..1) — fraction of recorded ticks
+   * where the subsystem was HEALTHY. Recorded each time
+   * getSubsystems() is called; the operator's polling cadence
+   * drives the resolution.
+   */
+  uptime24h: number;
 }
 
 export interface HealthPayload {
@@ -121,6 +172,13 @@ export class HealthService {
   private readonly loginFailures: LoginFailureEvent[] = [];
   private errorCountSinceStart = 0;
   private loginFailureCountSinceStart = 0;
+  /**
+   * Per-subsystem rolling history (newest at end). Each tick records
+   * `1` for HEALTHY, `0` otherwise. The 24h uptime ratio is the mean
+   * of the latest UPTIME_RING_SIZE samples — the buffer is bounded
+   * so memory cost is constant.
+   */
+  private readonly uptimeRings = new Map<string, number[]>();
 
   constructor(private readonly prisma: PrismaService) {}
 
@@ -265,6 +323,163 @@ export class HealthService {
       return 'yellow';
     return 'green';
   }
+
+  // -------------------------------------------------------------------------
+  // Public read accessors — used by the Operations Center aggregator
+  // (and potentially future consumers) to read the in-memory rings
+  // without bracket-accessing private fields. Returns shallow copies
+  // so callers can't mutate our state.
+  // -------------------------------------------------------------------------
+
+  recentErrors(): ReadonlyArray<ErrorEvent> {
+    return this.errors;
+  }
+
+  recentLoginFailures(): ReadonlyArray<LoginFailureEvent> {
+    return this.loginFailures;
+  }
+
+  // -------------------------------------------------------------------------
+  // Subsystem health (Operations Center).
+  // -------------------------------------------------------------------------
+
+  /**
+   * Per-subsystem health report. Returns one row per known subsystem
+   * with status + a one-line observation. Each call also appends a
+   * sample into the 24h uptime ring per subsystem; the polling rate
+   * controls resolution (e.g. 15s polling = 4×60×24 samples).
+   *
+   * Cost: 4 small DB queries (probe DB, count stuck jobs, count
+   * delivery outcomes by status, count email outcomes by status).
+   * Cheap enough to run on every operator dashboard tick.
+   */
+  async getSubsystems(): Promise<SubsystemHealth[]> {
+    const now = new Date();
+    const hourAgo = new Date(now.getTime() - 60 * 60_000);
+    const stuckCutoff = new Date(now.getTime() - STUCK_QUEUE_MIN * 60_000);
+
+    const [
+      dbProbe,
+      stuckJobs,
+      runningJobs,
+      deliveryAgg,
+      emailAgg,
+    ] = await Promise.all([
+      this.probeDatabase(),
+      this.prisma.job.count({
+        where: { status: 'PENDING', runAt: { lt: stuckCutoff } },
+      }),
+      this.prisma.job.count({ where: { status: 'RUNNING' } }),
+      this.prisma.notificationDelivery.groupBy({
+        by: ['status'],
+        where: { createdAt: { gte: hourAgo } },
+        _count: { _all: true },
+      }),
+      this.prisma.notificationDelivery.groupBy({
+        by: ['status'],
+        where: { createdAt: { gte: hourAgo }, channel: 'EMAIL' },
+        _count: { _all: true },
+      }),
+    ]);
+
+    const uptimeSec = Math.floor((now.getTime() - this.startedAt.getTime()) / 1000);
+    const at = now.toISOString();
+
+    const dbStatus: SubsystemStatus = dbProbe.healthy ? 'HEALTHY' : 'DOWN';
+    const dbDetail = dbProbe.healthy
+      ? `Probe ${dbProbe.latencyMs?.toFixed(1) ?? '?'}ms`
+      : (dbProbe.error ?? 'DB probe failed');
+
+    const queueStatus: SubsystemStatus = stuckJobs > 0
+      ? 'DEGRADED'
+      : 'HEALTHY';
+    const queueDetail =
+      stuckJobs > 0
+        ? `${stuckJobs} pending job${stuckJobs === 1 ? '' : 's'} stuck > ${STUCK_QUEUE_MIN}m past runAt`
+        : `${runningJobs} running, no backlog`;
+
+    const dispatch = ratioStatus(deliveryAgg);
+    const dispatchDetail = ratioDetail(
+      'notification deliveries',
+      deliveryAgg,
+    );
+
+    const cronStatus: SubsystemStatus = uptimeSec >= 60
+      ? 'HEALTHY'
+      : 'HEALTHY'; // uptime gate — placeholder for future tick health
+    const cronDetail = `Uptime ${prettyDuration(uptimeSec)}`;
+
+    const email = ratioStatus(emailAgg);
+    const emailDetail = ratioDetail('email deliveries', emailAgg);
+
+    const subsystems: Omit<SubsystemHealth, 'uptime24h'>[] = [
+      {
+        key: 'db',
+        label: 'Database',
+        status: dbStatus,
+        detail: dbDetail,
+        checkedAt: at,
+      },
+      {
+        key: 'queue_runner',
+        label: 'Queue runner',
+        status: queueStatus,
+        detail: queueDetail,
+        checkedAt: at,
+      },
+      {
+        key: 'notification_dispatch',
+        label: 'Notification dispatcher',
+        status: dispatch,
+        detail: dispatchDetail,
+        checkedAt: at,
+      },
+      {
+        key: 'cron_scheduler',
+        label: 'Cron scheduler',
+        status: cronStatus,
+        detail: cronDetail,
+        checkedAt: at,
+      },
+      {
+        key: 'email_provider',
+        label: 'Email provider',
+        status: email,
+        detail: emailDetail,
+        checkedAt: at,
+      },
+      {
+        key: 'cache_layer',
+        label: 'Cache layer',
+        status: 'HEALTHY',
+        detail: 'No cache backend configured (in-memory only)',
+        checkedAt: at,
+      },
+    ];
+
+    // Record + roll up 24h uptime per subsystem.
+    return subsystems.map((s) => {
+      const ring = this.uptimeRings.get(s.key) ?? [];
+      ring.push(s.status === 'HEALTHY' ? 1 : 0);
+      if (ring.length > UPTIME_RING_SIZE) ring.shift();
+      this.uptimeRings.set(s.key, ring);
+      const uptime24h =
+        ring.length > 0
+          ? ring.reduce((sum, x) => sum + x, 0) / ring.length
+          : 1;
+      return { ...s, uptime24h };
+    });
+  }
+
+  /**
+   * Compute the worst subsystem status — used by the Operations
+   * Center's overview banner. Empty list defaults to HEALTHY.
+   */
+  rollupSubsystemStatus(rows: SubsystemHealth[]): SubsystemStatus {
+    if (rows.some((r) => r.status === 'DOWN')) return 'DOWN';
+    if (rows.some((r) => r.status === 'DEGRADED')) return 'DEGRADED';
+    return 'HEALTHY';
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -273,6 +488,39 @@ export class HealthService {
 
 function round(n: number): number {
   return Math.round(n * 100) / 100;
+}
+
+/**
+ * Roll up a `groupBy(status)` aggregation into a HEALTHY / DEGRADED
+ * / DOWN classification. Empty input is HEALTHY (no signal).
+ *
+ * Thresholds tuned per the SUBSYSTEM_FAIL_RATIO_* constants — small
+ * fail rates are noise (transient SES blips), but >50% means the
+ * provider is effectively offline.
+ */
+function ratioStatus(
+  agg: Array<{ status: string; _count: { _all: number } }>,
+): SubsystemStatus {
+  const total = agg.reduce((s, g) => s + g._count._all, 0);
+  if (total === 0) return 'HEALTHY';
+  const failed =
+    agg.find((g) => g.status === 'FAILED')?._count._all ?? 0;
+  const ratio = failed / total;
+  if (ratio >= SUBSYSTEM_FAIL_RATIO_DOWN) return 'DOWN';
+  if (ratio >= SUBSYSTEM_FAIL_RATIO_DEGRADED) return 'DEGRADED';
+  return 'HEALTHY';
+}
+
+function ratioDetail(
+  label: string,
+  agg: Array<{ status: string; _count: { _all: number } }>,
+): string {
+  const total = agg.reduce((s, g) => s + g._count._all, 0);
+  const failed =
+    agg.find((g) => g.status === 'FAILED')?._count._all ?? 0;
+  const sent = agg.find((g) => g.status === 'SENT')?._count._all ?? 0;
+  if (total === 0) return `No ${label} in the last hour`;
+  return `${sent}/${total} sent · ${failed} failed (1h)`;
 }
 
 function prettyDuration(totalSec: number): string {

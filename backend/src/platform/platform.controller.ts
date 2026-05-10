@@ -12,7 +12,7 @@ import {
   Req,
   UseGuards,
 } from '@nestjs/common';
-import { SkipThrottle } from '@nestjs/throttler';
+import { SkipThrottle, Throttle } from '@nestjs/throttler';
 import type { Request } from 'express';
 import { PlatformAuditAction, Role, SchoolStatus } from '@prisma/client';
 import { CurrentUser } from '../common/decorators/current-user.decorator';
@@ -33,6 +33,7 @@ import { ForceLogoutSchoolDto } from './dto/force-logout-school.dto';
 import { SecurityActionDto } from './dto/security-action.dto';
 import { SetMaintenanceModeDto } from './dto/set-maintenance-mode.dto';
 import { UpdateFeatureOverridesDto } from './dto/update-feature-overrides.dto';
+import { UpdateSchoolCodeDto } from './dto/update-school-code.dto';
 import { UpdateSchoolStatusDto } from './dto/update-school-status.dto';
 
 // ---------------------------------------------------------------------------
@@ -56,6 +57,12 @@ import { UpdateSchoolStatusDto } from './dto/update-school-status.dto';
 @Controller('platform')
 @UseGuards(JwtAuthGuard, RolesGuard)
 @Roles(Role.SUPER_ADMIN)
+// Phase — global query hardening. Platform endpoints get the
+// `platform` bucket (300/min/user). Operator workflows are bursty
+// (open the ops cockpit + drill into a school + open audit log
+// in quick succession), so 300/min gives comfortable headroom
+// while still bounding a runaway client.
+@Throttle({ platform: { limit: 300, ttl: 60_000 } })
 export class PlatformController {
   constructor(
     private readonly platform: PlatformService,
@@ -173,6 +180,34 @@ export class PlatformController {
    * expired" / "Reactivate" buttons; this single endpoint is the
    * one write path behind all three.
    */
+  /**
+   * SUPER_ADMIN — change a school's public schoolCode. The new code
+   * must match `^[A-Z0-9-]+$` and be unique across all schools.
+   * Emits a SCHOOL_CODE_UPDATED audit row carrying both the old and
+   * new codes. School admins cannot call this — the controller-level
+   * RolesGuard restricts the entire /platform surface to SUPER_ADMIN.
+   */
+  @Patch('schools/:id/code')
+  @HttpCode(HttpStatus.OK)
+  updateSchoolCode(
+    @Param('id', ParseUUIDPipe) id: string,
+    @Body() dto: UpdateSchoolCodeDto,
+    @CurrentUser() user: AuthenticatedUser,
+    @Req() req: Request,
+  ) {
+    return this.platform.updateSchoolCode(
+      id,
+      { schoolCode: dto.schoolCode, reason: dto.reason ?? null },
+      {
+        userId: user.id,
+        email: user.email,
+        role: user.role,
+        ip: req.ip ?? null,
+        userAgent: req.headers['user-agent'] ?? null,
+      },
+    );
+  }
+
   @Patch('schools/:id/status')
   @HttpCode(HttpStatus.OK)
   updateSchoolStatus(
@@ -463,22 +498,15 @@ export class PlatformController {
    * round-trip + in-memory rollups), so the platform UI polls this
    * every ~30s for a live "is the box alive?" view.
    *
-   * `@SkipThrottle()`:
-   *   The endpoint is BY DESIGN polled at a fixed cadence by the
-   *   operator's open browser tab. The /platform overview also
-   *   includes a one-shot health pull. Together with React's
-   *   StrictMode double-firing in dev + multiple platform tabs
-   *   open during incident response, the call rate easily exceeds
-   *   the default 60/min/IP bucket.
-   *
-   *   Throttling an operational pulse endpoint is a footgun: when
-   *   the operator most needs to see what's happening (during an
-   *   incident, refreshing aggressively), the throttle would lock
-   *   them out. The endpoint is already SUPER_ADMIN-gated, which
-   *   is a far stronger access control than rate limiting.
+   * Throttle: inherits the controller-level `platform` bucket
+   * (300/min/user). With 30s React Query polling per tab, even
+   * 5+ open operator tabs spend at most ~10/min — well within
+   * the budget. The previous `@SkipThrottle()` was needed only
+   * because of the legacy 60/min/IP default; the dedicated
+   * platform bucket plus the React Query stale window remove
+   * that pressure.
    */
   @Get('health')
-  @SkipThrottle()
   getHealth() {
     return this.health.getHealth();
   }

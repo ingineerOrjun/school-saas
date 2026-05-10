@@ -24,12 +24,14 @@ import { maintenanceEnabledTemplate } from './maintenance-enabled.template';
 import { passwordResetTemplate } from './password-reset.template';
 import { paymentReceiptTemplate } from './payment-receipt.template';
 import { planChangedTemplate } from './plan-changed.template';
+import { platformIncidentTemplate } from './platform-incident.template';
 import { promotionCompletedTemplate } from './promotion-completed.template';
 import { refundReceiptTemplate } from './refund-receipt.template';
 import { schoolCreatedTemplate } from './school-created.template';
 import { schoolReactivatedTemplate } from './school-reactivated.template';
 import { schoolSuspendedTemplate } from './school-suspended.template';
 import { securityAlertTemplate } from './security-alert.template';
+import { staffInvitationTemplate } from './staff-invitation.template';
 import { subscriptionExpiringTemplate } from './subscription-expiring.template';
 import { subscriptionRenewedTemplate } from './subscription-renewed.template';
 
@@ -69,12 +71,14 @@ export const TEMPLATES: Record<string, NotificationTemplate<any>> = {
   [passwordResetTemplate.key]: passwordResetTemplate,
   [paymentReceiptTemplate.key]: paymentReceiptTemplate,
   [planChangedTemplate.key]: planChangedTemplate,
+  [platformIncidentTemplate.key]: platformIncidentTemplate,
   [promotionCompletedTemplate.key]: promotionCompletedTemplate,
   [refundReceiptTemplate.key]: refundReceiptTemplate,
   [schoolCreatedTemplate.key]: schoolCreatedTemplate,
   [schoolReactivatedTemplate.key]: schoolReactivatedTemplate,
   [schoolSuspendedTemplate.key]: schoolSuspendedTemplate,
   [securityAlertTemplate.key]: securityAlertTemplate,
+  [staffInvitationTemplate.key]: staffInvitationTemplate,
   [subscriptionExpiringTemplate.key]: subscriptionExpiringTemplate,
   [subscriptionRenewedTemplate.key]: subscriptionRenewedTemplate,
 };

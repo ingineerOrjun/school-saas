@@ -35,6 +35,20 @@ import { JobRegistry } from './job-registry.service';
 
 const POLL_INTERVAL_MS = 1000;
 const SHUTDOWN_TIMEOUT_MS = 30_000;
+/**
+ * Phase 22 — stuck-job sweeper cadence. The sweep is cheap (one
+ * indexed scan + an updateMany on the matching rows), so running it
+ * every 60s is safe and gives a worker-crash recovery window of
+ * ~10 minutes (sweep threshold) + 60s (sweep interval).
+ */
+const SWEEP_INTERVAL_MS = 60_000;
+/**
+ * RUNNING rows whose lock is held longer than this are considered
+ * orphaned by a crashed/restarted worker. Tuned to be longer than
+ * the slowest legitimate handler — anything above this is a real
+ * stuck job.
+ */
+const STUCK_THRESHOLD_MIN = 10;
 
 @Injectable()
 export class JobRunnerService
@@ -42,6 +56,7 @@ export class JobRunnerService
 {
   private readonly logger = new Logger(JobRunnerService.name);
   private timer: NodeJS.Timeout | null = null;
+  private sweepTimer: NodeJS.Timeout | null = null;
   private inFlight: Promise<void> | null = null;
   private stopping = false;
   private readonly disablePolling: boolean;
@@ -64,9 +79,21 @@ export class JobRunnerService
     }
     this.logger.log(
       `Job runner starting (poll every ${POLL_INTERVAL_MS}ms, ` +
+        `sweep every ${SWEEP_INTERVAL_MS}ms, ` +
         `${this.registry.list().length} handlers registered)`,
     );
     this.scheduleNext();
+    // Phase 22 — start the stuck-job sweeper. Independent timer
+    // so a hot poll loop doesn't delay the sweep, and a slow
+    // sweep doesn't delay the next poll. setInterval is fine here
+    // because the work is bounded + idempotent.
+    this.sweepTimer = setInterval(() => {
+      void this.runSweep();
+    }, SWEEP_INTERVAL_MS);
+    // Don't keep the process alive on the sweep timer alone — the
+    // poll loop's setTimeout already keeps the loop alive when there
+    // is work to do.
+    this.sweepTimer.unref?.();
   }
 
   async onApplicationShutdown() {
@@ -75,7 +102,16 @@ export class JobRunnerService
       clearTimeout(this.timer);
       this.timer = null;
     }
+    if (this.sweepTimer) {
+      clearInterval(this.sweepTimer);
+      this.sweepTimer = null;
+    }
     if (this.inFlight) {
+      // Phase 22 — graceful shutdown. Wait for the in-flight job
+      // to settle so we don't strand a half-run row in RUNNING.
+      // The stuck-job sweeper would eventually recover it, but a
+      // clean drain prevents the recovery alert from firing on
+      // every deploy.
       this.logger.log('Waiting for in-flight job to settle…');
       const settled = await Promise.race([
         this.inFlight.then(() => true),
@@ -85,7 +121,33 @@ export class JobRunnerService
       ]);
       if (!settled) {
         this.logger.warn('Shutdown timeout reached with job still in flight.');
+      } else {
+        this.logger.log('In-flight job drained cleanly.');
       }
+    }
+  }
+
+  /**
+   * Phase 22 — periodic stuck-job recovery. Logs at ERROR when any
+   * rows were swept (an operator-actionable signal); silent on a
+   * healthy queue. Wrapped in try/catch — a sweep failure must not
+   * crash the poll loop.
+   */
+  private async runSweep(): Promise<void> {
+    if (this.stopping) return;
+    try {
+      const result = await this.queue.sweepStuck({
+        thresholdMinutes: STUCK_THRESHOLD_MIN,
+      });
+      if (result.unlocked > 0) {
+        this.logger.error(
+          `[stuck-job-sweeper] unlocked ${result.unlocked} stuck job(s): ${result.ids.slice(0, 5).join(', ')}${result.ids.length > 5 ? '…' : ''}`,
+        );
+      }
+    } catch (e) {
+      this.logger.error(
+        `Stuck-job sweep failed: ${e instanceof Error ? e.message : String(e)}`,
+      );
     }
   }
 

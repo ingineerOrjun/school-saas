@@ -71,6 +71,16 @@ enum PlatformAuditAction {
   /// plaintext temp password is delivered to the operator via the
   /// API response only; the audit row carries no secret material.
   ADMIN_PASSWORD_RESET
+  /// Public school code assigned at school creation. Emitted by
+  /// SchoolCodeService whether the code was auto-generated
+  /// (SCH-0001 sequence) or manually supplied by a SUPER_ADMIN.
+  /// `after` carries the assigned code; `before` is null.
+  SCHOOL_CODE_ASSIGNED
+  /// Public school code changed by a SUPER_ADMIN after creation.
+  /// School admins cannot trigger this — the platform endpoint is
+  /// SUPER_ADMIN-gated. `before` / `after` carry the old + new
+  /// codes for the audit trail.
+  SCHOOL_CODE_UPDATED
 }
 
 /// Subscription plan tiers (Phase 4). Real billing integration is
@@ -190,6 +200,13 @@ enum JobStatus {
   SUCCEEDED
   FAILED
   DEAD
+  /// Phase 22 — the dead-letter terminal state. Distinct from FAILED
+  /// (which represents a transient single-attempt failure that may
+  /// still be retried by the worker) and DEAD (operator-cancelled).
+  /// FAILED_PERMANENT means: max attempts exhausted, the runner has
+  /// given up. Operator action required. Visible in the Operations
+  /// Center "Dead Letter Queue" panel; manually retryable from there.
+  FAILED_PERMANENT
 }
 
 /// Phase 14 — operator-facing severity tier for Notification Center
@@ -231,6 +248,21 @@ model School {
   id        String   @id @default(uuid()) @db.Uuid
   name      String
   slug      String   @unique
+  /// Public, human-readable, platform-unique school identifier.
+  /// Format: uppercase + digits + dashes only (`^[A-Z0-9-]+$`).
+  /// Default generation produces SCH-0001, SCH-0002, …; SUPER_ADMIN
+  /// may supply a custom code at creation (KTM-001, EVEREST-01, …)
+  /// or change it later via the platform layer.
+  ///
+  /// Used as the tenant selector on the login form (login is
+  /// `schoolCode + email + password`, not just `email + password`),
+  /// so two different schools may legitimately have users sharing
+  /// an email address — the schoolCode disambiguates.
+  ///
+  /// Mutable only by SUPER_ADMIN; school admins cannot edit. Every
+  /// assignment / change emits a PlatformAuditEvent
+  /// (SCHOOL_CODE_ASSIGNED / SCHOOL_CODE_UPDATED).
+  schoolCode String   @unique @db.VarChar(40)
   /// Public URL of the school's logo image (PNG/JPG/WebP). Null until
   /// uploaded. Path is served by NestJS at `/uploads/logos/<file>`.
   logoUrl   String?
@@ -265,6 +297,35 @@ model School {
   /// toggle. Distinct from SUSPENDED — a school can be ACTIVE-and-
   /// in-maintenance during a support session.
   maintenanceMode Boolean @default(false)
+  /// Phase 22 — scheduled maintenance window. When `maintenanceScheduledStart`
+  /// has passed (and `maintenanceScheduledEnd` hasn't), the
+  /// MaintenanceModeService enables `maintenanceMode` automatically.
+  /// `maintenanceScheduledEnd` triggers the auto-disable. The
+  /// MaintenanceMessage shows in the school-side banner / 503
+  /// response so users see operator-authored copy instead of a
+  /// generic outage string. All three are nullable — set them
+  /// together to schedule, leave them null for ad-hoc toggles.
+  maintenanceScheduledStart DateTime?
+  maintenanceScheduledEnd   DateTime?
+  maintenanceMessage        String?   @db.VarChar(500)
+
+  /// Phase 23 — onboarding wizard progress. `onboardingStep` is a
+  /// short slug ("school-profile" | "academic-setup" | "staff-setup"
+  /// | "fee-setup" | "complete"); the frontend resumes the wizard
+  /// from this step. `onboardingCompleted` flips true when the
+  /// wizard finishes (or the operator skips). Used by the dashboard
+  /// shell to redirect newly-provisioned tenants into the wizard.
+  onboardingCompleted Boolean @default(false)
+  onboardingStep      String  @default("school-profile") @db.VarChar(40)
+
+  /// Phase 23 — per-tenant brand customization. All five fields are
+  /// nullable; the resolver falls back to the global BrandConfig
+  /// (env-driven) for any unset value. Surfaced on receipts /
+  /// report cards / login page via the BrandConfig service.
+  brandPrimaryColor   String? @db.VarChar(20)
+  brandAccentColor    String? @db.VarChar(20)
+  brandSlogan         String? @db.VarChar(160)
+  brandReceiptFooter  String? @db.VarChar(500)
 
   /// Phase 5 — per-tenant feature overrides. Keys are feature
   /// catalog entries (see backend/src/feature-flags/feature-catalog.ts);
@@ -298,6 +359,13 @@ model School {
   studentAcademicRecords StudentAcademicRecord[]
   subscriptions          SchoolSubscription[]
   notifications          Notification[]
+  // Phase 23 back-relations
+  invitations            UserInvitation[]
+  guardians              Guardian[]
+  studentGuardianLinks   StudentGuardianLink[]
+  supportNotes           SupportNote[]
+  dataExportRuns         DataExportRun[]
+  importRuns             ImportRun[]
 
   @@index([status])
   @@map("schools")
@@ -309,7 +377,12 @@ model School {
 
 model User {
   id       String @id @default(uuid()) @db.Uuid
-  email    String @unique
+  /// Tenant-scoped: unique per (schoolId, email), not globally.
+  /// Two different schools are allowed to have users with the same
+  /// email address — the login flow disambiguates via the school's
+  /// public `schoolCode`. The compound unique index lives on the
+  /// model below as `@@unique([schoolId, email])`.
+  email    String
   password String
   role     Role   @default(ADMIN)
 
@@ -352,10 +425,19 @@ model User {
   subscriptionsCreated SchoolSubscription[] @relation("SubscriptionCreatedBy")
   notifications        Notification[]
   sessions             Session[]
+  // Phase 23 back-relations
+  invitationsSent      UserInvitation[]      @relation("InvitationInvitedBy")
+  guardianProfile      Guardian[]            @relation("GuardianUser")
+  supportNotesAuthored SupportNote[]         @relation("SupportNoteAuthor")
+  announcementsPublished PlatformAnnouncement[] @relation("AnnouncementPublishedBy")
+  announcementDismissals AnnouncementDismissal[] @relation("AnnouncementDismisser")
+  exportsRequested     DataExportRun[]       @relation("ExportRequestedBy")
+  importsRequested     ImportRun[]           @relation("ImportRequestedBy")
 
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
 
+  @@unique([schoolId, email])
   @@index([schoolId])
   @@index([schoolId, role])
   @@map("users")
@@ -373,6 +455,27 @@ model Student {
   /// Nepal-style Symbol / Roll number. Unique within a school when present;
   /// NULL is allowed so legacy rows stay valid until one is assigned.
   symbolNumber String? @db.VarChar(40)
+
+  /// Permanent platform-wide-unique registration number generated
+  /// once at admission. Format: SCHOOLCODE-YYYY-CLASS-SERIAL
+  /// (e.g. SCH0001-2026-08-0001, SCH0001-2026-NUR-0001).
+  /// Components:
+  ///   • SCHOOLCODE — School.schoolCode with dashes stripped
+  ///   • YYYY        — admission year (admissionDate ?? createdAt)
+  ///   • CLASS       — normalized admitted-class code:
+  ///                   numeric grades → 2-digit zero-pad ("01"…"12"),
+  ///                   named ("Nursery"→"NUR", "LKG"→"LKG", …),
+  ///                   fallback → first 3 alphanumeric uppercase chars.
+  ///   • SERIAL      — 4-digit zero-padded sequence per
+  ///                   (school, year, class) bucket.
+  ///
+  /// IMMUTABLE after creation: never reassigned on promotion,
+  /// section transfer, or class re-enrollment — it reflects the
+  /// student's ORIGINAL admission, not their current grade.
+  /// Nullable for two reasons: (a) legacy rows that pre-date
+  /// admission may not have a class to derive from, (b) students
+  /// whose `classId` is null at creation time can't be encoded.
+  registrationNumber String? @unique @db.VarChar(60)
 
   schoolId String @db.Uuid
   school   School @relation(fields: [schoolId], references: [id], onDelete: Cascade)
@@ -412,6 +515,8 @@ model Student {
   feeAssignments FeeAssignment[]
   payments       Payment[]
   academicRecords StudentAcademicRecord[]
+  // Phase 23 — guardian linking foundations.
+  guardianLinks  StudentGuardianLink[]
 
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
@@ -420,6 +525,9 @@ model Student {
   @@index([schoolId])
   @@index([classId])
   @@index([sectionId])
+  // Tenant-scoped lookup by registration number — used by the
+  // student search endpoint and the global search bar.
+  @@index([schoolId, registrationNumber])
   @@map("students")
 }
 
@@ -548,6 +656,12 @@ model ExamSubject {
   /// Practical component full marks. 0 means this subject has no practical
   /// (theory-only) and the pass rule auto-passes practical.
   practicalFullMarks Int @default(0)
+  /// Credit hours for this subject (CDC weekly-period weighting).
+  /// Used to compute the credit-hour-weighted GPA per the CDC progress
+  /// report formula:  GPA = Σ(gradePoint × creditHours) / Σ(creditHours).
+  /// Default of 5 matches the most common weekly allocation, so all
+  /// existing rows remain valid without a data migration.
+  creditHours Float @default(5)
 
   examId String @db.Uuid
   exam   Exam   @relation(fields: [examId], references: [id], onDelete: Cascade)
@@ -943,12 +1057,17 @@ model PlatformAuditEvent {
   /// Best-effort capture of network context.
   ip            String?
   userAgent     String?
+  /// Phase 22 — request correlation id (when the action ran inside
+  /// an HTTP request). Lets ops trace an event back to the originating
+  /// request line in the structured log stream.
+  correlationId String?
   createdAt     DateTime            @default(now())
 
   @@index([action])
   @@index([actorUserId])
   @@index([targetType, targetId])
   @@index([createdAt(sort: Desc)])
+  @@index([correlationId])
   @@map("platform_audit_events")
 }
 
@@ -1129,6 +1248,19 @@ model Session {
   /// session originally come from?"
   ip            String?
   userAgent     String?
+  /// Phase 22 — coarse device fingerprint (SHA-256 of UA + IP-prefix
+  /// + accept-language). Stable across the life of a session under
+  /// the same browser, changes when the user moves to a new device
+  /// or rolls IP into a different /24. New-device-detection compares
+  /// this against the user's recent fingerprints and surfaces a
+  /// "New device detected" notification when no recent match.
+  deviceFingerprint String?
+  /// Phase 22 — last-observed IP / user-agent (vs. the snapshot
+  /// above which is creation-time only). Lets ops see "this session
+  /// moved networks" patterns. Updated on the same throttle cadence
+  /// as `lastActiveAt`.
+  lastIp        String?
+  lastUserAgent String?
   /// Null while active. Once set, the strategy rejects the token;
   /// the row stays for audit history.
   revokedAt     DateTime?
@@ -1136,6 +1268,7 @@ model Session {
 
   @@index([userId, lastActiveAt(sort: Desc)])
   @@index([userId, createdAt(sort: Desc)])
+  @@index([deviceFingerprint])
   @@map("sessions")
 }
 
@@ -1169,6 +1302,10 @@ model Notification {
   /// Null until the operator opens the row in the Notification
   /// Center. The bell badge counts rows where this is null.
   readAt      DateTime?
+  /// Phase 22 — request correlation id from the originating HTTP
+  /// request (when one exists). Lets ops cross-reference the
+  /// notification back to the originating request log line.
+  correlationId String?
   createdAt   DateTime @default(now())
 
   // Cascade on parent removal so the audit trail stays consistent
@@ -1247,6 +1384,20 @@ model Job {
   lastError    String?
   startedAt    DateTime?
   completedAt  DateTime?
+  /// Phase 22 — when the worker claimed this row. Used by the
+  /// stuck-job sweeper: any RUNNING row with `lockedAt` more than
+  /// JOB_STUCK_THRESHOLD_MIN minutes old is presumed orphaned by a
+  /// crashed/restarted worker and gets unlocked + requeued.
+  lockedAt     DateTime?
+  /// Phase 22 — host:pid identifier of the worker that holds the
+  /// lock. Surfaced for the operator drill-down ("which box owned
+  /// the row when it stuck?"). Cleared when the row terminates.
+  lockedBy     String?
+  /// Phase 22 — request correlation id (when the job was scheduled
+  /// inside an HTTP request). Lets ops trace a customer-reported
+  /// incident from the originating request through to the job's
+  /// outcome via /platform/operations/correlation/:id.
+  correlationId String?
   createdAt    DateTime  @default(now())
   updatedAt    DateTime  @updatedAt
 
@@ -1254,6 +1405,8 @@ model Job {
   @@index([runAt])
   @@index([status])
   @@index([name, status])
+  @@index([lockedAt])
+  @@index([correlationId])
   @@map("jobs")
 }
 
@@ -1290,6 +1443,21 @@ model StudentAcademicRecord {
 
   status StudentSessionStatus @default(PROMOTED)
 
+  /// Credit-hour-weighted GPA captured at promotion time. Nullable so
+  /// existing promotion records (written before this column existed)
+  /// are unaffected. Null also means "no exam results to summarize"
+  /// — promotion can run for a session that never had a final exam.
+  gpa Float?
+  /// Letter-grade label that pairs with `gpa` (e.g. "A+", "B", "NG").
+  /// Stored as String (not the LetterGrade enum) because this is a
+  /// historical snapshot — if the enum is ever extended/renamed the
+  /// archived label must remain readable as-is.
+  gpaLetterGrade String?
+  /// Sum of credit hours used as the denominator of the weighted GPA.
+  /// Stored alongside `gpa` so historical rows remain auditable even
+  /// if subject credit hours are later edited.
+  totalCreditHours Float?
+
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
 
@@ -1298,4 +1466,372 @@ model StudentAcademicRecord {
   @@index([classId])
   @@index([schoolId])
   @@map("student_academic_records")
+}
+
+// -----------------------------------------------------------------------------
+// Platform incidents (Phase 22 — operator broadcast persistence)
+// -----------------------------------------------------------------------------
+
+/// Severity tier for operator-broadcast incidents. Mirrors the
+/// notification severity scale but is its own enum because incidents
+/// are a distinct concept (a discrete operational event with
+/// active/resolved lifecycle) — not all severities map cleanly across.
+enum IncidentSeverity {
+  INFO
+  WARNING
+  CRITICAL
+}
+
+enum IncidentStatus {
+  ACTIVE
+  RESOLVED
+}
+
+/// Targeting scope. ALL_SCHOOLS broadcasts to every active tenant;
+/// SPECIFIC_SCHOOLS broadcasts to only those listed in `targetSchoolIds`.
+/// Stored as an enum (not a boolean) so future scopes (e.g. by plan
+/// tier, by region) can extend cleanly.
+enum IncidentScope {
+  ALL_SCHOOLS
+  SPECIFIC_SCHOOLS
+}
+
+/// Phase 22 — operator-broadcast incidents. Replaces the in-memory
+/// active-set the Operations Center previously used.
+///
+/// Why a dedicated table (vs. piggy-backing the Notification model):
+///   • Persistence-across-restart is a hard requirement now —
+///     incidents are infrequent + high-impact and operators can't
+///     lose them when a process restarts.
+///   • Lifecycle is simpler than a notification: ACTIVE → RESOLVED
+///     with two timestamps. No deliveries, no severity scale that
+///     changes on read. A dedicated table keeps the queries trivial.
+///   • Audit-linked via `createdById` / `resolvedById` snapshots —
+///     the platform_audit_events row carries the full record but
+///     the foreign keys here let the cockpit page join straight to
+///     the actor without crossing into the audit table.
+///
+/// Notification fan-out is still done at broadcast time via
+/// NotificationService — those rows live in the notifications table
+/// and link back to the incident via the `correlationId` column on
+/// Notification (set to `incident:${id}`).
+model PlatformIncident {
+  id              String            @id @default(uuid()) @db.Uuid
+  title           String            @db.VarChar(160)
+  body            String            @db.Text
+  severity        IncidentSeverity
+  status          IncidentStatus    @default(ACTIVE)
+  targetScope     IncidentScope
+  /// Array of school UUIDs when scope === SPECIFIC_SCHOOLS. Stored
+  /// as Json (not String[]) for forward compatibility — future
+  /// scopes may store object payloads here. Null when scope === ALL_SCHOOLS.
+  targetSchoolIds Json?
+  /// Operator who broadcast — kept as denormalised id (not FK) so
+  /// the row survives operator deletion. The corresponding audit
+  /// event holds the email + role snapshot.
+  createdById     String            @db.Uuid
+  /// Set when an operator marks the incident RESOLVED. Null while
+  /// active.
+  resolvedById    String?           @db.Uuid
+  resolvedAt      DateTime?
+  /// Best-effort fan-out counters captured at broadcast time. Used
+  /// by the cockpit "↪ N in-app · N email" caption. Not authoritative
+  /// — the Notification table is the source of truth for what was
+  /// actually queued.
+  inAppFanOut     Int               @default(0)
+  emailFanOut     Int               @default(0)
+  /// Phase 22 — request correlation id from the broadcast request,
+  /// matching the same id stamped on every fan-out Notification row.
+  correlationId   String?
+  createdAt       DateTime          @default(now())
+  updatedAt       DateTime          @updatedAt
+
+  @@index([status, createdAt(sort: Desc)])
+  @@index([severity, createdAt(sort: Desc)])
+  @@index([correlationId])
+  @@map("platform_incidents")
+}
+
+// -----------------------------------------------------------------------------
+// User invitations (Phase 23 — Section 2)
+// -----------------------------------------------------------------------------
+
+/// One-shot invitation token. Admin invites a teacher; recipient
+/// follows the email link, sets a password, and the account
+/// activates as a real `User` row. Until acceptance, the row is
+/// JUST an invitation — the user has no login.
+model UserInvitation {
+  id             String    @id @default(uuid()) @db.Uuid
+  schoolId       String    @db.Uuid
+  school         School    @relation(fields: [schoolId], references: [id], onDelete: Cascade)
+  email          String    @db.VarChar(180)
+  role           Role
+  /// Opaque token in the email link. Indexed for fast accept-endpoint
+  /// lookup; treat as a secret (never log full value).
+  token          String    @unique @db.VarChar(80)
+  expiresAt      DateTime
+  acceptedAt     DateTime?
+  revokedAt      DateTime?
+  invitedById    String    @db.Uuid
+  invitedBy      User      @relation("InvitationInvitedBy", fields: [invitedById], references: [id], onDelete: SetNull)
+  acceptedUserId String?   @db.Uuid
+  displayName    String?   @db.VarChar(180)
+  createdAt      DateTime  @default(now())
+  updatedAt      DateTime  @updatedAt
+
+  @@unique([schoolId, email])
+  @@index([schoolId])
+  @@index([expiresAt])
+  @@map("user_invitations")
+}
+
+// -----------------------------------------------------------------------------
+// Guardians + linking (Phase 23 — Section 12)
+// -----------------------------------------------------------------------------
+
+model Guardian {
+  id           String   @id @default(uuid()) @db.Uuid
+  schoolId     String   @db.Uuid
+  school       School   @relation(fields: [schoolId], references: [id], onDelete: Cascade)
+  /// Optional User row when the guardian has accepted a portal
+  /// invitation. Null while the guardian is just a contact record.
+  userId       String?  @db.Uuid
+  user         User?    @relation("GuardianUser", fields: [userId], references: [id], onDelete: SetNull)
+  fullName     String   @db.VarChar(180)
+  email        String?  @db.VarChar(180)
+  phone        String?  @db.VarChar(40)
+  relationship String?  @db.VarChar(40)
+  notes        String?
+  createdAt    DateTime @default(now())
+  updatedAt    DateTime @updatedAt
+
+  links StudentGuardianLink[]
+
+  @@index([schoolId])
+  @@index([schoolId, email])
+  @@map("guardians")
+}
+
+/// Many-to-many link. A student can have multiple guardians; a
+/// guardian can have multiple linked students. `isPrimary` is the
+/// "include in default fan-out" flag for notification routing.
+model StudentGuardianLink {
+  id           String   @id @default(uuid()) @db.Uuid
+  studentId    String   @db.Uuid
+  student      Student  @relation(fields: [studentId], references: [id], onDelete: Cascade)
+  guardianId   String   @db.Uuid
+  guardian     Guardian @relation(fields: [guardianId], references: [id], onDelete: Cascade)
+  schoolId     String   @db.Uuid
+  school       School   @relation(fields: [schoolId], references: [id], onDelete: Cascade)
+  isPrimary    Boolean  @default(false)
+  relationship String?  @db.VarChar(40)
+  createdAt    DateTime @default(now())
+
+  @@unique([studentId, guardianId])
+  @@index([studentId])
+  @@index([guardianId])
+  @@index([schoolId])
+  @@map("student_guardian_links")
+}
+
+// -----------------------------------------------------------------------------
+// Support notes (Phase 23 — Section 6)
+// -----------------------------------------------------------------------------
+
+/// Internal SUPER_ADMIN-only notes pinned to a school. Append-only
+/// by convention. Distinct from PlatformAuditEvent: audit rows are
+/// auto-emitted; support notes are manually-entered context.
+model SupportNote {
+  id        String   @id @default(uuid()) @db.Uuid
+  schoolId  String   @db.Uuid
+  school    School   @relation(fields: [schoolId], references: [id], onDelete: Cascade)
+  authorId  String   @db.Uuid
+  author    User     @relation("SupportNoteAuthor", fields: [authorId], references: [id], onDelete: SetNull)
+  body      String
+  /// "important" | "info" | "warning" — drives the UI tint.
+  tone      String?  @db.VarChar(20)
+  createdAt DateTime @default(now())
+
+  @@index([schoolId, createdAt(sort: Desc)])
+  @@map("support_notes")
+}
+
+// -----------------------------------------------------------------------------
+// Platform announcements (Phase 23 — Section 7)
+// -----------------------------------------------------------------------------
+
+enum AnnouncementAudience {
+  ALL_SCHOOLS
+  ADMINS_ONLY
+  TEACHERS_ONLY
+  SPECIFIC_SCHOOLS
+}
+
+/// Operator-published release-note / announcement banner.
+/// Distinct from PlatformIncident — incidents are urgent operational
+/// events; announcements are routine "new feature" / "scheduled
+/// maintenance" copy with per-user dismiss tracking.
+model PlatformAnnouncement {
+  id              String                  @id @default(uuid()) @db.Uuid
+  title           String                  @db.VarChar(180)
+  body            String
+  tone            String                  @default("info") @db.VarChar(20)
+  audience        AnnouncementAudience    @default(ALL_SCHOOLS)
+  targetSchoolIds Json?
+  publishedById   String                  @db.Uuid
+  publishedBy     User                    @relation("AnnouncementPublishedBy", fields: [publishedById], references: [id], onDelete: SetNull)
+  active          Boolean                 @default(true)
+  linkUrl         String?                 @db.VarChar(500)
+  expiresAt       DateTime?
+  createdAt       DateTime                @default(now())
+  updatedAt       DateTime                @updatedAt
+
+  dismissals AnnouncementDismissal[]
+
+  @@index([active, createdAt(sort: Desc)])
+  @@map("platform_announcements")
+}
+
+model AnnouncementDismissal {
+  id              String                  @id @default(uuid()) @db.Uuid
+  announcementId  String                  @db.Uuid
+  announcement    PlatformAnnouncement    @relation(fields: [announcementId], references: [id], onDelete: Cascade)
+  userId          String                  @db.Uuid
+  user            User                    @relation("AnnouncementDismisser", fields: [userId], references: [id], onDelete: Cascade)
+  dismissedAt     DateTime                @default(now())
+
+  @@unique([announcementId, userId])
+  @@index([userId])
+  @@map("announcement_dismissals")
+}
+
+// -----------------------------------------------------------------------------
+// Data exports + imports (Phase 23 — Sections 8 + 9)
+// -----------------------------------------------------------------------------
+
+enum ExportRunStatus {
+  PENDING
+  RUNNING
+  SUCCEEDED
+  FAILED
+  EXPIRED
+}
+
+enum ImportRunStatus {
+  PENDING
+  VALIDATING
+  RUNNING
+  SUCCEEDED
+  FAILED
+  ROLLED_BACK
+}
+
+model DataExportRun {
+  id            String          @id @default(uuid()) @db.Uuid
+  schoolId      String          @db.Uuid
+  school        School          @relation(fields: [schoolId], references: [id], onDelete: Cascade)
+  requestedById String          @db.Uuid
+  requestedBy   User            @relation("ExportRequestedBy", fields: [requestedById], references: [id], onDelete: SetNull)
+  entity        String          @db.VarChar(40)
+  filters       Json            @default("{}")
+  format        String          @db.VarChar(10)
+  status        ExportRunStatus @default(PENDING)
+  outputUrl     String?
+  sizeBytes     Int?
+  expiresAt     DateTime?
+  errorMessage  String?
+  createdAt     DateTime        @default(now())
+  startedAt     DateTime?
+  completedAt   DateTime?
+
+  @@index([schoolId, createdAt(sort: Desc)])
+  @@index([status])
+  @@map("data_export_runs")
+}
+
+model ImportRun {
+  id            String          @id @default(uuid()) @db.Uuid
+  schoolId      String          @db.Uuid
+  school        School          @relation(fields: [schoolId], references: [id], onDelete: Cascade)
+  requestedById String          @db.Uuid
+  requestedBy   User            @relation("ImportRequestedBy", fields: [requestedById], references: [id], onDelete: SetNull)
+  entity        String          @db.VarChar(40)
+  filename      String          @db.VarChar(240)
+  totalRows     Int             @default(0)
+  validRows     Int             @default(0)
+  invalidRows   Int             @default(0)
+  importedRows  Int             @default(0)
+  status        ImportRunStatus @default(PENDING)
+  /// Per-row errors, parsed sample, inferred column mapping. The
+  /// preview UI renders this before the user clicks "commit".
+  dryRunSummary Json            @default("{}")
+  errorMessage  String?
+  createdAt     DateTime        @default(now())
+  startedAt     DateTime?
+  completedAt   DateTime?
+
+  @@index([schoolId, createdAt(sort: Desc)])
+  @@index([status])
+  @@map("import_runs")
+}
+
+// -----------------------------------------------------------------------------
+// Backups (Phase α — real backup engine)
+// -----------------------------------------------------------------------------
+
+enum BackupRunKind {
+  /// Full pg_dump of the entire database. The default + safest.
+  FULL
+  /// Reserved for future incremental + WAL-shipping engines. Not
+  /// produced in this phase; the column exists so adding either
+  /// later doesn't need a migration.
+  INCREMENTAL
+  WAL
+}
+
+enum BackupRunStatus {
+  PENDING
+  RUNNING
+  SUCCEEDED
+  FAILED
+  EXPIRED
+}
+
+/// One row per backup attempt. Replaces the Phase 22 in-memory stub.
+/// Storage location is a free-form URL/path so we can swap providers
+/// (local disk → S3 → GCS) without a schema change.
+///
+/// Retention:
+///   `retentionUntil` is set at create time from the operator-tier
+///   retention config. The cleanup sweeper purges runs whose
+///   retention has passed AND whose status is SUCCEEDED — failed /
+///   running rows are kept for forensics until manually cleared.
+model BackupRun {
+  id            String          @id @default(uuid()) @db.Uuid
+  kind          BackupRunKind   @default(FULL)
+  status        BackupRunStatus @default(PENDING)
+  /// Storage backend identifier ("local" / "s3" / …).
+  storage       String          @db.VarChar(40)
+  /// Provider-specific URL or absolute filesystem path.
+  location      String?
+  /// Bytes on disk after compression. Null until SUCCEEDED.
+  sizeBytes    BigInt?
+  /// SHA-256 of the artifact for tamper detection.
+  sha256        String?         @db.VarChar(64)
+  /// True iff this run was scheduled by cron. False for operator-
+  /// triggered ad-hoc backups.
+  scheduled     Boolean         @default(true)
+  /// User who triggered the run (null for cron).
+  triggeredById String?         @db.Uuid
+  startedAt     DateTime?
+  completedAt   DateTime?
+  errorMessage  String?
+  /// When the cleanup sweeper is allowed to delete this row + its
+  /// artifact. Defaults to 30d after creation.
+  retentionUntil DateTime?
+  createdAt     DateTime        @default(now())
+
+  @@index([status, createdAt(sort: Desc)])
+  @@index([retentionUntil])
+  @@map("backup_runs")
 }

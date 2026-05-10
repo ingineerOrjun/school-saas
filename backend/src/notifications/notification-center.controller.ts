@@ -9,6 +9,7 @@ import {
   Query,
   UseGuards,
 } from '@nestjs/common';
+import { SkipThrottle } from '@nestjs/throttler';
 import { NotificationSeverity, Role } from '@prisma/client';
 import { JwtAuthGuard } from '../auth/guards/jwt-auth.guard';
 import { RolesGuard } from '../auth/guards/roles.guard';
@@ -60,7 +61,13 @@ export class NotificationCenterController {
     });
   }
 
+  /**
+   * `@SkipThrottle()` — same reasoning as the school-side
+   * `/notifications/unread-count`. Polled by the platform's bell
+   * badge at a fixed cadence; the call is one indexed COUNT.
+   */
   @Get('unread-count')
+  @SkipThrottle()
   async unreadCount() {
     const count = await this.center.unreadCount();
     return { count };

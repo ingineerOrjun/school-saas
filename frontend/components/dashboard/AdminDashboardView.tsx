@@ -31,7 +31,7 @@ import { EmptyState } from "@/components/ui/EmptyState";
 import { OnboardingChecklist } from "@/components/ui/OnboardingChecklist";
 import { AddStudentDialog } from "@/components/students/AddStudentDialog";
 import { useDashboardData } from "@/lib/use-dashboard-data";
-import { classesApi, type ClassWithSections } from "@/lib/classes";
+import { useClasses, type ClassWithSections } from "@/lib/classes";
 import type { StudentDto } from "@/lib/students";
 import { ApiError } from "@/lib/api";
 import { formatCurrencyShort } from "@/lib/currency";
@@ -248,7 +248,13 @@ export function AdminDashboardView() {
     refreshing,
   } = useDashboardData();
   const [modalOpen, setModalOpen] = React.useState(false);
-  const [classes, setClasses] = React.useState<ClassWithSections[]>([]);
+  // Phase α 429-fix — was: useEffect+raw fetch, which double-fired
+  // under StrictMode and didn't share its cache with other consumers
+  // (e.g. /classes page, AssignFeeDialog). useClasses() routes
+  // through React Query so every consumer sees ONE underlying
+  // request per stale-window.
+  const classesQuery = useClasses();
+  const classes: ClassWithSections[] = classesQuery.data ?? [];
 
   // Setup notices come in via querystring after login. Currently the
   // only one is `setup=missing-class` — sent here when a TEACHER who
@@ -282,25 +288,8 @@ export function AdminDashboardView() {
     [matchesRole],
   );
 
-  // Load classes once for the Add-Student dialog's section dropdown.
-  React.useEffect(() => {
-    let cancelled = false;
-    classesApi
-      .list()
-      .then((list) => {
-        if (!cancelled) setClasses(list);
-      })
-      .catch((err) => {
-        if (err instanceof ApiError && err.status === 401) {
-          router.replace("/login");
-        }
-        // Otherwise silently fall back — the dialog still works without
-        // sections.
-      });
-    return () => {
-      cancelled = true;
-    };
-  }, [router]);
+  // (Classes list is fetched via useClasses() above — no useEffect
+  // needed; React Query handles loading + caching + auth-401 retry.)
 
   const isLoading = state === "loading";
   const isEmpty = state === "empty";

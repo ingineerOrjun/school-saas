@@ -16,14 +16,14 @@ import {
   X,
 } from "lucide-react";
 import { toast } from "sonner";
-import { ApiError } from "@/lib/api";
 import {
-  notificationsApi,
   pingNotificationsAcrossTabs,
-  useNotifications,
+  useMarkAllRead,
+  useMarkRead,
+  useMarkUnread,
+  useNotificationDetail,
+  useNotificationList,
   type NotificationSeverity,
-  type SchoolNotificationDetailRow,
-  type SchoolNotificationListResponse,
   type SchoolNotificationListRow,
 } from "@/lib/notifications";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/Card";
@@ -32,26 +32,16 @@ import { Skeleton } from "@/components/ui/Skeleton";
 import { cn } from "@/lib/utils";
 
 // ---------------------------------------------------------------------------
-// /notifications — Phase 20 school-side inbox.
+// /notifications — Phase 20 inbox (rebuilt on React Query).
 //
-// Layout:
-//   • Filter strip: severity multi-select + unread-only toggle +
-//     "Mark all read" button.
-//   • Day-grouped list (Today, Yesterday, "October 12, 2025"…).
-//   • Side drawer with full content + payload + delivery states.
-//   • Pagination at the bottom (50 per page).
+// Shared cache via notificationKeys.list(filters) — bell preview
+// + this page hit the same query when filter shapes match. Different
+// filter shapes get different keys + their own cache entries; the
+// previous page stays visible during pagination via placeholderData.
 //
-// Optimistic state:
-//   • Mark read on row click (and on opening the drawer for an
-//     unread row).
-//   • Unread badge in topbar bumps without round-trip.
-//   • Cross-tab nudge via localStorage.
-//
-// Mobile responsiveness:
-//   • Filter strip wraps.
-//   • Drawer slides in from the right; full-width below sm.
-//   • Row layout is single-column at all sizes (severity icon +
-//     content stack).
+// Mutations (mark read, mark unread, mark all read) flip the cache
+// optimistically. The bell badge updates synchronously because it
+// reads from the same shared unread-count cache.
 // ---------------------------------------------------------------------------
 
 const PAGE_SIZE = 50;
@@ -117,139 +107,89 @@ const SEVERITY_ICON: Record<
 export default function NotificationsPage() {
   const searchParams = useSearchParams();
   const initialId = searchParams?.get("id") ?? null;
-  const { refresh, bumpUnread } = useNotifications();
-
-  const [data, setData] = React.useState<SchoolNotificationListResponse | null>(
-    null,
-  );
-  const [loading, setLoading] = React.useState(true);
-  const [error, setError] = React.useState<string | null>(null);
 
   const [severity, setSeverity] = React.useState<NotificationSeverity[]>([]);
   const [unreadOnly, setUnreadOnly] = React.useState(false);
   const [page, setPage] = React.useState(1);
 
-  const [selected, setSelected] = React.useState<SchoolNotificationDetailRow | null>(
-    null,
-  );
-  const [detailLoading, setDetailLoading] = React.useState(false);
-  const [bulkSubmitting, setBulkSubmitting] = React.useState(false);
+  const [selectedId, setSelectedId] = React.useState<string | null>(initialId);
 
-  const load = React.useCallback(async () => {
-    setLoading(true);
-    setError(null);
-    try {
-      const result = await notificationsApi.list({
-        severity: severity.length > 0 ? severity : undefined,
-        unreadOnly,
-        page,
-        pageSize: PAGE_SIZE,
-      });
-      setData(result);
-    } catch (err) {
-      setError(
-        err instanceof ApiError ? err.message : "Failed to load notifications.",
-      );
-    } finally {
-      setLoading(false);
-    }
-  }, [severity, unreadOnly, page]);
-
-  React.useEffect(() => {
-    void load();
-  }, [load]);
-
-  // Reset to page 1 when filters change.
+  // Reset to page 1 when filters change. State, not derived — so
+  // the user can navigate forward/back within the same filter set.
   React.useEffect(() => {
     setPage(1);
   }, [severity, unreadOnly]);
 
-  // Open the requested notification on first mount when ?id= is set.
-  React.useEffect(() => {
-    if (initialId) void openDetail(initialId);
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [initialId]);
+  // List query — shared key with the bell when filters happen to
+  // match. Same network call dedupes via React Query.
+  const filters = React.useMemo(
+    () => ({
+      severity: severity.length > 0 ? severity : undefined,
+      unreadOnly: unreadOnly || undefined,
+      page,
+      pageSize: PAGE_SIZE,
+    }),
+    [severity, unreadOnly, page],
+  );
+  const {
+    data,
+    isLoading,
+    isError,
+    error,
+    isFetching,
+    refetch,
+  } = useNotificationList(filters);
 
-  async function openDetail(id: string) {
-    setDetailLoading(true);
-    try {
-      const detail = await notificationsApi.get(id);
-      setSelected(detail);
-      // Mark read on open if it's unread.
-      if (!detail.readAt) {
-        await notificationsApi.markRead(id).catch(() => undefined);
-        setData((prev) =>
-          prev
-            ? {
-                ...prev,
-                rows: prev.rows.map((r) =>
-                  r.id === id ? { ...r, readAt: new Date().toISOString() } : r,
-                ),
-                unreadCount: Math.max(0, prev.unreadCount - 1),
-              }
-            : prev,
-        );
-        bumpUnread(-1);
-        pingNotificationsAcrossTabs();
-      }
-    } catch (err) {
-      toast.error(
-        err instanceof ApiError ? err.message : "Failed to load notification.",
-      );
-    } finally {
-      setDetailLoading(false);
-    }
-  }
+  // Detail query — lazy on selectedId.
+  const {
+    data: detail,
+    isLoading: detailLoading,
+  } = useNotificationDetail(selectedId);
 
-  const toggleSelectedRead = async () => {
-    if (!selected) return;
-    try {
-      const updated = selected.readAt
-        ? await notificationsApi.markUnread(selected.id)
-        : await notificationsApi.markRead(selected.id);
-      setSelected({ ...selected, readAt: updated.readAt });
-      setData((prev) =>
-        prev
-          ? {
-              ...prev,
-              rows: prev.rows.map((r) =>
-                r.id === selected.id ? { ...r, readAt: updated.readAt } : r,
-              ),
-              unreadCount: updated.readAt
-                ? Math.max(0, prev.unreadCount - 1)
-                : prev.unreadCount + 1,
-            }
-          : prev,
-      );
-      bumpUnread(updated.readAt ? -1 : 1);
-      pingNotificationsAcrossTabs();
-    } catch (err) {
-      toast.error(
-        err instanceof ApiError ? err.message : "Failed to update notification.",
-      );
+  const markRead = useMarkRead();
+  const markUnread = useMarkUnread();
+  const markAllRead = useMarkAllRead();
+
+  // When the user opens a row, mark it read (if unread). The
+  // mutation's onMutate handles the cache flip — no manual state.
+  const openDetail = (id: string) => {
+    setSelectedId(id);
+    const existing = data?.rows.find((r) => r.id === id);
+    if (existing && !existing.readAt) {
+      markRead.mutate(id, {
+        onSuccess: () => pingNotificationsAcrossTabs(),
+      });
     }
   };
 
-  const onMarkAllRead = async () => {
-    if (!data || data.unreadCount === 0) return;
-    setBulkSubmitting(true);
-    try {
-      const result = await notificationsApi.markAllRead();
-      toast.success(
-        result.count === 0
-          ? "All caught up."
-          : `Marked ${result.count} as read.`,
-      );
-      bumpUnread(-result.count);
-      pingNotificationsAcrossTabs();
-      await load();
-    } catch (err) {
-      toast.error(
-        err instanceof ApiError ? err.message : "Failed to mark all read.",
-      );
-    } finally {
-      setBulkSubmitting(false);
+  const toggleSelectedRead = () => {
+    if (!detail) return;
+    if (detail.readAt) {
+      markUnread.mutate(detail.id, {
+        onSuccess: () => pingNotificationsAcrossTabs(),
+      });
+    } else {
+      markRead.mutate(detail.id, {
+        onSuccess: () => pingNotificationsAcrossTabs(),
+      });
     }
+  };
+
+  const onMarkAllRead = () => {
+    if (!data || data.unreadCount === 0) return;
+    markAllRead.mutate(undefined, {
+      onSuccess: (result) => {
+        toast.success(
+          result.count === 0
+            ? "All caught up."
+            : `Marked ${result.count} as read.`,
+        );
+        pingNotificationsAcrossTabs();
+      },
+      onError: (e) => {
+        toast.error(e.message ?? "Failed to mark all read.");
+      },
+    });
   };
 
   const grouped = React.useMemo(() => {
@@ -277,19 +217,23 @@ export default function NotificationsPage() {
         <div className="flex items-center gap-2">
           <Button
             variant="ghost"
-            onClick={load}
-            disabled={loading}
-            leftIcon={<Loader2 className={cn("h-3.5 w-3.5", loading && "animate-spin")} />}
+            onClick={() => void refetch()}
+            disabled={isFetching}
+            leftIcon={
+              <Loader2
+                className={cn("h-3.5 w-3.5", isFetching && "animate-spin")}
+              />
+            }
           >
             Refresh
           </Button>
           <Button
             onClick={onMarkAllRead}
             disabled={
-              !data || data.unreadCount === 0 || bulkSubmitting
+              !data || data.unreadCount === 0 || markAllRead.isPending
             }
             leftIcon={
-              bulkSubmitting ? (
+              markAllRead.isPending ? (
                 <Loader2 className="h-3.5 w-3.5 animate-spin" />
               ) : (
                 <CheckCheck className="h-3.5 w-3.5" />
@@ -333,7 +277,7 @@ export default function NotificationsPage() {
         </CardContent>
       </Card>
 
-      {loading ? (
+      {isLoading && !data ? (
         <Card>
           <CardContent className="space-y-2 py-4">
             <Skeleton className="h-12 w-full" />
@@ -342,11 +286,11 @@ export default function NotificationsPage() {
             <Skeleton className="h-12 w-full" />
           </CardContent>
         </Card>
-      ) : error ? (
+      ) : isError ? (
         <Card>
           <CardContent className="flex items-center gap-2 py-6 text-sm text-destructive">
             <AlertTriangle className="h-4 w-4" />
-            {error}
+            {error?.message ?? "Failed to load notifications."}
           </CardContent>
         </Card>
       ) : !data || grouped.length === 0 ? (
@@ -380,7 +324,7 @@ export default function NotificationsPage() {
                     <NotificationRow
                       key={row.id}
                       row={row}
-                      onClick={() => void openDetail(row.id)}
+                      onClick={() => openDetail(row.id)}
                     />
                   ))}
                 </ul>
@@ -417,9 +361,10 @@ export default function NotificationsPage() {
       )}
 
       <DetailDrawer
-        notification={selected}
+        open={!!selectedId}
+        notification={detail ?? null}
         loading={detailLoading}
-        onClose={() => setSelected(null)}
+        onClose={() => setSelectedId(null)}
         onToggleRead={toggleSelectedRead}
       />
     </div>
@@ -504,26 +449,30 @@ function NotificationRow({
 // ---------------------------------------------------------------------------
 
 function DetailDrawer({
+  open,
   notification,
   loading,
   onClose,
   onToggleRead,
 }: {
-  notification: SchoolNotificationDetailRow | null;
+  open: boolean;
+  notification: ReturnType<typeof useNotificationDetail>["data"] extends infer T | undefined
+    ? Exclude<T, undefined> | null
+    : never;
   loading: boolean;
   onClose: () => void;
   onToggleRead: () => void;
 }) {
   React.useEffect(() => {
-    if (!notification && !loading) return;
+    if (!open) return;
     const onKey = (e: KeyboardEvent) => {
       if (e.key === "Escape") onClose();
     };
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
-  }, [notification, loading, onClose]);
+  }, [open, onClose]);
 
-  if (!notification && !loading) return null;
+  if (!open) return null;
 
   return (
     <>
@@ -736,5 +685,4 @@ function timeOnly(iso: string): string {
   });
 }
 
-// Suppress unused — kept for the relative-date variant we'll add later.
 void Bell;

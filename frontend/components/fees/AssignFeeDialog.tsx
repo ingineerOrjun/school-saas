@@ -11,8 +11,8 @@ import {
   type DiscountType,
   type FeeStructureDto,
 } from "@/lib/fees";
-import { studentsApi, type StudentDto } from "@/lib/students";
-import { classesApi, type ClassWithSections } from "@/lib/classes";
+import { useStudents, type StudentDto } from "@/lib/students";
+import { useClasses, type ClassWithSections } from "@/lib/classes";
 import { Button } from "@/components/ui/Button";
 import { Modal } from "@/components/ui/Modal";
 import { cn } from "@/lib/utils";
@@ -32,8 +32,15 @@ export function AssignFeeDialog({
   onAssigned,
 }: AssignFeeDialogProps) {
   const [structures, setStructures] = React.useState<FeeStructureDto[]>([]);
-  const [students, setStudents] = React.useState<StudentDto[]>([]);
-  const [classes, setClasses] = React.useState<ClassWithSections[]>([]);
+  // Phase Ω migration — students + classes now flow through shared
+  // React Query hooks. Reopening the dialog re-uses the cache instead
+  // of refetching; multiple open modals collapse to one underlying
+  // request. Fee structures stay local because feesApi has no shared
+  // hook yet (low-traffic enough not to warrant one).
+  const studentsQuery = useStudents();
+  const classesQuery = useClasses();
+  const students: StudentDto[] = studentsQuery.data ?? [];
+  const classes: ClassWithSections[] = classesQuery.data ?? [];
   const [classScope, setClassScope] = React.useState<string>(CLASS_ANY);
   const [feeStructureId, setFeeStructureId] = React.useState<string>("");
   const [dueDate, setDueDate] = React.useState<string>("");
@@ -58,16 +65,12 @@ export function AssignFeeDialog({
     setDiscountEnabled(false);
     setDiscountType("PERCENT");
     setDiscountValue("");
+    // Phase Ω — only fetch fee structures here. Students + classes
+    // come from the shared React Query hooks above (cache-aware).
     (async () => {
       try {
-        const [s, st, c] = await Promise.all([
-          feesApi.listStructures(),
-          studentsApi.list(),
-          classesApi.list(),
-        ]);
+        const s = await feesApi.listStructures();
         setStructures(s);
-        setStudents(st);
-        setClasses(c);
       } catch (err) {
         toast.error(err instanceof ApiError ? err.message : "Failed to load.");
       }

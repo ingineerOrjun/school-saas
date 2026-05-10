@@ -30,6 +30,7 @@ import { ThemeToggle } from "@/components/theme/ThemeToggle";
 import { CalendarToggle } from "@/components/calendar/CalendarToggle";
 import { SessionSelector } from "@/components/academic-session/SessionSelector";
 import { SyncStatusBadge } from "@/components/sync/SyncStatusBadge";
+import { LowDataPill } from "@/components/LowDataModeProvider";
 import { NotificationsBell } from "./NotificationsBell";
 
 export interface TopbarProps {
@@ -132,6 +133,9 @@ export function Topbar({ onMobileMenuClick }: TopbarProps) {
           mounts the sync engine lifecycle (mount + online event +
           30s poll) for the entire dashboard tree. */}
       <div className="flex items-center gap-1">
+        {/* Phase 26 — auto-detected low-data mode pill. Self-hides
+            when the network is normal + no manual override. */}
+        <LowDataPill />
         <SyncStatusBadge />
         <span className="hidden sm:inline-flex">
           <SessionSelector />

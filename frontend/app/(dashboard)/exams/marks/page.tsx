@@ -29,7 +29,7 @@ import {
   type GridRosterStudent,
 } from "@/lib/exams";
 import {
-  teachingAssignmentsApi,
+  useMyTeachingAssignments,
   type TeachingAssignmentDto,
 } from "@/lib/teaching-assignments";
 import { Button } from "@/components/ui/Button";
@@ -261,9 +261,6 @@ function BulkEntry() {
   // ----- Reference data -----
   const [exams, setExams] = React.useState<ExamDto[]>([]);
   const [classes, setClasses] = React.useState<ClassWithSections[]>([]);
-  const [assignments, setAssignments] = React.useState<
-    TeachingAssignmentDto[] | null
-  >(null);
   const [refLoading, setRefLoading] = React.useState(true);
   const [refError, setRefError] = React.useState<string | null>(null);
 
@@ -289,29 +286,47 @@ function BulkEntry() {
     return u?.role === "ADMIN" || u?.role === "STAFF";
   }, []);
 
-  // ----- Load reference data -----
+  // Assignments now flow through the React Query cache. The `enabled`
+  // gate keeps admins/staff from firing a request that would always
+  // 403 — the original imperative branch checked role === "TEACHER"
+  // for the same reason. The downstream `assignments` derivation
+  // preserves the previous semantics: null = "no filter (admin)",
+  // empty = "teacher with no assignments / 403", populated = scope.
+  const {
+    data: rawAssignments,
+    isLoading: assignmentsLoading,
+    error: assignmentsError,
+  } = useMyTeachingAssignments({ enabled: !isWideScope });
+  const assignments: TeachingAssignmentDto[] | null = React.useMemo(() => {
+    if (isWideScope) return null;
+    if (
+      assignmentsError instanceof ApiError &&
+      assignmentsError.status === 403
+    ) {
+      return [];
+    }
+    // While loading (or hook hasn't resolved), surface as `[]` so the
+    // teacher never momentarily sees the unfiltered admin catalog. The
+    // page-level skeleton + the combined refLoading flag keep the body
+    // hidden during this window anyway.
+    return rawAssignments ?? [];
+  }, [isWideScope, rawAssignments, assignmentsError]);
+
+  // ----- Load reference data (exams + classes only — assignments are
+  // hooked above) -----
   React.useEffect(() => {
     let cancelled = false;
     (async () => {
       setRefLoading(true);
       setRefError(null);
       try {
-        const u = getStoredUser();
-        const isTeacher = u?.role === "TEACHER";
-        const [exs, cls, asg] = await Promise.all([
+        const [exs, cls] = await Promise.all([
           examsApi.list(),
           classesApi.list(),
-          isTeacher
-            ? teachingAssignmentsApi.listMine().catch((err) => {
-                if (err instanceof ApiError && err.status === 403) return [];
-                throw err;
-              })
-            : Promise.resolve<TeachingAssignmentDto[]>([]),
         ]);
         if (cancelled) return;
         setExams(exs);
         setClasses(cls);
-        setAssignments(asg);
       } catch (err) {
         if (cancelled) return;
         if (err instanceof ApiError && err.status === 401) {
@@ -469,11 +484,22 @@ function BulkEntry() {
   };
 
   // ----- Render gates -----
-  if (refLoading) return <PageSkeleton />;
+  // Combined loading flag — page-skeleton stays visible until BOTH
+  // exams/classes (imperative) AND assignments (hook) have resolved
+  // for teachers. Mirrors the old Promise.all-based UX exactly.
+  const referenceLoading =
+    refLoading || (!isWideScope && assignmentsLoading);
+  if (referenceLoading) return <PageSkeleton />;
   if (refError) return <ErrorBanner message={refError} />;
 
+  // teacherEmpty: only after hook has settled — never during loading,
+  // otherwise the empty-state would flash briefly while assignments
+  // are still in flight.
   const teacherEmpty =
-    !isWideScope && assignments !== null && assignments.length === 0;
+    !isWideScope &&
+    !assignmentsLoading &&
+    assignments !== null &&
+    assignments.length === 0;
   if (teacherEmpty) return <NoAssignmentEmptyState />;
 
   return (

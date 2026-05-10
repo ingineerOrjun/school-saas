@@ -1,26 +1,37 @@
 "use client";
 
 import * as React from "react";
-import { api } from "./api";
-import { getToken } from "./auth";
+import {
+  useMutation,
+  useQuery,
+  useQueryClient,
+  type UseQueryOptions,
+} from "@tanstack/react-query";
+import { ApiError, api } from "./api";
+import { useAuthReady } from "@/hooks/useAuthReady";
 
 // ---------------------------------------------------------------------------
-// School-side notifications client + context — Phase 20.
+// School-side notifications client + hooks — Phase 20.
 //
-// Two surfaces use this file:
+// Phase-20-followup: rebuilt on @tanstack/react-query so the bell,
+// the dropdown preview, and the /notifications page share ONE
+// underlying cache via shared query keys. Same key → one fetch
+// regardless of how many components mount the hook.
 //
-//   • The /notifications inbox page (full list, drawer, filters).
-//   • The topbar NotificationsBell (live unread counter + dropdown
-//     preview).
+// Shared query keys are the entire dedupe story:
+//   notificationKeys.unreadCount          → bell badge + provider sentinel
+//   notificationKeys.list(filters)        → page list AND dropdown list
+//   notificationKeys.detail(id)           → side drawer
 //
-// The provider is mounted ONCE in the dashboard layout. It owns:
-//   • The unread counter (polled every 30s).
-//   • An optimistic mark-read helper that bumps the counter
-//     immediately so the bell updates without round-tripping.
+// Every mutation (mark read, mark unread, mark all read) flips the
+// cached entries optimistically — onMutate updates cache before
+// the network call lands. onError rolls back. onSuccess is a no-op
+// (the optimistic state is already correct).
 //
-// Why polling and not WebSockets / SSE: spec explicitly defers
-// real-time. 30s is fast enough that the UI feels live without
-// new infrastructure.
+// React StrictMode safety:
+//   useQuery handles double-mount + double-effect via internal
+//   request dedupe + the staleTime check. No setInterval in
+//   useEffect — the polling is React Query's own scheduler.
 // ---------------------------------------------------------------------------
 
 export type NotificationSeverity =
@@ -37,7 +48,6 @@ export interface SchoolNotificationListRow {
   severity: NotificationSeverity;
   readAt: string | null;
   createdAt: string;
-  /** True when targeted to this user vs school-wide broadcast. */
   targetedToMe: boolean;
 }
 
@@ -66,11 +76,18 @@ export interface NotificationListQuery {
   pageSize?: number;
 }
 
+// ---------------------------------------------------------------------------
+// Raw API client. Kept exported for the rare caller that needs an
+// imperative call outside the React tree (none today).
+// ---------------------------------------------------------------------------
+
 export const notificationsApi = {
   list: (query: NotificationListQuery = {}) => {
     const params = new URLSearchParams();
     if (query.severity && query.severity.length > 0) {
-      params.set("severity", query.severity.join(","));
+      // Sort to make the URL stable across permutations — same
+      // selection order = same query key = cache hit.
+      params.set("severity", [...query.severity].sort().join(","));
     }
     if (query.unreadOnly) params.set("unread", "true");
     if (query.page) params.set("page", String(query.page));
@@ -105,100 +122,304 @@ export const notificationsApi = {
 };
 
 // ---------------------------------------------------------------------------
-// Provider — owns the live unread counter for the topbar bell.
+// Shared query keys — the dedupe contract. Any two components
+// using the same key get the same cache entry.
+//
+// `list` accepts the SAME filters object the API takes — the key
+// is structurally compared so different filter shapes get different
+// caches (same filter shape = cache hit, even across components).
 // ---------------------------------------------------------------------------
 
-const POLL_INTERVAL_MS = 30_000;
-
-interface NotificationsContextValue {
-  unreadCount: number;
+export const notificationKeys = {
+  /** Root key — bulk-invalidated when any mutation lands. */
+  all: ["notifications"] as const,
+  unreadCount: ["notifications", "unread-count"] as const,
   /**
-   * Refresh the counter immediately. Called by the inbox page after
-   * a mutation so the bell stays in sync.
+   * List key includes the filter shape. We normalise undefined →
+   * defaults so {} and {page: 1, pageSize: 25} produce the same key.
    */
-  refresh: () => Promise<void>;
-  /**
-   * Optimistic delta — call with -1 after mark-read, +1 after
-   * mark-unread, -N after mark-all-read. Saves a round-trip when
-   * we already know the result.
-   */
-  bumpUnread: (delta: number) => void;
+  list: (filters: NotificationListQuery = {}) =>
+    [
+      "notifications",
+      "list",
+      {
+        severity: filters.severity ? [...filters.severity].sort() : [],
+        unreadOnly: !!filters.unreadOnly,
+        page: filters.page ?? 1,
+        pageSize: filters.pageSize ?? 25,
+      },
+    ] as const,
+  detail: (id: string) => ["notifications", "detail", id] as const,
+};
+
+// ---------------------------------------------------------------------------
+// Hooks
+// ---------------------------------------------------------------------------
+
+/**
+ * Live unread count. Polled at fixed interval; otherwise served
+ * from cache. Bell badge + drawer "x unread" indicator both read
+ * from this single hook.
+ *
+ * Rate budget: 60s refetchInterval × N tabs. Backend bucket is
+ * 30/min/user — comfortable headroom even for 5 open tabs.
+ */
+export function useUnreadCount() {
+  // Phase α follow-up — gate on the auth-store. Was: getToken()
+  // synchronous read which raced bootstrap.
+  const { authReady, isAuthenticated } = useAuthReady();
+  return useQuery({
+    queryKey: notificationKeys.unreadCount,
+    queryFn: () => notificationsApi.unreadCount(),
+    enabled: authReady && isAuthenticated,
+    // 30s stale → identical reads collapse to one network call.
+    staleTime: 30_000,
+    // 60s background poll keeps the badge live without hammering.
+    refetchInterval: 60_000,
+    // Don't refetch on focus — the interval is already enough for
+    // a long-lived ERP tab.
+    refetchOnWindowFocus: false,
+    // Don't retry the badge — a single failure isn't worth a toast
+    // and the next poll will reconcile.
+    retry: 1,
+  });
 }
 
-const NotificationsContext =
-  React.createContext<NotificationsContextValue | null>(null);
-
-export function NotificationsProvider({
-  children,
-}: {
-  children: React.ReactNode;
-}) {
-  const [unreadCount, setUnreadCount] = React.useState(0);
-
-  const refresh = React.useCallback(async () => {
-    if (!getToken()) return;
-    try {
-      const result = await notificationsApi.unreadCount();
-      setUnreadCount(result.count);
-    } catch {
-      // Silent — the bell just doesn't update. Fewer log lines
-      // than complaining on every poll tick when offline.
-    }
-  }, []);
-
-  const bumpUnread = React.useCallback((delta: number) => {
-    setUnreadCount((prev) => Math.max(0, prev + delta));
-  }, []);
-
-  React.useEffect(() => {
-    void refresh();
-    const id = window.setInterval(() => void refresh(), POLL_INTERVAL_MS);
-    return () => window.clearInterval(id);
-  }, [refresh]);
-
-  // Cross-tab sync: when another tab changes the unread count
-  // (e.g., user marks read on /notifications in tab A, the bell
-  // in tab B should update). Triggered by writes to a sentinel
-  // localStorage key from the inbox page.
-  React.useEffect(() => {
-    const onStorage = (e: StorageEvent) => {
-      if (e.key === NOTIFICATIONS_TICK_KEY) void refresh();
-    };
-    window.addEventListener("storage", onStorage);
-    return () => window.removeEventListener("storage", onStorage);
-  }, [refresh]);
-
-  const value = React.useMemo<NotificationsContextValue>(
-    () => ({ unreadCount, refresh, bumpUnread }),
-    [unreadCount, refresh, bumpUnread],
-  );
-
-  return (
-    <NotificationsContext.Provider value={value}>
-      {children}
-    </NotificationsContext.Provider>
-  );
+/**
+ * Notification list. Bell dropdown + inbox page read from this.
+ * Same filter shape = same cache entry.
+ *
+ * `keepPreviousData` lets the inbox page show the previous page
+ * while the next one fetches — no flash of skeleton on pagination.
+ */
+export function useNotificationList(
+  filters: NotificationListQuery = {},
+  options: Pick<
+    UseQueryOptions<SchoolNotificationListResponse, ApiError>,
+    "enabled" | "refetchOnMount"
+  > = {},
+) {
+  const { authReady, isAuthenticated } = useAuthReady();
+  return useQuery<SchoolNotificationListResponse, ApiError>({
+    queryKey: notificationKeys.list(filters),
+    queryFn: () => notificationsApi.list(filters),
+    enabled: (options.enabled ?? true) && authReady && isAuthenticated,
+    refetchOnMount: options.refetchOnMount ?? false,
+    staleTime: 30_000,
+    refetchOnWindowFocus: false,
+    retry: 1,
+    placeholderData: (prev) => prev,
+  });
 }
 
-export function useNotifications(): NotificationsContextValue {
-  const ctx = React.useContext(NotificationsContext);
-  if (ctx) return ctx;
-  // Standalone fallback for code paths that don't mount the
-  // provider (e.g., login page). Returns a no-op shape.
-  return {
-    unreadCount: 0,
-    refresh: async () => {},
-    bumpUnread: () => {},
-  };
+/** Drawer detail. Lazy — only fetches when the drawer opens. */
+export function useNotificationDetail(id: string | null) {
+  const { authReady, isAuthenticated } = useAuthReady();
+  return useQuery({
+    queryKey: id ? notificationKeys.detail(id) : ["notifications", "detail", "__noop__"],
+    queryFn: () => notificationsApi.get(id!),
+    enabled: !!id && authReady && isAuthenticated,
+    staleTime: 60_000,
+    refetchOnWindowFocus: false,
+  });
 }
+
+// ---------------------------------------------------------------------------
+// Mutations — optimistic updates against the shared cache.
+//
+// Pattern: onMutate flips local state, returns a snapshot for
+// rollback. onError rolls back. onSettled invalidates so the next
+// poll reconciles with the server.
+//
+// We DO NOT eagerly refetch after a mutation — the optimistic
+// state is the truth until the next scheduled poll (or the next
+// time the user opens a stale view).
+// ---------------------------------------------------------------------------
+
+interface MarkReadContext {
+  /** Snapshots of every cached entry we touched, for rollback. */
+  snapshots: Array<[readonly unknown[], unknown]>;
+}
+
+export function useMarkRead() {
+  const qc = useQueryClient();
+  return useMutation<SchoolNotificationListRow, ApiError, string, MarkReadContext>({
+    mutationFn: (id: string) => notificationsApi.markRead(id),
+    onMutate: async (id) => {
+      // Pause any in-flight refetches so they don't overwrite our
+      // optimistic state with stale data.
+      await qc.cancelQueries({ queryKey: notificationKeys.all });
+
+      const snapshots: Array<[readonly unknown[], unknown]> = [];
+      const now = new Date().toISOString();
+
+      // Walk every cached list entry; flip the row if present.
+      // queryClient.setQueriesData with a predicate would do this
+      // in one call but we want the snapshots for rollback.
+      const cached = qc.getQueriesData<SchoolNotificationListResponse>({
+        queryKey: ["notifications", "list"],
+      });
+      for (const [key, value] of cached) {
+        if (!value) continue;
+        const found = value.rows.find((r) => r.id === id);
+        if (!found || found.readAt) continue; // already read — no change
+        snapshots.push([key, value]);
+        qc.setQueryData<SchoolNotificationListResponse>(key, {
+          ...value,
+          rows: value.rows.map((r) =>
+            r.id === id ? { ...r, readAt: now } : r,
+          ),
+          unreadCount: Math.max(0, value.unreadCount - 1),
+        });
+      }
+
+      // Bump the badge.
+      const prevUnread = qc.getQueryData<{ count: number }>(
+        notificationKeys.unreadCount,
+      );
+      if (prevUnread) {
+        snapshots.push([notificationKeys.unreadCount, prevUnread]);
+        qc.setQueryData(notificationKeys.unreadCount, {
+          count: Math.max(0, prevUnread.count - 1),
+        });
+      }
+
+      // Detail cache, if open.
+      const detailKey = notificationKeys.detail(id);
+      const prevDetail = qc.getQueryData<SchoolNotificationDetailRow>(detailKey);
+      if (prevDetail && !prevDetail.readAt) {
+        snapshots.push([detailKey, prevDetail]);
+        qc.setQueryData(detailKey, { ...prevDetail, readAt: now });
+      }
+
+      return { snapshots };
+    },
+    onError: (_err, _id, ctx) => {
+      // Roll back every cache entry we mutated.
+      if (!ctx) return;
+      for (const [key, value] of ctx.snapshots) {
+        qc.setQueryData(key, value);
+      }
+    },
+    // Intentionally NO onSuccess invalidate — the optimistic state
+    // is correct. The next scheduled poll reconciles.
+  });
+}
+
+export function useMarkUnread() {
+  const qc = useQueryClient();
+  return useMutation<SchoolNotificationListRow, ApiError, string, MarkReadContext>({
+    mutationFn: (id: string) => notificationsApi.markUnread(id),
+    onMutate: async (id) => {
+      await qc.cancelQueries({ queryKey: notificationKeys.all });
+
+      const snapshots: Array<[readonly unknown[], unknown]> = [];
+
+      const cached = qc.getQueriesData<SchoolNotificationListResponse>({
+        queryKey: ["notifications", "list"],
+      });
+      for (const [key, value] of cached) {
+        if (!value) continue;
+        const found = value.rows.find((r) => r.id === id);
+        if (!found || !found.readAt) continue;
+        snapshots.push([key, value]);
+        qc.setQueryData<SchoolNotificationListResponse>(key, {
+          ...value,
+          rows: value.rows.map((r) =>
+            r.id === id ? { ...r, readAt: null } : r,
+          ),
+          unreadCount: value.unreadCount + 1,
+        });
+      }
+
+      const prevUnread = qc.getQueryData<{ count: number }>(
+        notificationKeys.unreadCount,
+      );
+      if (prevUnread) {
+        snapshots.push([notificationKeys.unreadCount, prevUnread]);
+        qc.setQueryData(notificationKeys.unreadCount, {
+          count: prevUnread.count + 1,
+        });
+      }
+
+      const detailKey = notificationKeys.detail(id);
+      const prevDetail = qc.getQueryData<SchoolNotificationDetailRow>(detailKey);
+      if (prevDetail && prevDetail.readAt) {
+        snapshots.push([detailKey, prevDetail]);
+        qc.setQueryData(detailKey, { ...prevDetail, readAt: null });
+      }
+
+      return { snapshots };
+    },
+    onError: (_err, _id, ctx) => {
+      if (!ctx) return;
+      for (const [key, value] of ctx.snapshots) {
+        qc.setQueryData(key, value);
+      }
+    },
+  });
+}
+
+interface MarkAllReadContext {
+  snapshots: Array<[readonly unknown[], unknown]>;
+}
+
+export function useMarkAllRead() {
+  const qc = useQueryClient();
+  return useMutation<{ count: number }, ApiError, void, MarkAllReadContext>({
+    mutationFn: () => notificationsApi.markAllRead(),
+    onMutate: async () => {
+      await qc.cancelQueries({ queryKey: notificationKeys.all });
+      const snapshots: Array<[readonly unknown[], unknown]> = [];
+      const now = new Date().toISOString();
+
+      // Flip every list entry's unread rows in cache.
+      const cached = qc.getQueriesData<SchoolNotificationListResponse>({
+        queryKey: ["notifications", "list"],
+      });
+      for (const [key, value] of cached) {
+        if (!value) continue;
+        const hasUnread = value.rows.some((r) => !r.readAt);
+        if (!hasUnread && value.unreadCount === 0) continue;
+        snapshots.push([key, value]);
+        qc.setQueryData<SchoolNotificationListResponse>(key, {
+          ...value,
+          rows: value.rows.map((r) => (r.readAt ? r : { ...r, readAt: now })),
+          unreadCount: 0,
+        });
+      }
+
+      // Zero the badge.
+      const prevUnread = qc.getQueryData<{ count: number }>(
+        notificationKeys.unreadCount,
+      );
+      if (prevUnread && prevUnread.count > 0) {
+        snapshots.push([notificationKeys.unreadCount, prevUnread]);
+        qc.setQueryData(notificationKeys.unreadCount, { count: 0 });
+      }
+
+      return { snapshots };
+    },
+    onError: (_err, _v, ctx) => {
+      if (!ctx) return;
+      for (const [key, value] of ctx.snapshots) {
+        qc.setQueryData(key, value);
+      }
+    },
+  });
+}
+
+// ---------------------------------------------------------------------------
+// Cross-tab nudge — kept from the previous implementation so writes
+// in tab A invalidate caches in tab B.
+//
+// Setup is in the QueryProvider at app boot via useNotificationsCrossTabSync,
+// or any component (idempotent) — adding a listener twice is fine,
+// React Query's invalidateQueries dedupes the resulting refetches.
+// ---------------------------------------------------------------------------
 
 const NOTIFICATIONS_TICK_KEY = "scholaris:notifications:tick";
 
-/**
- * Cross-tab nudge — writes a sentinel timestamp to localStorage
- * so other tabs' NotificationsProvider instances refetch the
- * unread counter. Called by the inbox page after any mutation.
- */
 export function pingNotificationsAcrossTabs(): void {
   if (typeof window === "undefined") return;
   try {
@@ -206,4 +427,21 @@ export function pingNotificationsAcrossTabs(): void {
   } catch {
     /* storage unavailable — skip */
   }
+}
+
+/**
+ * Mount this hook ONCE inside the QueryClient subtree (e.g. from
+ * NotificationsBell). Listens for the cross-tab sentinel and
+ * invalidates the notifications root key when another tab signals.
+ */
+export function useNotificationsCrossTabSync() {
+  const qc = useQueryClient();
+  React.useEffect(() => {
+    const onStorage = (e: StorageEvent) => {
+      if (e.key !== NOTIFICATIONS_TICK_KEY) return;
+      void qc.invalidateQueries({ queryKey: notificationKeys.all });
+    };
+    window.addEventListener("storage", onStorage);
+    return () => window.removeEventListener("storage", onStorage);
+  }, [qc]);
 }

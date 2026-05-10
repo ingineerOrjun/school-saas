@@ -1,8 +1,12 @@
 "use client";
 
 import * as React from "react";
+import { useQuery } from "@tanstack/react-query";
 import { api } from "./api";
-import { getStoredUser, getToken } from "./auth";
+import { getStoredUser } from "./auth";
+import { useAuthReady } from "@/hooks/useAuthReady";
+import { qk } from "./query-keys";
+import { STALE } from "./query-client";
 
 // ---------------------------------------------------------------------------
 // Phase 5 — frontend feature flag client.
@@ -140,52 +144,69 @@ const FeaturesContext = React.createContext<FeaturesContextValue | null>(null);
 
 /**
  * Provider for the feature flag context. Mounted ONCE in the
- * dashboard / platform layouts (whichever the user lands on). Every
- * `useFeatures()` call reads from this context, falling back to
- * defaults when not mounted.
+ * dashboard / platform layouts. Wraps the React Query result for
+ * `/me/features` so every `useFeatures()` call goes through the
+ * shared cache — no parallel fetches across pages, modals, or
+ * sidebar mounts.
+ *
+ * Reference data (REFERENCE_DATA staleTime, 10m) — features
+ * change on operator-grade actions (subscription create / override
+ * write), not on user-driven flow. The shared cache covers a full
+ * SPA navigation cycle without refetching.
  */
 export function FeaturesProvider({
   children,
 }: {
   children: React.ReactNode;
 }) {
-  const [features, setFeatures] = React.useState<Record<string, boolean>>(() =>
-    getCachedFeatures(),
-  );
-  const [catalog, setCatalog] = React.useState<FeatureCatalogEntry[]>([]);
-  const [loading, setLoading] = React.useState(true);
-  const [maintenanceMode, setMaintenanceMode] = React.useState(false);
+  // Phase α follow-up — gate on the subscribable auth-store. Was:
+  // synchronous getToken() read which raced the bootstrap window
+  // and produced user=<anon> 429s on /me/features.
+  const { authReady, isAuthenticated } = useAuthReady();
+  const query = useQuery({
+    queryKey: qk.meFeatures,
+    queryFn: () => featuresApi.getMine(),
+    enabled: authReady && isAuthenticated,
+    // Phase γ — feature flags change rarely (operator action).
+    // 30m stale + 30m gc keeps the provider quiet across navigation.
+    staleTime: 30 * 60_000,
+    gcTime: 30 * 60_000,
+    refetchOnWindowFocus: false,
+    refetchOnMount: false,
+    retry: (failureCount, error) => {
+      const status = (error as { status?: number } | null)?.status;
+      if (status === 401 || status === 403) return false;
+      return failureCount < 1;
+    },
+  });
 
-  const refresh = React.useCallback(async () => {
-    if (!getToken()) {
-      setLoading(false);
-      return;
-    }
-    try {
-      const result = await featuresApi.getMine();
-      setFeatures(result.features);
-      setCatalog(result.catalog);
-      setMaintenanceMode(result.tenant?.maintenanceMode ?? false);
-      cacheFeatures(result.features);
-    } catch (e) {
-      // Conservative fallback — keep whatever is cached, otherwise
-      // the catalog defaults. Don't toast (the UI hasn't asked yet
-      // and a generic toast on layout mount is jarring).
-      // eslint-disable-next-line no-console
-      console.warn("[features] /me/features failed, using cached/defaults:", e);
-    } finally {
-      setLoading(false);
-    }
-  }, []);
-
+  // Side-effect: warm the localStorage cache on every successful
+  // fetch so getCachedFeatures() (used by getCachedFeatures-only
+  // callers like FeatureGate during initial paint) stays current.
   React.useEffect(() => {
-    void refresh();
-  }, [refresh]);
+    if (query.data) cacheFeatures(query.data.features);
+  }, [query.data]);
+
+  // Conservative fallback when the query hasn't resolved yet:
+  // serve from localStorage so the UI doesn't flash empty + the
+  // sidebar doesn't show every nav entry while we wait.
+  const cachedSeed = React.useMemo(() => getCachedFeatures(), []);
+  const features = query.data?.features ?? cachedSeed;
+  const catalog = query.data?.catalog ?? [];
+  const maintenanceMode = query.data?.tenant?.maintenanceMode ?? false;
+  const loading = query.isLoading;
 
   const isEnabled = React.useCallback(
     (key: string) => features[key] ?? FEATURE_DEFAULTS[key] ?? false,
     [features],
   );
+
+  // `refresh` is exposed for code paths that want to force-update
+  // (e.g. after a SUPER_ADMIN flips a flag). React Query's
+  // refetch() is the underlying call.
+  const refresh = React.useCallback(async () => {
+    await query.refetch();
+  }, [query]);
 
   const value = React.useMemo<FeaturesContextValue>(
     () => ({
