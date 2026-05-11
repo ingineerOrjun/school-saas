@@ -429,6 +429,10 @@ export class PlatformService {
 
     await this.audit.record({
       action: 'SCHOOL_CODE_UPDATED',
+      // Tenant scope is the target school — surfaces on that
+      // school's admin audit feed even though the actor is a
+      // SUPER_ADMIN from the platform school.
+      schoolId,
       actor: {
         userId: actor.userId,
         email: actor.email,

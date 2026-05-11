@@ -10,8 +10,10 @@ import {
   Patch,
   Post,
   Query,
+  Req,
   UseGuards,
 } from '@nestjs/common';
+import type { Request as ExpressRequest } from 'express';
 import { Role } from '@prisma/client';
 import { CurrentUser } from '../common/decorators/current-user.decorator';
 import { JwtAuthGuard } from '../auth/guards/jwt-auth.guard';
@@ -107,6 +109,50 @@ export class ExamsController {
     @CurrentUser() user: AuthenticatedUser,
   ) {
     return this.exams.remove(id, user.schoolId);
+  }
+
+  /**
+   * Publication lock — ADMIN-only. After this lands, every Result
+   * write path rejects with HTTP 423 LOCKED until /unlock fires.
+   * Idempotent (no-op when already locked). Emits MARKS_LOCKED to
+   * the platform audit stream with the actor + examId for the trail.
+   */
+  @Patch('exams/:id/lock')
+  @HttpCode(HttpStatus.OK)
+  @Roles(Role.ADMIN)
+  lockExam(
+    @Param('id', ParseUUIDPipe) id: string,
+    @CurrentUser() user: AuthenticatedUser,
+    @Req() req: ExpressRequest,
+  ) {
+    return this.exams.lockExam(id, user.schoolId, {
+      userId: user.id,
+      email: user.email,
+      role: user.role,
+      ip: req.ip ?? null,
+      userAgent: req.headers['user-agent'] ?? null,
+    });
+  }
+
+  /**
+   * Publication unlock — ADMIN-only. Re-enables marks edits.
+   * Idempotent. Emits MARKS_UNLOCKED with the actor + examId.
+   */
+  @Patch('exams/:id/unlock')
+  @HttpCode(HttpStatus.OK)
+  @Roles(Role.ADMIN)
+  unlockExam(
+    @Param('id', ParseUUIDPipe) id: string,
+    @CurrentUser() user: AuthenticatedUser,
+    @Req() req: ExpressRequest,
+  ) {
+    return this.exams.unlockExam(id, user.schoolId, {
+      userId: user.id,
+      email: user.email,
+      role: user.role,
+      ip: req.ip ?? null,
+      userAgent: req.headers['user-agent'] ?? null,
+    });
   }
 
   // ---------- Subject management under an exam ----------

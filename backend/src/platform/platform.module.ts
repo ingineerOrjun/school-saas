@@ -11,6 +11,7 @@ import { PlatformController } from './platform.controller';
 import { PlatformService } from './platform.service';
 import { PlatformAuditService } from './platform-audit.service';
 import { ImpersonationController } from './impersonation.controller';
+import { SchoolAuditController } from './school-audit.controller';
 import { ImpersonationService } from './impersonation.service';
 import { PlatformAnalyticsService } from './platform-analytics.service';
 import { SchoolCodeService } from './services/school-code.service';
@@ -65,7 +66,14 @@ import { SubscriptionService } from './subscription.service';
       }),
     }),
   ],
-  controllers: [PlatformController, ImpersonationController],
+  controllers: [
+    PlatformController,
+    ImpersonationController,
+    // School-side audit feed — mounted at /audit/recent, gated by
+    // @Roles(ADMIN, STAFF). Reads the same PlatformAuditEvent table
+    // with a tenant filter applied server-side.
+    SchoolAuditController,
+  ],
   providers: [
     PlatformService,
     PlatformAnalyticsService,

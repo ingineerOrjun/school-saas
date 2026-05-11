@@ -1,10 +1,8 @@
 "use client";
 
 import * as React from "react";
-import { AlertTriangle } from "lucide-react";
 import type { StudentDto } from "@/lib/students";
-import { Button } from "@/components/ui/Button";
-import { Modal } from "@/components/ui/Modal";
+import { ConfirmDestructiveActionDialog } from "@/components/ui/ConfirmDestructiveActionDialog";
 
 export interface DeleteStudentDialogProps {
   student: StudentDto | null;
@@ -14,56 +12,68 @@ export interface DeleteStudentDialogProps {
    * animation, scheduling the backend call, and showing an undo affordance.
    */
   onConfirm: (student: StudentDto) => void;
+  /**
+   * Optional pending flag — passed by the parent when the deletion's
+   * actual backend mutation is in flight (mutation.isPending). While
+   * true the dialog disables both buttons + the typed input, and the
+   * confirm button shows a spinner. Defaults to false (immediate
+   * close pattern from the legacy "schedule delete then undo" flow).
+   */
+  isPending?: boolean;
 }
 
+/**
+ * Thin wrapper around the platform's shared ConfirmDestructiveActionDialog
+ * primitive. Phase data-integrity Rule 4: deleting a student is
+ * high-risk + irreversible, so we require the operator to type the
+ * student's full name to enable the destructive button. Prevents
+ * accidental deletion of the wrong row when the admin is hurrying
+ * through a roster cleanup.
+ */
 export function DeleteStudentDialog({
   student,
   onClose,
   onConfirm,
+  isPending = false,
 }: DeleteStudentDialogProps) {
+  const fullName = student
+    ? `${student.firstName} ${student.lastName}`.trim()
+    : "";
   const handleConfirm = () => {
     if (!student) return;
     onConfirm(student);
-    onClose();
+    // Legacy contract — the parent's undo flow expects the dialog to
+    // close immediately so the snackbar can take over. Skip when
+    // isPending is set (parent is awaiting the mutation; close on
+    // success in that flow).
+    if (!isPending) onClose();
   };
-
   return (
-    <Modal
+    <ConfirmDestructiveActionDialog
       open={student !== null}
-      onClose={onClose}
-      size="sm"
-      footer={
+      title="Delete student?"
+      description={
         <>
-          <Button variant="ghost" onClick={onClose} type="button">
-            Cancel
-          </Button>
-          <Button
-            variant="destructive"
-            onClick={handleConfirm}
-            type="button"
-          >
-            Delete student
-          </Button>
+          This will remove{" "}
+          <span className="font-medium text-foreground">{fullName}</span> from
+          your school. The action is reversible only via the undo affordance
+          shown immediately after — once that disappears, the row is gone
+          for good.
         </>
       }
-    >
-      <div className="flex items-start gap-4">
-        <div className="flex h-10 w-10 shrink-0 items-center justify-center rounded-full bg-destructive/10 text-destructive">
-          <AlertTriangle className="h-5 w-5" />
-        </div>
-        <div>
-          <h2 className="text-lg font-semibold tracking-tight text-foreground">
-            Delete student?
-          </h2>
-          <p className="mt-1 text-sm text-muted-foreground">
-            This will remove{" "}
-            <span className="font-medium text-foreground">
-              {student?.firstName} {student?.lastName}
-            </span>{" "}
-            from your school. You&apos;ll have a few seconds to undo.
-          </p>
-        </div>
-      </div>
-    </Modal>
+      typedConfirmation={
+        student
+          ? {
+              label: `Type the student's full name to confirm`,
+              expectedValue: fullName,
+              placeholder: fullName,
+            }
+          : undefined
+      }
+      confirmLabel="Delete student"
+      isPending={isPending}
+      onCancel={onClose}
+      onConfirm={handleConfirm}
+    />
   );
 }

@@ -29,6 +29,7 @@ import { Table, THead, TBody, Tr, Th, Td } from "@/components/ui/Table";
 import { Skeleton } from "@/components/ui/Skeleton";
 import { EmptyState } from "@/components/ui/EmptyState";
 import { OnboardingChecklist } from "@/components/ui/OnboardingChecklist";
+import { RecentActivityPanel } from "@/components/activity/RecentActivityPanel";
 import { AddStudentDialog } from "@/components/students/AddStudentDialog";
 import { useDashboardData } from "@/lib/use-dashboard-data";
 import { useClasses, type ClassWithSections } from "@/lib/classes";
@@ -497,6 +498,12 @@ export function AdminDashboardView() {
           {(isReady || isEmpty) && (
             <QuickActionsCard items={visibleQuickActions} />
           )}
+
+          {/* Recent activity — school-wide audit feed. Shows the
+              last ~10 events (marks locked, attendance overwritten,
+              school-code changes, …). Hidden silently for non-ADMIN
+              callers via the 403 handling inside the panel itself. */}
+          {(isReady || isEmpty) && <RecentActivityPanel limit={10} />}
         </div>
       </section>
 

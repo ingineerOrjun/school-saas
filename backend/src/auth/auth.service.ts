@@ -136,6 +136,9 @@ export class AuthService {
     void this.platformAudit
       .record({
         action: PlatformAuditAction.SCHOOL_CODE_ASSIGNED,
+        // Tenant scope is the just-created school itself — this is
+        // the very first audit row in that tenant's feed.
+        schoolId: school.id,
         actor: { userId: user.id, email: user.email, role: user.role },
         target: { type: 'School', id: school.id, label: school.name },
         before: null,

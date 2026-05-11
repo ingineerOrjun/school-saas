@@ -1,11 +1,20 @@
 import {
   ConflictException,
+  HttpException,
+  HttpStatus,
   Injectable,
   NotFoundException,
 } from '@nestjs/common';
-import { Exam, ExamSubject, LetterGrade, Prisma } from '@prisma/client';
+import {
+  Exam,
+  ExamSubject,
+  LetterGrade,
+  PlatformAuditAction,
+  Prisma,
+} from '@prisma/client';
 import { AcademicSessionService } from '../academic-session/academic-session.service';
 import { PrismaService } from '../database/prisma.service';
+import { PlatformAuditService } from '../platform/platform-audit.service';
 import { CreateExamDto } from './dto/create-exam.dto';
 import { UpdateExamDto } from './dto/update-exam.dto';
 
@@ -107,6 +116,7 @@ export class ExamService {
   constructor(
     private readonly prisma: PrismaService,
     private readonly sessions: AcademicSessionService,
+    private readonly audit: PlatformAuditService,
   ) {}
 
   /**
@@ -403,6 +413,161 @@ export class ExamService {
     });
     if (!exam) throw new NotFoundException('Exam not found.');
     return exam;
+  }
+
+  /**
+   * Tenant + lock guard for marks-write paths. Returns the exam
+   * when it's both in the caller's school AND not locked. Throws:
+   *
+   *   • 404 NotFound  — exam doesn't exist in this school.
+   *   • 423 Locked    — exam exists but `locked = true`. Marks edits
+   *                     require an explicit unlock first; the
+   *                     frontend surfaces this with the LockedBadge
+   *                     and a "Request unlock" affordance.
+   *
+   * Phase data-integrity Rule 1: this is the SERVER-SIDE guard. The
+   * UI may also disable inputs when locked, but the source of truth
+   * is here — every results.save / bulkSave / gridSave call routes
+   * through this method.
+   */
+  async assertEditable(id: string, schoolId: string): Promise<Exam> {
+    const exam = await this.assertInSchool(id, schoolId);
+    if (exam.locked) {
+      // 423 LOCKED — RFC 4918 §11.3. Closest standard code for
+      // "the resource is locked against modification."
+      throw new HttpException(
+        {
+          statusCode: HttpStatus.LOCKED,
+          message:
+            'This exam is locked. Marks cannot be edited until an admin unlocks it.',
+          examId: exam.id,
+          locked: true,
+          lockedAt: exam.lockedAt,
+        },
+        HttpStatus.LOCKED,
+      );
+    }
+    return exam;
+  }
+
+  /**
+   * Lock an exam. Idempotent: a lock-when-already-locked is a no-op
+   * (returns the existing row, no audit emit, no extra timestamp
+   * shuffle). The actor is recorded for the audit trail.
+   *
+   * Phase data-integrity Rules 1+2+5:
+   *   • Server-enforced — every save path checks the flag.
+   *   • Explicit action — separate endpoint, ADMIN-only.
+   *   • Audit emits with examId + examName so the operator can see
+   *     "locked X by Y at Z" in the platform audit timeline.
+   */
+  async lockExam(
+    id: string,
+    schoolId: string,
+    actor: {
+      userId: string;
+      email?: string | null;
+      role?: string | null;
+      ip?: string | null;
+      userAgent?: string | null;
+    },
+  ): Promise<Exam> {
+    const before = await this.assertInSchool(id, schoolId);
+    if (before.locked) {
+      // No-op — return the existing row without writing or auditing.
+      // The endpoint is idempotent so a double-click can't spam audit.
+      return before;
+    }
+
+    const updated = await this.prisma.exam.update({
+      where: { id },
+      data: {
+        locked: true,
+        lockedAt: new Date(),
+        lockedById: actor.userId,
+      },
+    });
+
+    await this.audit.record({
+      action: PlatformAuditAction.MARKS_LOCKED,
+      // Tenant-scope explicitly so the school-side audit feed picks
+      // this up. Without it the row would inherit the actor's
+      // schoolId, which IS the target school here, but being
+      // explicit decouples the audit from any future actor that
+      // doesn't match (e.g. SUPER_ADMIN locking on behalf of).
+      schoolId,
+      actor: {
+        userId: actor.userId,
+        email: actor.email,
+        role: actor.role,
+      },
+      target: { type: 'Exam', id: updated.id, label: updated.name },
+      before: { locked: false, lockedAt: null },
+      after: {
+        locked: true,
+        lockedAt: updated.lockedAt,
+        examId: updated.id,
+      },
+      ip: actor.ip,
+      userAgent: actor.userAgent,
+    });
+
+    return updated;
+  }
+
+  /**
+   * Unlock an exam. Mirror of lockExam — idempotent no-op when
+   * already unlocked. Clears `lockedAt` + `lockedById` so the
+   * audit trail tells the full story (lock event + unlock event in
+   * the platform audit stream); the row itself doesn't carry
+   * "previously locked at X" history because the audit log is the
+   * source of truth for that.
+   */
+  async unlockExam(
+    id: string,
+    schoolId: string,
+    actor: {
+      userId: string;
+      email?: string | null;
+      role?: string | null;
+      ip?: string | null;
+      userAgent?: string | null;
+    },
+  ): Promise<Exam> {
+    const before = await this.assertInSchool(id, schoolId);
+    if (!before.locked) {
+      return before;
+    }
+
+    const updated = await this.prisma.exam.update({
+      where: { id },
+      data: {
+        locked: false,
+        lockedAt: null,
+        lockedById: null,
+      },
+    });
+
+    await this.audit.record({
+      action: PlatformAuditAction.MARKS_UNLOCKED,
+      schoolId,
+      actor: {
+        userId: actor.userId,
+        email: actor.email,
+        role: actor.role,
+      },
+      target: { type: 'Exam', id: updated.id, label: updated.name },
+      before: {
+        locked: true,
+        lockedAt: before.lockedAt,
+        lockedById: before.lockedById,
+      },
+      after: { locked: false, examId: updated.id },
+      ip: actor.ip,
+      userAgent: actor.userAgent,
+    });
+
+    return updated;
   }
 }
 

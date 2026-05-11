@@ -46,6 +46,38 @@ export const qk = {
    */
   myAssignments: () => ["teaching-assignments", "mine"] as const,
 
+  /**
+   * School-side recent activity feed (PlatformAuditEvent rows for
+   * the caller's tenant). Filters are serialised into the key so
+   * different filter sets get distinct cache entries — the dashboard
+   * panel (no filter) and an entity-history sidebar
+   * (targetType+targetId) don't collide.
+   */
+  auditRecent: (filters: {
+    action?: string;
+    targetType?: string;
+    targetId?: string;
+    q?: string;
+    fromDate?: string;
+    toDate?: string;
+    page?: number;
+    pageSize?: number;
+  } = {}) =>
+    [
+      "audit",
+      "recent",
+      {
+        action: filters.action ?? null,
+        targetType: filters.targetType ?? null,
+        targetId: filters.targetId ?? null,
+        q: filters.q ?? "",
+        fromDate: filters.fromDate ?? null,
+        toDate: filters.toDate ?? null,
+        page: filters.page ?? 1,
+        pageSize: filters.pageSize ?? 20,
+      },
+    ] as const,
+
   // ---- Academic sessions (10m — but `selected` is set ad-hoc) ----
   academicSessions: () => ["academic-sessions"] as const,
 

@@ -22,6 +22,15 @@ export interface ExamDto {
   name: string;
   schoolId: string;
   subjects: ExamSubjectDto[];
+  /**
+   * Marks-publication lock state. When `locked` is true, every backend
+   * results-write path rejects with HTTP 423. The `lockedAt` /
+   * `lockedById` fields exist for the audit trail but the platform
+   * audit stream is the authoritative history.
+   */
+  locked?: boolean;
+  lockedAt?: string | null;
+  lockedById?: string | null;
   createdAt: string;
   updatedAt: string;
 }
@@ -217,6 +226,22 @@ export const examsApi = {
     }),
   removeSubject: (id: string) =>
     api<void>(`/exam-subjects/${id}`, { method: "DELETE" }),
+
+  /**
+   * Marks-publication lock. ADMIN-only on the backend. Idempotent:
+   * locking an already-locked exam is a no-op (no audit emit, no
+   * timestamp change). After this lands every result-save path
+   * rejects with HTTP 423.
+   */
+  lock: (examId: string) =>
+    api<ExamDto>(`/exams/${encodeURIComponent(examId)}/lock`, {
+      method: "PATCH",
+    }),
+  /** Mirror of `lock` — re-enables marks edits. ADMIN-only. */
+  unlock: (examId: string) =>
+    api<ExamDto>(`/exams/${encodeURIComponent(examId)}/unlock`, {
+      method: "PATCH",
+    }),
 };
 
 export const resultsApi = {
@@ -255,6 +280,14 @@ export interface Marksheet extends StudentReport {
   } | null;
   examCreatedAt: string;
   generatedAt: string;
+  /**
+   * Marks-publication lock state from the parent Exam. Drives the
+   * LockedBadge in the marksheet header. Optional in the typing for
+   * back-compat with API responses that pre-date the field — the
+   * renderer falls back to `false` when missing.
+   */
+  examLocked?: boolean;
+  examLockedAt?: string | null;
 }
 
 export const marksheetApi = {

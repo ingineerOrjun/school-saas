@@ -9,13 +9,20 @@ import {
   ArrowLeft,
   AlertTriangle,
   Loader2,
+  Lock,
+  Unlock,
 } from "lucide-react";
+import { toast } from "sonner";
 import { cn } from "@/lib/utils";
 import { ApiError } from "@/lib/api";
-import { getToken } from "@/lib/auth";
-import { marksheetApi, type Marksheet } from "@/lib/exams";
+import { getToken, getStoredUser } from "@/lib/auth";
+import { examsApi, marksheetApi, type Marksheet } from "@/lib/exams";
 import { gpaToLetterGrade } from "@/lib/grading";
 import { DocumentLogo } from "@/components/documents/DocumentLogo";
+import { ConfirmDestructiveActionDialog } from "@/components/ui/ConfirmDestructiveActionDialog";
+import { LockedBadge } from "@/components/ui/LockedBadge";
+import { AuditStamp } from "@/components/ui/AuditStamp";
+import { RecentActivityPanel } from "@/components/activity/RecentActivityPanel";
 import { formatDual } from "@/lib/date";
 
 export default function MarksheetPage() {
@@ -24,6 +31,23 @@ export default function MarksheetPage() {
   const [data, setData] = React.useState<Marksheet | null>(null);
   const [loading, setLoading] = React.useState(true);
   const [error, setError] = React.useState<string | null>(null);
+  // Admin-only lock/unlock state. `pendingToggle` is null when no
+  // dialog is open; otherwise the boolean indicates the target
+  // state ("true" = will lock, "false" = will unlock). `mutating`
+  // disables the dialog while the PATCH is in flight (Phase
+  // data-integrity Rule 3 — async-safe confirmation).
+  const [pendingToggle, setPendingToggle] = React.useState<boolean | null>(
+    null,
+  );
+  const [mutating, setMutating] = React.useState(false);
+  // Cached role — reads localStorage once on mount. Non-admins
+  // never see the lock button so they can't accidentally request
+  // an action the backend would reject anyway.
+  const [role, setRole] = React.useState<string | null>(null);
+  React.useEffect(() => {
+    setRole(getStoredUser()?.role ?? null);
+  }, []);
+  const isAdmin = role === "ADMIN";
 
   React.useEffect(() => {
     if (!getToken()) {
@@ -115,6 +139,38 @@ export default function MarksheetPage() {
             Back to exams
           </Link>
           <div className="flex items-center gap-2">
+            {/* Admin-only marks-publication toggle. Hidden for
+                non-ADMINs entirely so the surface stays uncluttered.
+                The backend is the authoritative guard — even if a
+                non-ADMIN reached this button via DOM mutation, the
+                ADMIN-only @Roles guard on /exams/:id/lock would
+                reject the call. */}
+            {isAdmin && (
+              <button
+                type="button"
+                onClick={() => setPendingToggle(!data.examLocked)}
+                disabled={mutating}
+                title={
+                  data.examLocked
+                    ? "Unlock marks for this exam — admins only"
+                    : "Lock marks for this exam — admins only"
+                }
+                className={cn(
+                  "inline-flex items-center gap-1.5 rounded-md border bg-surface px-3.5 py-2 text-sm font-medium shadow-xs active:scale-[0.98] transition-all",
+                  data.examLocked
+                    ? "border-amber-300 text-amber-700 hover:bg-amber-50"
+                    : "border-border text-foreground hover:border-primary/40 hover:text-primary",
+                  mutating && "opacity-60 cursor-not-allowed",
+                )}
+              >
+                {data.examLocked ? (
+                  <Unlock className="h-4 w-4" />
+                ) : (
+                  <Lock className="h-4 w-4" />
+                )}
+                {data.examLocked ? "Unlock marks" : "Lock marks"}
+              </button>
+            )}
             <button
               type="button"
               onClick={() => window.print()}
@@ -135,12 +191,95 @@ export default function MarksheetPage() {
           </div>
         </div>
 
+        {/*
+         * Lock / unlock confirmation. Lock is a simple-confirm flow
+         * (medium-risk per Rule 4 — operator may need to re-publish
+         * after a typo correction). Unlock is similarly simple-confirm
+         * — the audit trail records both transitions, so accidental
+         * unlock is recoverable by re-locking.
+         */}
+        <ConfirmDestructiveActionDialog
+          open={pendingToggle !== null}
+          title={
+            pendingToggle
+              ? "Lock marks for this exam?"
+              : "Unlock marks for this exam?"
+          }
+          description={
+            pendingToggle ? (
+              <>
+                After this lands, every marks-edit endpoint will reject
+                with HTTP 423 LOCKED until you unlock the exam. The
+                action is logged with your name and timestamp on the
+                platform audit trail.
+              </>
+            ) : (
+              <>
+                Re-enables marks edits for{" "}
+                <span className="font-medium text-foreground">
+                  {data.examName}
+                </span>
+                . Subsequent edits flow through the existing audit path.
+              </>
+            )
+          }
+          confirmLabel={pendingToggle ? "Lock marks" : "Unlock marks"}
+          isPending={mutating}
+          onCancel={() => setPendingToggle(null)}
+          onConfirm={async () => {
+            const target = pendingToggle;
+            if (target === null) return;
+            setMutating(true);
+            try {
+              if (target) {
+                await examsApi.lock(data.examId);
+                toast.success(`Marks locked for ${data.examName}`);
+              } else {
+                await examsApi.unlock(data.examId);
+                toast.success(`Marks unlocked for ${data.examName}`);
+              }
+              // Refetch the marksheet so the badge + header reflect
+              // the new state immediately. Cheaper than re-mounting
+              // the route.
+              const fresh = await marksheetApi.get(
+                data.examId,
+                data.studentId,
+              );
+              setData(fresh);
+            } catch (err) {
+              toast.error(
+                err instanceof ApiError
+                  ? err.message
+                  : "Failed to update lock state.",
+              );
+            } finally {
+              setMutating(false);
+              setPendingToggle(null);
+            }
+          }}
+        />
+
         {/* The sheet */}
         <article className="marksheet mx-auto max-w-[820px] bg-white shadow-sm print:shadow-none border border-slate-300 text-slate-900">
           <Header data={data} />
           <Body data={data} />
           <Footer data={data} />
         </article>
+
+        {/* Entity history — chronological audit timeline scoped to
+            THIS exam. Filtered by `targetType: 'Exam'` + the exam id
+            so only the lock/unlock / marks-publication events for
+            this specific exam appear. ADMIN/STAFF only — the panel
+            hides itself silently for other roles via 403 handling. */}
+        <div className="no-print mx-auto mt-6 max-w-[820px] px-6">
+          <RecentActivityPanel
+            title="Exam activity"
+            filters={{ targetType: "Exam", targetId: data.examId }}
+            limit={20}
+            expanded
+            collapsible
+          />
+        </div>
       </div>
     </>
   );
@@ -212,6 +351,27 @@ function Header({ data }: { data: Marksheet }) {
           <span className="mt-0.5 block text-[11px] text-slate-500">
             {examDate}
           </span>
+          {/* Lock badge — surfaces the publication state next to the
+              exam name so it's visible on the printable artifact too.
+              Backend is the authoritative guard; this is display-only. */}
+          {data.examLocked && (
+            <span className="mt-1 inline-flex items-center gap-2">
+              <LockedBadge
+                tone="amber"
+                size="sm"
+                label="Marks locked"
+                tooltip="Marks are published — edits are server-blocked until an admin unlocks the exam."
+              />
+              {data.examLockedAt && (
+                <AuditStamp
+                  at={data.examLockedAt}
+                  action="locked"
+                  tone="warning"
+                  className="text-slate-700"
+                />
+              )}
+            </span>
+          )}
         </InfoField>
       </div>
     </header>

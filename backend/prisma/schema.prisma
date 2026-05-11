@@ -96,6 +96,20 @@ enum PlatformAuditAction {
   /// undo by hand. `after.entryCount` records how many students
   /// were affected.
   ATTENDANCE_BULK_OVERWRITE
+  /// Student soft-archived. The row stays in the DB (preserves
+  /// foreign-key history on attendance / results / payments) but is
+  /// hidden from default listings. `after.archiveReason` records the
+  /// free-form reason captured in the dialog.
+  STUDENT_ARCHIVED
+  /// Student restored from the archive — re-enters default listings.
+  /// `before.archiveReason` preserves the historical reason.
+  STUDENT_RESTORED
+  /// Exam soft-archived. Same semantics as STUDENT_ARCHIVED: rows
+  /// remain (Result history is preserved) but the exam no longer
+  /// appears in default lists or pickers.
+  EXAM_ARCHIVED
+  /// Exam restored from the archive.
+  EXAM_RESTORED
 }
 
 /// Subscription plan tiers (Phase 4). Real billing integration is
@@ -1064,6 +1078,14 @@ enum PaymentStatus {
 model PlatformAuditEvent {
   id            String              @id @default(uuid()) @db.Uuid
   action        PlatformAuditAction
+  /// Tenant scope, denormalized for the school-side audit feed.
+  /// Populated whenever the action pertains to a specific school —
+  /// SCHOOL_CODE_ASSIGNED, MARKS_LOCKED, ATTENDANCE_BULK_OVERWRITE, …
+  /// Nullable for actions that don't have a school anchor (e.g.
+  /// future platform-only events). The Operations Center continues
+  /// to query without this filter; school admins query WITH it via
+  /// `/audit/recent`.
+  schoolId      String?             @db.Uuid
   /// User who performed the action — typically a SUPER_ADMIN. Email
   /// + role are denormalized snapshots so deleting/renaming the
   /// actor later doesn't rewrite history.
@@ -1100,6 +1122,11 @@ model PlatformAuditEvent {
   @@index([targetType, targetId])
   @@index([createdAt(sort: Desc)])
   @@index([correlationId])
+  /// Composite for the school-side audit feed — newest-first per
+  /// tenant. The query at /audit/recent always passes (schoolId)
+  /// + ORDER BY createdAt DESC LIMIT N, so this index serves it in
+  /// one btree scan.
+  @@index([schoolId, createdAt(sort: Desc)])
   @@map("platform_audit_events")
 }
 

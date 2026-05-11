@@ -39,6 +39,14 @@ export interface AuditRecordInput {
   action: PlatformAuditAction;
   actor: AuditActor;
   target: AuditTarget;
+  /**
+   * Tenant scope, denormalized onto the audit row for the school-side
+   * activity feed at /audit/recent. Optional: omit only for
+   * genuinely platform-only events with no school anchor. When
+   * omitted, the service falls back to the actor's `schoolId` so
+   * legacy / lazy call sites still produce tenant-attributed rows.
+   */
+  schoolId?: string | null;
   /** JSON-serialisable slice of the target before the change. */
   before?: unknown;
   /** JSON-serialisable slice of the target after the change. */
@@ -51,6 +59,7 @@ export interface AuditRecordInput {
 export interface PlatformAuditRow {
   id: string;
   action: PlatformAuditAction;
+  schoolId: string | null;
   actorUserId: string;
   actorEmail: string | null;
   actorRole: string | null;
@@ -100,9 +109,25 @@ export class PlatformAuditService {
    */
   async record(input: AuditRecordInput): Promise<string | null> {
     try {
+      // Resolve the tenant scope. Explicit `schoolId` on input wins;
+      // otherwise fall back to the actor's school so the school-side
+      // feed still shows actions taken by their own users without
+      // every call site having to remember to pass schoolId. One
+      // extra point-read per audit — cheap and only fires when the
+      // call site didn't supply it.
+      let resolvedSchoolId: string | null = input.schoolId ?? null;
+      if (resolvedSchoolId === null) {
+        const actor = await this.prisma.user.findUnique({
+          where: { id: input.actor.userId },
+          select: { schoolId: true },
+        });
+        resolvedSchoolId = actor?.schoolId ?? null;
+      }
+
       const created = await this.prisma.platformAuditEvent.create({
         data: {
           action: input.action,
+          schoolId: resolvedSchoolId,
           actorUserId: input.actor.userId,
           actorEmail: input.actor.email ?? null,
           actorRole:
@@ -187,25 +212,108 @@ export class PlatformAuditService {
     ]);
 
     return {
-      rows: rows.map((r) => ({
-        id: r.id,
-        action: r.action,
-        actorUserId: r.actorUserId,
-        actorEmail: r.actorEmail,
-        actorRole: r.actorRole,
-        targetType: r.targetType,
-        targetId: r.targetId,
-        targetLabel: r.targetLabel,
-        before: r.before,
-        after: r.after,
-        reason: r.reason,
-        ip: r.ip,
-        userAgent: r.userAgent,
-        createdAt: r.createdAt.toISOString(),
-      })),
+      rows: rows.map((r) => toAuditRow(r)),
       total,
       page,
       pageSize,
     };
   }
+
+  /**
+   * Tenant-scoped audit feed for school admins. Same shape as
+   * `list()` minus the actorUserId filter (school admins don't have
+   * a SUPER_ADMIN-style "who's the actor" picker — they want a
+   * chronological tape of "what happened in MY school"). The
+   * `schoolId` filter is applied unconditionally + indexed —
+   * cross-tenant leakage is structurally impossible.
+   *
+   * Defaults to 20 rows per page (vs the platform feed's 25) — the
+   * school-side panel is a sidebar widget, not a full audit page.
+   */
+  async listForSchool(
+    schoolId: string,
+    query: Omit<PlatformAuditQuery, 'actorUserId'>,
+  ): Promise<PlatformAuditResponse> {
+    const page = Math.max(1, query.page ?? 1);
+    const pageSize = Math.min(100, Math.max(1, query.pageSize ?? 20));
+
+    const where: Prisma.PlatformAuditEventWhereInput = { schoolId };
+    if (query.action) where.action = query.action;
+    if (query.targetType) where.targetType = query.targetType;
+    if (query.targetId) where.targetId = query.targetId;
+    if (query.fromDate || query.toDate) {
+      where.createdAt = {};
+      if (query.fromDate)
+        where.createdAt.gte = new Date(`${query.fromDate}T00:00:00.000Z`);
+      if (query.toDate)
+        where.createdAt.lte = new Date(`${query.toDate}T23:59:59.999Z`);
+    }
+    if (query.q && query.q.trim().length > 0) {
+      const q = query.q.trim();
+      where.OR = [
+        { actorEmail: { contains: q, mode: 'insensitive' } },
+        { targetLabel: { contains: q, mode: 'insensitive' } },
+        { reason: { contains: q, mode: 'insensitive' } },
+      ];
+    }
+
+    const [rows, total] = await this.prisma.$transaction([
+      this.prisma.platformAuditEvent.findMany({
+        where,
+        orderBy: { createdAt: 'desc' },
+        skip: (page - 1) * pageSize,
+        take: pageSize,
+      }),
+      this.prisma.platformAuditEvent.count({ where }),
+    ]);
+
+    return {
+      rows: rows.map((r) => toAuditRow(r)),
+      total,
+      page,
+      pageSize,
+    };
+  }
+}
+
+/**
+ * Shared row-shape mapper used by both list() (SUPER_ADMIN) and
+ * listForSchool() (school ADMIN/STAFF). Keeps both feeds in lockstep
+ * — any future PlatformAuditRow field gets surfaced everywhere at
+ * once.
+ */
+function toAuditRow(r: {
+  id: string;
+  action: PlatformAuditAction;
+  schoolId: string | null;
+  actorUserId: string;
+  actorEmail: string | null;
+  actorRole: string | null;
+  targetType: string;
+  targetId: string;
+  targetLabel: string | null;
+  before: unknown;
+  after: unknown;
+  reason: string | null;
+  ip: string | null;
+  userAgent: string | null;
+  createdAt: Date;
+}): PlatformAuditRow {
+  return {
+    id: r.id,
+    action: r.action,
+    schoolId: r.schoolId,
+    actorUserId: r.actorUserId,
+    actorEmail: r.actorEmail,
+    actorRole: r.actorRole,
+    targetType: r.targetType,
+    targetId: r.targetId,
+    targetLabel: r.targetLabel,
+    before: r.before,
+    after: r.after,
+    reason: r.reason,
+    ip: r.ip,
+    userAgent: r.userAgent,
+    createdAt: r.createdAt.toISOString(),
+  };
 }

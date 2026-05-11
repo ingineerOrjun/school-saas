@@ -35,6 +35,7 @@ import { syncNow } from "@/lib/sync-engine";
 import { useOnlineStatus } from "@/hooks/useOnlineStatus";
 import { useIsMobile } from "@/hooks/useMediaQuery";
 import { Button } from "@/components/ui/Button";
+import { ConfirmDestructiveActionDialog } from "@/components/ui/ConfirmDestructiveActionDialog";
 import { Skeleton } from "@/components/ui/Skeleton";
 import { EmptyState } from "@/components/ui/EmptyState";
 import { DualDate } from "@/components/calendar/DualDate";
@@ -209,6 +210,13 @@ export default function AttendancePage() {
   const [savingIds, setSavingIds] = React.useState<Set<string>>(
     () => new Set(),
   );
+  // Pending bulk overwrite. When non-null, the confirmation dialog
+  // is open and `markAll` will fire on confirm. Per Phase
+  // data-integrity Rule 4, bulk attendance overwrite is high-risk
+  // (touches every student in scope, hard to undo by hand) and
+  // requires a typed confirmation before the write proceeds.
+  const [pendingBulk, setPendingBulk] =
+    React.useState<AttendanceStatus | null>(null);
 
   // Load classes only — assignments now flow through the React Query
   // cache via `useMyTeachingAssignments()` above. The two used to be
@@ -615,7 +623,7 @@ export default function AttendancePage() {
             <Button
               variant="outline"
               size="md"
-              onClick={() => markAll("PRESENT")}
+              onClick={() => setPendingBulk("PRESENT")}
               leftIcon={<Check className="h-4 w-4" />}
             >
               Mark all present
@@ -623,7 +631,7 @@ export default function AttendancePage() {
             <Button
               variant="outline"
               size="md"
-              onClick={() => markAll("ABSENT")}
+              onClick={() => setPendingBulk("ABSENT")}
               leftIcon={<X className="h-4 w-4" />}
             >
               Mark all absent
@@ -631,6 +639,51 @@ export default function AttendancePage() {
           </div>
         )}
       </div>
+
+      {/* Bulk-overwrite confirmation. Typed confirmation required —
+          this writes a row for every student in the current roster
+          and emits a platform audit event (ATTENDANCE_BULK_OVERWRITE)
+          on the backend. The pendingBulk state stays set until the
+          mutation finishes, so a double-click during the write is a
+          no-op (the dialog stays open with the spinner). */}
+      <ConfirmDestructiveActionDialog
+        open={pendingBulk !== null}
+        title={
+          pendingBulk === "PRESENT"
+            ? "Mark every student PRESENT?"
+            : pendingBulk === "ABSENT"
+              ? "Mark every student ABSENT?"
+              : ""
+        }
+        description={
+          <>
+            This will overwrite today's attendance for{" "}
+            <span className="font-medium text-foreground">
+              {roster?.length ?? 0} student
+              {roster && roster.length === 1 ? "" : "s"}
+            </span>{" "}
+            in the selected class — including any individual marks
+            already toggled. The action is logged to the platform
+            audit trail with your name and timestamp.
+          </>
+        }
+        typedConfirmation={{
+          label: 'Type "OVERWRITE" to confirm',
+          expectedValue: "OVERWRITE",
+        }}
+        confirmLabel={
+          pendingBulk === "PRESENT" ? "Mark all present" : "Mark all absent"
+        }
+        isPending={savingIds.size > 0}
+        onCancel={() => setPendingBulk(null)}
+        onConfirm={() => {
+          if (pendingBulk) {
+            const status = pendingBulk;
+            setPendingBulk(null);
+            void markAll(status);
+          }
+        }}
+      />
 
       {/* No classes yet — prompt to create one */}
       {noClasses && (

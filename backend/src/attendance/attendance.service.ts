@@ -5,11 +5,25 @@ import {
   Logger,
   NotFoundException,
 } from '@nestjs/common';
-import { AttendanceStatus, Prisma } from '@prisma/client';
+import { AttendanceStatus, PlatformAuditAction, Prisma } from '@prisma/client';
 import { AcademicSessionService } from '../academic-session/academic-session.service';
 import { PrismaService } from '../database/prisma.service';
+import { PlatformAuditService } from '../platform/platform-audit.service';
 import { MarkAttendanceDto } from './dto/mark-attendance.dto';
 import { ReportQueryDto } from './dto/report-query.dto';
+
+/**
+ * Threshold for ATTENDANCE_BULK_OVERWRITE audit emit. A single
+ * mark() call writing this many or more rows is treated as a bulk
+ * operation (markAll-present / markAll-absent flows on the
+ * attendance page) and gets an audit event so a "the whole class
+ * was marked at 9:02 AM by Y" line is recoverable.
+ *
+ * Single toggles stay below the threshold and don't audit — the
+ * platform audit stream would otherwise flood with one entry per
+ * checkbox click.
+ */
+const ATTENDANCE_BULK_THRESHOLD = 5;
 
 export interface AttendanceRoster {
   studentId: string;
@@ -132,6 +146,7 @@ export class AttendanceService {
   constructor(
     private readonly prisma: PrismaService,
     private readonly sessions: AcademicSessionService,
+    private readonly audit: PlatformAuditService,
   ) {}
 
   /**
@@ -258,6 +273,20 @@ export class AttendanceService {
     schoolId: string,
     lastKnownVersion?: string,
     deviceId?: string,
+    /**
+     * Actor context — passed by the controller so the bulk-overwrite
+     * audit row can record who triggered the mass mark. Optional
+     * because legacy callers (offline-replay, etc.) may not have it;
+     * the audit emit is gated on `actor != null` so missing context
+     * silently skips the audit rather than crashing.
+     */
+    actor?: {
+      userId: string;
+      email?: string | null;
+      role?: string | null;
+      ip?: string | null;
+      userAgent?: string | null;
+    },
   ): Promise<{ marked: number; date: string }> {
     const date = parseDate(dto.date);
     const studentIds = [...new Set(dto.entries.map((e) => e.studentId))];
@@ -335,6 +364,54 @@ export class AttendanceService {
         deviceId ? `Device-${deviceId.replace(/-/g, '').slice(0, 8)}` : '(unknown)'
       } · schoolId=${schoolId}`,
     );
+
+    // ATTENDANCE_BULK_OVERWRITE — fires whenever a single mark()
+    // call writes ATTENDANCE_BULK_THRESHOLD or more rows. Single
+    // toggles stay below the line and DON'T audit (would drown
+    // the platform stream). Best-effort: a failed audit emit
+    // never rolls back the attendance write itself.
+    if (actor && results.length >= ATTENDANCE_BULK_THRESHOLD) {
+      void this.audit
+        .record({
+          action: PlatformAuditAction.ATTENDANCE_BULK_OVERWRITE,
+          // Tenant scope — surfaces on the school-side audit feed
+          // even when an admin from a parent platform context
+          // triggers it.
+          schoolId,
+          actor: {
+            userId: actor.userId,
+            email: actor.email,
+            role: actor.role,
+          },
+          target: {
+            type: 'Attendance',
+            // No single attendance row to point at — use the date
+            // string as the stable per-day identifier so the
+            // audit timeline shows one row per day.
+            id: dto.date,
+            label: `Attendance ${dto.date}`,
+          },
+          before: null,
+          after: {
+            date: dto.date,
+            entryCount: results.length,
+            // Mode is informational — most bulk writes are all-
+            // present or all-absent, but a heterogeneous bulk is
+            // legal too (e.g., "mark all then individually
+            // toggle a few absent before saving").
+            allSameStatus: areAllSameStatus(dto.entries),
+          },
+          ip: actor.ip,
+          userAgent: actor.userAgent,
+        })
+        .catch((err) => {
+          this.logger.error(
+            `[audit] ATTENDANCE_BULK_OVERWRITE failed for ${dto.date}: ${
+              err instanceof Error ? err.message : String(err)
+            }`,
+          );
+        });
+    }
 
     return { marked: results.length, date: dto.date };
   }
@@ -871,4 +948,21 @@ function computeRosterVersion(
     if (s.updatedAt > latest) latest = s.updatedAt;
   }
   return latest.toISOString();
+}
+
+/**
+ * Tiny helper — returns true when every entry in the bulk write
+ * carries the same status (pure mark-all-present / mark-all-absent).
+ * Recorded on the audit row so the operator can tell at a glance
+ * whether a 30-row write was uniform or a heterogeneous bulk.
+ */
+function areAllSameStatus(
+  entries: ReadonlyArray<{ status: AttendanceStatus }>,
+): boolean {
+  if (entries.length <= 1) return true;
+  const first = entries[0].status;
+  for (let i = 1; i < entries.length; i++) {
+    if (entries[i].status !== first) return false;
+  }
+  return true;
 }

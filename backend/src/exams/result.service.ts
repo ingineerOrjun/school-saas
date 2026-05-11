@@ -171,6 +171,14 @@ export interface Marksheet extends StudentReport {
   examCreatedAt: string;
   /** ISO timestamp when this marksheet was generated (useful for footers). */
   generatedAt: string;
+  /**
+   * Marks-publication lock state. Surfaced so the marksheet header
+   * can render the LockedBadge without a follow-up exam fetch. The
+   * backend lock check on writes is the authoritative guard — these
+   * fields are display-only.
+   */
+  examLocked: boolean;
+  examLockedAt: string | null;
 }
 
 @Injectable()
@@ -196,11 +204,14 @@ export class ResultService {
     schoolId: string,
     userId: string,
   ): Promise<StudentReport> {
-    // Tenant guards.
-    const exam = await this.exams.assertInSchool(dto.examId, schoolId);
-    // Lock guard — once a session is locked, marks updates are
-    // frozen even if there's a different active session. The exam
-    // remains in its original session for life.
+    // Tenant guard + exam-level lock guard. assertEditable rejects
+    // with HTTP 423 LOCKED if the admin has published this exam,
+    // which is the server-side enforcement point for Phase
+    // data-integrity Rule 1.
+    const exam = await this.exams.assertEditable(dto.examId, schoolId);
+    // Session lock guard — once a session is locked, marks updates
+    // are frozen even if there's a different active session. The
+    // exam remains in its original session for life.
     await this.sessions.assertSessionUnlocked(exam.sessionId);
 
     const student = await this.prisma.student.findFirst({
@@ -351,8 +362,9 @@ export class ResultService {
     schoolId: string,
     userId: string,
   ): Promise<{ successCount: number }> {
-    // 1. Tenant guards.
-    const exam = await this.exams.assertInSchool(dto.examId, schoolId);
+    // 1. Tenant guard + exam-level lock guard. 423 LOCKED when the
+    //    admin has published this exam.
+    const exam = await this.exams.assertEditable(dto.examId, schoolId);
     // Same lock guard as the per-row save above — see comment there.
     await this.sessions.assertSessionUnlocked(exam.sessionId);
 
@@ -703,8 +715,9 @@ export class ResultService {
     schoolId: string,
     userId: string,
   ): Promise<{ success: true; updatedCount: number }> {
-    // 1. Tenant guards.
-    const exam = await this.exams.assertInSchool(dto.examId, schoolId);
+    // 1. Tenant guard + exam-level lock guard. 423 LOCKED when the
+    //    admin has published this exam.
+    const exam = await this.exams.assertEditable(dto.examId, schoolId);
     await this.sessions.assertSessionUnlocked(exam.sessionId);
 
     const klass = await this.prisma.class.findFirst({
@@ -1016,6 +1029,8 @@ export class ResultService {
       studentSection,
       examCreatedAt: exam.createdAt.toISOString(),
       generatedAt: new Date().toISOString(),
+      examLocked: exam.locked,
+      examLockedAt: exam.lockedAt ? exam.lockedAt.toISOString() : null,
     };
   }
 
