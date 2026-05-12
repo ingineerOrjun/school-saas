@@ -130,6 +130,21 @@ export default function PlatformSchoolsPage() {
     fetchData();
   }, [fetchData]);
 
+  // Refresh button debounce — prevents click-spam at the source instead
+  // of letting the global throttler 429 the requests after the fact.
+  // The 1-second floor re-enables the button even on error, so a single
+  // failing refetch doesn't permanently disable the button.
+  const [refreshing, setRefreshing] = React.useState(false);
+  const handleRefresh = async () => {
+    if (refreshing) return;
+    setRefreshing(true);
+    try {
+      await fetchData();
+    } finally {
+      setTimeout(() => setRefreshing(false), 1000);
+    }
+  };
+
   const handleStatusChange = (
     school: PlatformSchoolRow,
     nextStatus: SchoolStatus,
@@ -146,12 +161,14 @@ export default function PlatformSchoolsPage() {
         actions={
           <button
             type="button"
-            onClick={fetchData}
-            disabled={loading}
+            onClick={handleRefresh}
+            disabled={refreshing}
             className="inline-flex h-9 items-center gap-1.5 rounded-md border border-slate-200 bg-white px-3 text-sm font-medium text-slate-700 hover:bg-slate-50 disabled:opacity-50"
           >
-            <RotateCw className="h-3.5 w-3.5" />
-            Refresh
+            <RotateCw
+              className={`h-3.5 w-3.5 ${refreshing ? "animate-spin" : ""}`}
+            />
+            {refreshing ? "Refreshing…" : "Refresh"}
           </button>
         }
       />

@@ -8,6 +8,7 @@ import {
   recordTransactionFailure,
   recordTransactionRetry,
 } from './tx-telemetry';
+import { recordRollingEvent } from './tx-rolling-window';
 
 // ============================================================================
 // txWithRetry — deadlock-safe transaction wrapper.
@@ -149,9 +150,20 @@ export async function txWithRetry<T>(
         // Final failure path. Classify + record exactly once per
         // terminating transaction. Retry-exhaustion gets its own
         // counter on top of the failure class.
-        recordTransactionFailure(label, classifyTransactionError(err));
+        const reason = classifyTransactionError(err);
+        recordTransactionFailure(label, reason);
+        // Phase RELIABILITY-III Part 7: rolling-window snapshot for
+        // the operations cockpit. Records only the operationally
+        // interesting classes — `other` and `p2025` don't move the
+        // rolling rates we care about.
+        if (reason === 'validation') {
+          recordRollingEvent(label, 'validation_fail');
+        } else if (reason === 'p2002') {
+          recordRollingEvent(label, 'conflict_fail');
+        }
         if (isTransientPrismaError(err) && attempt >= maxAttempts) {
           recordTransactionExhausted(label);
+          recordRollingEvent(label, 'exhausted');
         }
         if (attempt > 1 && process.env.NODE_ENV !== 'production') {
           logger.warn(
@@ -165,6 +177,7 @@ export async function txWithRetry<T>(
 
       // Transient — about to retry. Count it.
       recordTransactionRetry(label);
+      recordRollingEvent(label, 'retry');
 
       // Backoff with jitter ±25%, capped at maxBackoffMs.
       const base = Math.min(

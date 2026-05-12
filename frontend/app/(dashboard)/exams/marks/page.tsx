@@ -34,6 +34,9 @@ import {
 } from "@/lib/teaching-assignments";
 import { Button } from "@/components/ui/Button";
 import { Skeleton } from "@/components/ui/Skeleton";
+import { LockedBadge } from "@/components/ui/LockedBadge";
+import { ArchivedBadge } from "@/components/ui/StatusBadges";
+import { AuditStamp } from "@/components/ui/AuditStamp";
 import { cn } from "@/lib/utils";
 
 // Sentinel for "Whole class (no section)" in the section dropdown.
@@ -548,6 +551,16 @@ function BulkEntry() {
 
       {!roster && !rosterLoading && !rosterError && <SelectionEmptyState />}
       {rosterLoading && <GridSkeleton />}
+
+      {/* Phase RELIABILITY-III Part 5 — operator trust strip on the
+          marks-entry toolbar. Surfaces the exam's lock + archive
+          state BEFORE the operator types anything, so the inevitable
+          backend 423/409 doesn't waste typing. Hidden when no exam
+          is selected or when neither flag is set. */}
+      {selectedExam && (selectedExam.locked || selectedExam.archivedAt) && (
+        <ExamStateBanner exam={selectedExam} />
+      )}
+
       {roster && !rosterLoading && (
         <Grid
           roster={roster}
@@ -1086,6 +1099,59 @@ function NoAssignmentEmptyState() {
         and subject you need to grade. Once they assign you, this page
         will load the roster automatically.
       </p>
+    </div>
+  );
+}
+
+/**
+ * Phase RELIABILITY-III Part 5 — exam-state trust banner.
+ *
+ * Rendered on the marks-entry page WHENEVER the selected exam is
+ * locked or archived. Reuses the existing badge primitives so the
+ * operator sees the same visual language they're used to on the
+ * marksheet, exam pickers, and student rows.
+ *
+ * Why above the grid (not inside the SelectorBar):
+ *   • The grid renders ONLY after the operator clicks Load students;
+ *     a banner inside the selector would clutter the "nothing
+ *     loaded yet" state too.
+ *   • Placing it directly above the grid means the operator sees
+ *     "this exam is locked" right next to the input column they're
+ *     about to type into. Maximum hit-rate, minimum surprise.
+ */
+function ExamStateBanner({ exam }: { exam: ExamDto }) {
+  const isArchived = !!exam.archivedAt;
+  const isLocked = !!exam.locked;
+  // Choose the dominant tone: archive is the more "operator must
+  // restore before doing anything else" state, so it takes priority.
+  const tone = isArchived ? 'rose' : 'amber';
+  const toneClass =
+    tone === 'rose'
+      ? 'border-rose-300/50 bg-rose-50/60 dark:border-rose-500/30 dark:bg-rose-500/5'
+      : 'border-amber-300/50 bg-amber-50/60 dark:border-amber-500/30 dark:bg-amber-500/5';
+  return (
+    <div
+      className={cn(
+        'flex flex-wrap items-center gap-3 rounded-md border px-3 py-2 text-xs',
+        toneClass,
+      )}
+    >
+      {isArchived && (
+        <ArchivedBadge archivedAt={exam.archivedAt} reason={exam.archiveReason} />
+      )}
+      {isLocked && (
+        <LockedBadge
+          tooltip="Marks edits will reject with HTTP 423 until an admin unlocks the exam."
+        />
+      )}
+      {isLocked && exam.lockedAt && (
+        <AuditStamp action="Locked" at={exam.lockedAt} tone="warning" />
+      )}
+      <span className="text-foreground">
+        {isArchived
+          ? 'This exam is archived. Restore it before editing marks.'
+          : 'This exam is locked. Marks edits will reject with 423 until an admin unlocks.'}
+      </span>
     </div>
   );
 }

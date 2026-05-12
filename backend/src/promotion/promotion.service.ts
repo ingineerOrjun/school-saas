@@ -107,7 +107,10 @@ export class PromotionService {
     // ----- Preconditions -----
     const active = await this.sessions.getActive(schoolId);
     if (!active) {
-      throw new BadRequestException('No active academic session');
+      // Phase RELIABILITY-III Part 6 — what/why/next-step copy.
+      throw new BadRequestException(
+        'No active academic session. Create or activate a session in /settings/sessions before running promotion.',
+      );
     }
     if (!active.isLocked) {
       throw new BadRequestException(
@@ -130,7 +133,7 @@ export class PromotionService {
     const studentIds = dto.entries.map((e) => e.studentId);
     if (new Set(studentIds).size !== studentIds.length) {
       throw new BadRequestException(
-        'Duplicate studentId entries in the promotion payload.',
+        'The promotion payload lists the same student more than once. Re-run the preview, fix the duplicate, then submit again.',
       );
     }
 

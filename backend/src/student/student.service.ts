@@ -461,11 +461,14 @@ export class StudentService {
         ((Array.isArray(target) && target.includes('registrationNumber')) ||
           (typeof target === 'string' &&
             target.includes('registrationNumber')));
+      // Phase RELIABILITY-III Part 6 — operator-actionable copy.
+      // Each branch tells the operator WHAT failed, WHY (root cause),
+      // and WHAT to do next. Matches FAILURE_COPY_REFERENCE.md.
       const reason = isRegNumberCollision
-        ? 'A registration number collided during commit. Please retry.'
+        ? 'Two simultaneous imports tried to claim the same registration number. Wait 5 seconds and re-submit this batch — the retry will succeed.'
         : isUniqueViolation
-          ? 'A symbol number collided during commit. Please retry.'
-          : 'Database transaction failed; no rows were imported.';
+          ? 'A symbol number in this batch collides with an existing student in your school. Edit the CSV to remove or replace the duplicate symbol number, then re-submit.'
+          : 'No rows were imported — the transaction rolled back. Check your CSV for invalid dates, blank required fields, or unknown classes, then re-submit.';
       for (const r of candidates) {
         failed.push({ rowIndex: r.idx, reason });
       }
@@ -807,7 +810,11 @@ export class StudentService {
         'That user is already linked to another student.',
       );
     }
-    return new ConflictException('Conflict with an existing record.');
+    // Phase RELIABILITY-III Part 6 — generic fallback now points the
+    // operator at the audit feed instead of leaving them stranded.
+    return new ConflictException(
+      'This change conflicts with an existing record. Open /audit/recent to see what else changed recently, then retry with corrected values.',
+    );
   }
 
   /**

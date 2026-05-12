@@ -25,6 +25,7 @@ import { formatDual } from "@/lib/date";
 import { amountInWords } from "@/lib/amount-in-words";
 import { formatCurrency } from "@/lib/currency";
 import { RefundPaymentDialog } from "@/components/fees/RefundPaymentDialog";
+import { AuditStamp } from "@/components/ui/AuditStamp";
 
 // ---------------------------------------------------------------------------
 // Production fee receipt
@@ -280,6 +281,29 @@ export default function ReceiptPage() {
               Print
             </button>
           </div>
+        </div>
+
+        {/* Phase RELIABILITY-III Part 5 — trust strip.
+            Operator-facing "this is an immutable financial record"
+            indicator + who/when stamps. Hidden on print (the receipt
+            already carries its own "Received by" line). */}
+        <div className="no-print mx-auto mb-4 flex max-w-[780px] flex-wrap items-center gap-3 rounded-md border border-border/60 bg-surface/60 px-4 py-2 text-xs">
+          <span className="inline-flex items-center gap-1.5 font-medium text-foreground">
+            <span className="h-1.5 w-1.5 rounded-full bg-emerald-500" aria-hidden />
+            Immutable financial record
+          </span>
+          {data.cashier && (
+            <AuditStamp
+              action="Recorded"
+              actor={data.cashier.email}
+              at={data.recordedAt}
+            />
+          )}
+          {data.isRefund && (
+            <span className="inline-flex items-center rounded-full bg-amber-100 px-2 py-0.5 text-[10px] font-semibold uppercase tracking-wider text-amber-800 ring-1 ring-amber-300/60 dark:bg-amber-500/15 dark:text-amber-300 dark:ring-amber-500/30">
+              Refund slip
+            </span>
+          )}
         </div>
 
         <article className="receipt relative mx-auto max-w-[780px] bg-white shadow-sm print:shadow-none border border-slate-300 text-slate-900 overflow-hidden">
