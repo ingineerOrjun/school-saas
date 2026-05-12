@@ -41,6 +41,14 @@ export interface StudentDto {
   class: ClassDto | null;
   sectionId: string | null;
   section: StudentSectionDto | null;
+  /**
+   * Phase DATA LIFECYCLE Part 1: soft-delete state. Non-null
+   * `archivedAt` means the row is hidden from default listings and
+   * read-only until restored.
+   */
+  archivedAt: string | null;
+  archivedById: string | null;
+  archiveReason: string | null;
   createdAt: string;
   updatedAt: string;
 }
@@ -82,6 +90,13 @@ export interface ListStudentsFilter {
   classId?: string;
   /** When true, only students without any class assignment are returned. */
   unassigned?: boolean;
+  /**
+   * Phase DATA LIFECYCLE Part 1 archive filter:
+   *   • true        → only archived rows (drives the "Archived" tab)
+   *   • "all"       → both active + archived
+   *   • undefined   → default (active only)
+   */
+  archived?: boolean | "all";
 }
 
 function buildListQuery(filter?: ListStudentsFilter): string {
@@ -89,6 +104,8 @@ function buildListQuery(filter?: ListStudentsFilter): string {
   const params = new URLSearchParams();
   if (filter.unassigned) params.set("unassigned", "1");
   else if (filter.classId) params.set("classId", filter.classId);
+  if (filter.archived === true) params.set("archived", "1");
+  else if (filter.archived === "all") params.set("archived", "all");
   const qs = params.toString();
   return qs ? `?${qs}` : "";
 }
@@ -178,6 +195,21 @@ export const studentsApi = {
     }),
   remove: (id: string) =>
     api<void>(`/students/${id}`, { method: "DELETE" }),
+  /**
+   * Phase DATA LIFECYCLE Part 1+2: soft-archive a student. Reason
+   * surfaces in the audit feed and ArchivedBadge tooltip.
+   * Idempotent on the server.
+   */
+  archive: (id: string, reason?: string) =>
+    api<StudentDto>(`/students/${id}/archive`, {
+      method: "POST",
+      body: JSON.stringify({ reason: reason ?? undefined }),
+    }),
+  /**
+   * Restore a previously archived student. Idempotent on the server.
+   */
+  restore: (id: string) =>
+    api<StudentDto>(`/students/${id}/restore`, { method: "POST" }),
 };
 
 // ---------------------------------------------------------------------------

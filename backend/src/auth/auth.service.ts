@@ -8,6 +8,7 @@ import { JwtService } from '@nestjs/jwt';
 import { PlatformAuditAction, Role, School, User } from '@prisma/client';
 import { randomBytes } from 'crypto';
 import { ConfigService } from '@nestjs/config';
+import { txWithRetry } from '../common/db/tx-retry';
 import { HashingService } from '../common/hashing/hashing.service';
 import { PrismaService } from '../database/prisma.service';
 import { HealthService } from '../health/health.service';
@@ -107,26 +108,36 @@ export class AuthService {
     const { school, user } = await this.schoolCodes.withRetryOnCollision(
       desiredSchoolCode ?? null,
       async (resolvedSchoolCode) => {
-        return this.prisma.$transaction(async (tx) => {
-          const school = await tx.school.create({
-            data: {
-              name: schoolName,
-              slug,
-              schoolCode: resolvedSchoolCode,
-            },
-          });
+        // Phase RELIABILITY Part 1: retry-aware. The outer
+        // withRetryOnCollision already retries P2002 on the school
+        // code; this inner wrapper covers P2034 between row creation
+        // and the unique-index check. Two concurrent registration
+        // attempts on the same code are vanishingly rare in practice
+        // but the retry costs nothing on the happy path.
+        return txWithRetry(
+          this.prisma,
+          async (tx) => {
+            const school = await tx.school.create({
+              data: {
+                name: schoolName,
+                slug,
+                schoolCode: resolvedSchoolCode,
+              },
+            });
 
-          const user = await tx.user.create({
-            data: {
-              email,
-              password: passwordHash,
-              role: Role.ADMIN,
-              schoolId: school.id,
-            },
-          });
+            const user = await tx.user.create({
+              data: {
+                email,
+                password: passwordHash,
+                role: Role.ADMIN,
+                schoolId: school.id,
+              },
+            });
 
-          return { school, user };
-        });
+            return { school, user };
+          },
+          { label: 'register-admin' },
+        );
       },
     );
 

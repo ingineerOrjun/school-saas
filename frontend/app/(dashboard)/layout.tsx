@@ -17,6 +17,11 @@ import { ServiceWorkerRegister } from "@/components/ServiceWorkerRegister";
 import { useQueueAwareBeforeUnload } from "@/hooks/useQueueAwareGuards";
 import { getStoredUser, getToken } from "@/lib/auth";
 import { FeaturesProvider } from "@/lib/features";
+import {
+  startSessionWatchdog,
+  stopSessionWatchdog,
+} from "@/lib/session-watchdog";
+import { toast } from "sonner";
 
 const TOKEN_KEY = "scholaris:token";
 const USER_KEY = "scholaris:user";
@@ -74,6 +79,43 @@ export default function DashboardLayout({
   React.useEffect(() => {
     setMobileOpen(false);
   }, [pathname]);
+
+  // ----- Phase PLATFORM STABILIZATION Part 2 — session watchdog. -----
+  // Starts a low-overhead poll of the JWT `exp` claim + a debounced
+  // online-event listener. Toasts a "session expiring" notice before
+  // the backend 401s; suppresses bursty `online` events from laptop
+  // wake-from-sleep so the React Query refetchOnReconnect path
+  // doesn't fire 20 requests in a row.
+  //
+  // We intentionally DON'T force a redirect here — `lib/api.ts`
+  // already does that on the first 401. This watchdog is purely
+  // UX-smoothing.
+  React.useEffect(() => {
+    if (!authChecked) return;
+    let warned = false;
+    startSessionWatchdog({
+      onSessionExpiring: (msUntilExpiry) => {
+        if (warned) return;
+        warned = true;
+        toast.warning("Your session is about to expire.", {
+          description: `Please save your work — you'll need to log in again in about ${Math.max(
+            1,
+            Math.round(msUntilExpiry / 60_000),
+          )} minute(s).`,
+          duration: 10_000,
+        });
+      },
+      onSessionExpired: () => {
+        // The api layer will redirect on the next 401; we just
+        // surface a soft hint here so the user understands why
+        // requests start failing.
+        toast.error("Your session has expired. Please log in again.", {
+          duration: 8_000,
+        });
+      },
+    });
+    return () => stopSessionWatchdog();
+  }, [authChecked]);
 
   if (!authChecked) {
     return (

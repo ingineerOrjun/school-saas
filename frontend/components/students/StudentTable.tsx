@@ -1,10 +1,11 @@
 "use client";
 
 import * as React from "react";
-import { Edit2, Loader2, Trash2 } from "lucide-react";
+import { Archive, Edit2, Loader2, RefreshCcw } from "lucide-react";
 import type { ClassWithSections } from "@/lib/classes";
 import type { StudentDto } from "@/lib/students";
 import { formatByMode, type CalendarMode } from "@/lib/date";
+import { ArchivedBadge } from "@/components/ui/StatusBadges";
 import { cn } from "@/lib/utils";
 import {
   SectionSelect,
@@ -17,16 +18,32 @@ export interface StudentTableProps {
   students: StudentDto[];
   classes: ClassWithSections[];
   onEdit: (student: StudentDto) => void;
-  onDelete: (student: StudentDto) => void;
+  /**
+   * Phase DATA LIFECYCLE Part 2: replaces `onDelete`. The trash icon
+   * now opens an archive dialog (soft-delete with reason). Hard-delete
+   * is no longer offered for high-risk entities — see retention-policy.md.
+   */
+  onArchive: (student: StudentDto) => void;
+  /**
+   * Phase DATA LIFECYCLE Part 2: row-level restore action. Used in the
+   * archived view to bring a row back into the active roster.
+   */
+  onRestore?: (student: StudentDto) => void;
   onAssignSection: (student: StudentDto, next: Assignment) => void;
   /**
    * When false, the table renders read-only:
-   *   • Actions column (Edit / Delete) is hidden entirely
+   *   • Actions column (Edit / Archive) is hidden entirely
    *   • Inline class/section picker collapses to a static label
    * Defaults to true so existing call sites that don't yet pass this
    * prop keep their current admin-style behavior.
    */
   canModify?: boolean;
+  /**
+   * Phase DATA LIFECYCLE Part 1: when true the table is showing the
+   * Archived tab — the Edit + Archive buttons collapse to a single
+   * Restore button per row, and each row carries the ArchivedBadge.
+   */
+  archivedView?: boolean;
   highlightIds?: Set<string>;
   removingIds?: Set<string>;
   assigningIds?: Set<string>;
@@ -36,9 +53,11 @@ export function StudentTable({
   students,
   classes,
   onEdit,
-  onDelete,
+  onArchive,
+  onRestore,
   onAssignSection,
   canModify = true,
+  archivedView = false,
   highlightIds,
   removingIds,
   assigningIds,
@@ -114,6 +133,18 @@ export function StudentTable({
                               saving...
                             </span>
                           )}
+                          {/* Phase DATA LIFECYCLE Part 1+5: row-level
+                              trust badge — present on any archived
+                              student regardless of which tab is open,
+                              so attendance / payment cross-references
+                              can also surface the state. */}
+                          {student.archivedAt && (
+                            <ArchivedBadge
+                              size="sm"
+                              archivedAt={student.archivedAt}
+                              reason={student.archiveReason}
+                            />
+                          )}
                         </div>
                         <span className="font-mono text-xs text-muted-foreground">
                           #{isPending ? "pending" : student.id.slice(0, 8)}
@@ -163,6 +194,19 @@ export function StudentTable({
                     >
                       {isPending || isAssigning ? (
                         <span className="text-xs text-muted-foreground">--</span>
+                      ) : archivedView ? (
+                        // Phase DATA LIFECYCLE Part 1: archived view —
+                        // single Restore icon replaces Edit + Archive.
+                        // Edit is suppressed because archived rows are
+                        // read-only on the backend (409 Conflict).
+                        <div className="inline-flex items-center gap-1">
+                          <IconButton
+                            label={`Restore ${student.firstName}`}
+                            onClick={() => onRestore?.(student)}
+                          >
+                            <RefreshCcw className="h-4 w-4" />
+                          </IconButton>
+                        </div>
                       ) : (
                         <div className="inline-flex items-center gap-1">
                           <IconButton
@@ -172,11 +216,11 @@ export function StudentTable({
                             <Edit2 className="h-4 w-4" />
                           </IconButton>
                           <IconButton
-                            label={`Delete ${student.firstName}`}
-                            onClick={() => onDelete(student)}
+                            label={`Archive ${student.firstName}`}
+                            onClick={() => onArchive(student)}
                             variant="danger"
                           >
-                            <Trash2 className="h-4 w-4" />
+                            <Archive className="h-4 w-4" />
                           </IconButton>
                         </div>
                       )}

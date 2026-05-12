@@ -82,13 +82,20 @@ export const qk = {
   academicSessions: () => ["academic-sessions"] as const,
 
   // ---- Students (1m — moves with enrollment) ----
-  students: (filters?: { classId?: string; sectionId?: string; q?: string }) =>
+  students: (filters?: {
+    classId?: string;
+    sectionId?: string;
+    q?: string;
+    /** Phase DATA LIFECYCLE Part 1: archived-tab cache slice. */
+    archived?: boolean | "all";
+  }) =>
     [
       "students",
       {
         classId: filters?.classId ?? null,
         sectionId: filters?.sectionId ?? null,
         q: filters?.q ?? "",
+        archived: filters?.archived ?? false,
       },
     ] as const,
   studentDetail: (id: string) => ["students", "detail", id] as const,

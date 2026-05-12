@@ -158,18 +158,30 @@ export class ExamService {
    *   • active session exists   → filter to that session (NULL excluded)
    *   • no active session       → filter to NULL legacy rows
    *
-   * See `AcademicSessionService.resolveReadFilter` for the rule.
+   * Archive filter (Phase DATA LIFECYCLE Part 1):
+   *   • archived === true   → only archived rows (the "Archived" tab)
+   *   • archived === 'all'  → both active + archived
+   *   • undefined (default) → only active rows (`archivedAt: null`)
+   *
+   * See `AcademicSessionService.resolveReadFilter` for the session rule.
    */
   async findAll(
     schoolId: string,
     sessionId?: string,
+    archived?: boolean | 'all',
   ): Promise<ExamWithSubjects[]> {
     const filter = await this.sessions.resolveReadFilter(
       schoolId,
       sessionId,
     );
+    const archivedFilter: Prisma.ExamWhereInput =
+      archived === true
+        ? { archivedAt: { not: null } }
+        : archived === 'all'
+          ? {}
+          : { archivedAt: null };
     return this.prisma.exam.findMany({
-      where: { schoolId, ...filter },
+      where: { schoolId, ...filter, ...archivedFilter },
       include: { subjects: { orderBy: { name: 'asc' } } },
       orderBy: { createdAt: 'desc' },
     });
@@ -381,6 +393,13 @@ export class ExamService {
     userId: string,
   ): Promise<Exam> {
     const existing = await this.assertInSchool(id, schoolId);
+    if (existing.archivedAt) {
+      // Phase DATA LIFECYCLE Part 1: archived exams can't be renamed
+      // or otherwise edited. Restore first.
+      throw new ConflictException(
+        'This exam is archived. Restore it before editing.',
+      );
+    }
     // Lock guard: edits to an exam in a locked session are blocked
     // even when there's a different active session. The exam stays
     // in the year it was created; if that year is locked, the data
@@ -401,9 +420,152 @@ export class ExamService {
     }
   }
 
-  async remove(id: string, schoolId: string): Promise<void> {
-    await this.assertInSchool(id, schoolId);
-    await this.prisma.exam.delete({ where: { id } });
+  /**
+   * Soft-delete an exam.
+   *
+   * Phase DATA LIFECYCLE Part 1+2: hard-delete is no longer offered
+   * for Exam — Result/ResultLedger rows cascade off the exam and would
+   * erase grading history that parents/audit need. This redirects to
+   * `archiveExam()` so the `DELETE /exams/:id` endpoint stays useful
+   * while honouring the soft-delete guarantee.
+   */
+  async remove(
+    id: string,
+    schoolId: string,
+    actor: {
+      userId: string;
+      email?: string | null;
+      role?: string | null;
+      ip?: string | null;
+      userAgent?: string | null;
+    },
+  ): Promise<void> {
+    await this.archiveExam(id, schoolId, actor, null);
+  }
+
+  /**
+   * Archive an exam. Stamps `archivedAt` + `archivedById` + optional
+   * reason and emits EXAM_ARCHIVED with explicit `schoolId`.
+   *
+   * Idempotent: archiving an already-archived exam returns the
+   * existing row with no second audit emit. Mirrors lockExam.
+   *
+   * Locked exams CAN be archived (and archived exams stay locked).
+   * The two flags are orthogonal: lock = "marks frozen, can be
+   * unlocked for edits", archive = "hidden from default listings,
+   * Restore before any edit". Archiving a locked exam is fine — the
+   * data is doubly-protected.
+   */
+  async archiveExam(
+    id: string,
+    schoolId: string,
+    actor: {
+      userId: string;
+      email?: string | null;
+      role?: string | null;
+      ip?: string | null;
+      userAgent?: string | null;
+    },
+    reason: string | null,
+  ): Promise<Exam> {
+    const before = await this.assertInSchool(id, schoolId);
+    if (before.archivedAt) {
+      return before;
+    }
+    const trimmedReason =
+      typeof reason === 'string' && reason.trim().length > 0
+        ? reason.trim().slice(0, 500)
+        : null;
+
+    const updated = await this.prisma.exam.update({
+      where: { id },
+      data: {
+        archivedAt: new Date(),
+        archivedById: actor.userId,
+        archiveReason: trimmedReason,
+      },
+    });
+
+    await this.audit.record({
+      action: PlatformAuditAction.EXAM_ARCHIVED,
+      schoolId,
+      actor: {
+        userId: actor.userId,
+        email: actor.email,
+        role: actor.role,
+      },
+      target: { type: 'Exam', id: updated.id, label: updated.name },
+      before: { archivedAt: null, archivedById: null, archiveReason: null },
+      after: {
+        archivedAt: updated.archivedAt,
+        archivedById: updated.archivedById,
+        archiveReason: updated.archiveReason,
+        examId: updated.id,
+      },
+      reason: trimmedReason,
+      ip: actor.ip,
+      userAgent: actor.userAgent,
+    });
+
+    return updated;
+  }
+
+  /**
+   * Restore a previously archived exam. Clears the archive triplet
+   * and emits EXAM_RESTORED. Idempotent.
+   */
+  async restoreExam(
+    id: string,
+    schoolId: string,
+    actor: {
+      userId: string;
+      email?: string | null;
+      role?: string | null;
+      ip?: string | null;
+      userAgent?: string | null;
+    },
+  ): Promise<Exam> {
+    const before = await this.assertInSchool(id, schoolId);
+    if (!before.archivedAt) {
+      return before;
+    }
+
+    const beforeSnapshot = {
+      archivedAt: before.archivedAt,
+      archivedById: before.archivedById,
+      archiveReason: before.archiveReason,
+    };
+
+    const updated = await this.prisma.exam.update({
+      where: { id },
+      data: {
+        archivedAt: null,
+        archivedById: null,
+        archiveReason: null,
+      },
+    });
+
+    await this.audit.record({
+      action: PlatformAuditAction.EXAM_RESTORED,
+      schoolId,
+      actor: {
+        userId: actor.userId,
+        email: actor.email,
+        role: actor.role,
+      },
+      target: { type: 'Exam', id: updated.id, label: updated.name },
+      before: beforeSnapshot,
+      after: {
+        archivedAt: null,
+        archivedById: null,
+        archiveReason: null,
+        examId: updated.id,
+      },
+      ip: actor.ip,
+      userAgent: actor.userAgent,
+    });
+
+    return updated;
   }
 
   /** Throws 404 if the exam isn't in the caller's school. */
@@ -432,6 +594,23 @@ export class ExamService {
    */
   async assertEditable(id: string, schoolId: string): Promise<Exam> {
     const exam = await this.assertInSchool(id, schoolId);
+    if (exam.archivedAt) {
+      // Phase DATA LIFECYCLE Part 1: archived exams reject every
+      // marks-write path. 409 Conflict (not 423 Locked) — archive is a
+      // different state from lock; the operator should restore first
+      // if they truly want to edit, not "unlock". Frontend surfaces
+      // this with the ArchivedBadge + a "Restore to edit" affordance.
+      throw new HttpException(
+        {
+          statusCode: HttpStatus.CONFLICT,
+          message:
+            'This exam is archived. Restore it before editing marks.',
+          examId: exam.id,
+          archivedAt: exam.archivedAt,
+        },
+        HttpStatus.CONFLICT,
+      );
+    }
     if (exam.locked) {
       // 423 LOCKED — RFC 4918 §11.3. Closest standard code for
       // "the resource is locked against modification."
@@ -508,6 +687,132 @@ export class ExamService {
         lockedAt: updated.lockedAt,
         examId: updated.id,
       },
+      ip: actor.ip,
+      userAgent: actor.userAgent,
+    });
+
+    return updated;
+  }
+
+  /**
+   * Publish an exam — marks become visible to parents. Phase
+   * ACADEMIC TRANSITION SAFETY Part 4. Orthogonal to the lock flag:
+   *   • Publishing a draft exam → state goes Draft → Published.
+   *   • Publishing then locking → state goes Published → Locked, but
+   *     the publishedAt timestamp is preserved.
+   *   • Publishing a locked exam IS allowed (rare but legal) — locking
+   *     freezes edits, it doesn't toggle visibility on its own.
+   *
+   * Idempotent: republishing an already-published exam is a no-op
+   * (same row returned, no audit emit). Mirrors lockExam.
+   */
+  async publishExam(
+    id: string,
+    schoolId: string,
+    actor: {
+      userId: string;
+      email?: string | null;
+      role?: string | null;
+      ip?: string | null;
+      userAgent?: string | null;
+    },
+  ): Promise<Exam> {
+    const before = await this.assertInSchool(id, schoolId);
+    if (before.archivedAt) {
+      // Archived exams can't be re-published — restore first.
+      throw new ConflictException(
+        'This exam is archived. Restore it before publishing.',
+      );
+    }
+    if (before.publishedAt) {
+      // Already published — short-circuit, no audit emit.
+      return before;
+    }
+
+    const updated = await this.prisma.exam.update({
+      where: { id },
+      data: {
+        publishedAt: new Date(),
+        publishedById: actor.userId,
+      },
+    });
+
+    await this.audit.record({
+      action: PlatformAuditAction.MARKS_PUBLISHED,
+      schoolId,
+      actor: {
+        userId: actor.userId,
+        email: actor.email,
+        role: actor.role,
+      },
+      target: { type: 'Exam', id: updated.id, label: updated.name },
+      before: { publishedAt: null, publishedById: null },
+      after: {
+        publishedAt: updated.publishedAt,
+        publishedById: updated.publishedById,
+        examId: updated.id,
+      },
+      ip: actor.ip,
+      userAgent: actor.userAgent,
+    });
+
+    return updated;
+  }
+
+  /**
+   * Unpublish an exam — marks return to Draft state. Useful when an
+   * admin published prematurely and needs to clawback visibility.
+   * Idempotent.
+   *
+   * Rejects locked exams: unpublishing a locked exam would leave it
+   * in an awkward state (frozen + draft) and there's no operator
+   * scenario for that. Unlock first.
+   */
+  async unpublishExam(
+    id: string,
+    schoolId: string,
+    actor: {
+      userId: string;
+      email?: string | null;
+      role?: string | null;
+      ip?: string | null;
+      userAgent?: string | null;
+    },
+  ): Promise<Exam> {
+    const before = await this.assertInSchool(id, schoolId);
+    if (!before.publishedAt) {
+      return before;
+    }
+    if (before.locked) {
+      throw new ConflictException(
+        'This exam is locked. Unlock it before changing publication state.',
+      );
+    }
+
+    const beforeSnapshot = {
+      publishedAt: before.publishedAt,
+      publishedById: before.publishedById,
+    };
+
+    const updated = await this.prisma.exam.update({
+      where: { id },
+      data: {
+        publishedAt: null,
+        publishedById: null,
+      },
+    });
+
+    await this.audit.record({
+      action: PlatformAuditAction.MARKS_UNPUBLISHED,
+      schoolId,
+      actor: {
+        userId: actor.userId,
+        email: actor.email,
+        role: actor.role,
+      },
+      target: { type: 'Exam', id: updated.id, label: updated.name },
+      before: beforeSnapshot,
+      after: { publishedAt: null, publishedById: null, examId: updated.id },
       ip: actor.ip,
       userAgent: actor.userAgent,
     });

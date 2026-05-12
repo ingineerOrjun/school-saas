@@ -5,11 +5,33 @@ import {
   NotFoundException,
 } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
-import { Prisma, Role, StudentSessionStatus } from '@prisma/client';
+import {
+  PlatformAuditAction,
+  Prisma,
+  Role,
+  StudentSessionStatus,
+} from '@prisma/client';
 import { AcademicSessionService } from '../academic-session/academic-session.service';
+import { txWithRetry } from '../common/db/tx-retry';
 import { PrismaService } from '../database/prisma.service';
 import { NotificationService } from '../notifications/notification.service';
+import { PlatformAuditService } from '../platform/platform-audit.service';
 import { RunPromotionDto } from './dto/run-promotion.dto';
+
+/**
+ * Phase ACADEMIC TRANSITION SAFETY Part 6 — actor descriptor for the
+ * promotion run. Captured at the controller boundary (JWT claims +
+ * request headers) and stamped onto every
+ * `StudentAcademicRecord.promotedById` plus the `PROMOTION_EXECUTED`
+ * audit row.
+ */
+export interface PromotionActor {
+  userId: string;
+  email?: string | null;
+  role?: string | null;
+  ip?: string | null;
+  userAgent?: string | null;
+}
 
 /**
  * Result summary returned to the caller after a successful promotion.
@@ -64,12 +86,24 @@ export class PromotionService {
     private readonly sessions: AcademicSessionService,
     private readonly notifications: NotificationService,
     private readonly config: ConfigService,
+    private readonly audit: PlatformAuditService,
   ) {}
 
   async run(
     dto: RunPromotionDto,
     schoolId: string,
+    actor?: PromotionActor,
   ): Promise<PromotionResult> {
+    // ---- DEV warning (Phase ACADEMIC TRANSITION SAFETY Part 8): the
+    // controller path always supplies an actor now. If `run()` is
+    // called from a script / test with no actor, we still execute
+    // for back-compat but log loudly in dev so the call site can
+    // adopt the new signature.
+    if (!actor && process.env.NODE_ENV !== 'production') {
+      this.logger.warn(
+        'PromotionService.run() invoked without an actor — promoted SAR rows will be missing promotedById and the PROMOTION_EXECUTED audit row.',
+      );
+    }
     // ----- Preconditions -----
     const active = await this.sessions.getActive(schoolId);
     if (!active) {
@@ -121,8 +155,11 @@ export class PromotionService {
       where: { id: { in: studentIds }, schoolId },
       select: {
         id: true,
+        firstName: true,
+        lastName: true,
         classId: true,
         sectionId: true,
+        archivedAt: true,
       },
     });
     if (students.length !== studentIds.length) {
@@ -132,6 +169,31 @@ export class PromotionService {
     }
     const studentById = new Map(students.map((s) => [s.id, s]));
 
+    // Phase ACADEMIC TRANSITION SAFETY Part 5+7+8 — block archived
+    // students from being silently swept into a promotion run. The
+    // preview endpoint surfaces this already; here we hard-reject so
+    // a UI that skipped the preview can't backdoor archived rows
+    // into the academic record table.
+    const archivedInPayload = students.filter((s) => s.archivedAt !== null);
+    if (archivedInPayload.length > 0) {
+      const names = archivedInPayload
+        .slice(0, 3)
+        .map((s) => `${s.firstName} ${s.lastName}`.trim())
+        .join(', ');
+      const suffix =
+        archivedInPayload.length > 3
+          ? ` and ${archivedInPayload.length - 3} other(s)`
+          : '';
+      if (process.env.NODE_ENV !== 'production') {
+        this.logger.warn(
+          `Live promotion run included ${archivedInPayload.length} archived student(s). Did the UI skip the preview step?`,
+        );
+      }
+      throw new BadRequestException(
+        `Promotion blocked — archived students cannot be promoted: ${names}${suffix}. Restore them or remove them from the payload first.`,
+      );
+    }
+
     const referencedClassIds = Array.from(
       new Set(
         dto.entries
@@ -140,12 +202,13 @@ export class PromotionService {
       ),
     );
     if (referencedClassIds.length > 0) {
-      const validClasses = await this.prisma.class.count({
+      const validClasses = await this.prisma.class.findMany({
         where: { id: { in: referencedClassIds }, schoolId },
+        select: { id: true, name: true },
       });
-      if (validClasses !== referencedClassIds.length) {
+      if (validClasses.length !== referencedClassIds.length) {
         throw new BadRequestException(
-          'One or more nextClassId values do not belong to this school.',
+          'Promotion blocked — one or more nextClassId values do not belong to this school.',
         );
       }
     }
@@ -196,13 +259,26 @@ export class PromotionService {
     }
 
     // ----- Atomic transaction -----
+    //
+    // Phase RELIABILITY Part 1: wrapped via `txWithRetry` so a
+    // serialization / deadlock (P2034) during concurrent rollover
+    // attempts retries automatically rather than 500ing. The retry
+    // helper preserves the audit emit below and rethrows
+    // non-transient errors unchanged — validation 4xx still surface
+    // to the operator immediately.
     const counts = { promoted: 0, retained: 0, left: 0 };
 
-    const newSession = await this.prisma.$transaction(async (tx) => {
+    const newSession = await txWithRetry(this.prisma, async (tx) => {
       // 1. Snapshot rows (one per student × session). Skip-on-conflict
       //    isn't supported via createMany without `skipDuplicates`,
       //    but we want hard failure on duplicates — better to fail
       //    cleanly than silently skip rows.
+      //
+      // Phase ACADEMIC TRANSITION SAFETY Part 6: also stamp the
+      // promotion-actor + destination class+section snapshots so the
+      // historical row tells the full "promoted from X to Y by Z"
+      // story without joining the live Student table (which may move
+      // again in subsequent runs).
       const snapshotData: Prisma.StudentAcademicRecordCreateManyInput[] =
         dto.entries.map((entry) => {
           const s = studentById.get(entry.studentId)!;
@@ -214,6 +290,15 @@ export class PromotionService {
             sectionId: s.sectionId,
             schoolId,
             status: entry.status,
+            nextClassId:
+              entry.status === StudentSessionStatus.PROMOTED
+                ? entry.nextClassId ?? null
+                : null,
+            nextSectionId:
+              entry.status === StudentSessionStatus.PROMOTED
+                ? entry.nextSectionId ?? null
+                : null,
+            promotedById: actor?.userId ?? null,
           };
         });
       await tx.studentAcademicRecord.createMany({ data: snapshotData });
@@ -266,7 +351,7 @@ export class PromotionService {
           schoolId,
         },
       });
-    });
+    }, { label: 'promote-students', slowMs: 3000 });
 
     const result: PromotionResult = {
       fromSessionId: active.id,
@@ -278,6 +363,37 @@ export class PromotionService {
         total: dto.entries.length,
       },
     };
+
+    // Phase ACADEMIC TRANSITION SAFETY Part 6 — emit the
+    // PROMOTION_EXECUTED audit row. Soft-fail: a failed audit emit
+    // never bubbles an error back through this method (the
+    // PromotionAuditService swallows + logs internally).
+    if (actor) {
+      await this.audit.record({
+        action: PlatformAuditAction.PROMOTION_EXECUTED,
+        schoolId,
+        actor: {
+          userId: actor.userId,
+          email: actor.email,
+          role: actor.role,
+        },
+        target: {
+          type: 'AcademicSession',
+          id: newSession.id,
+          label: `${active.name} → ${newSession.name}`,
+        },
+        before: { activeSessionId: active.id, activeSessionName: active.name },
+        after: {
+          fromSessionId: active.id,
+          fromSessionName: active.name,
+          toSessionId: newSession.id,
+          toSessionName: newSession.name,
+          counts: result.counts,
+        },
+        ip: actor.ip,
+        userAgent: actor.userAgent,
+      });
+    }
 
     // Phase 20 — fire a school-wide in-app notification + email to
     // the school's first ADMIN summarising the promotion. Best-

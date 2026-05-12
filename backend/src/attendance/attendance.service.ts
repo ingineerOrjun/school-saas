@@ -7,6 +7,7 @@ import {
 } from '@nestjs/common';
 import { AttendanceStatus, PlatformAuditAction, Prisma } from '@prisma/client';
 import { AcademicSessionService } from '../academic-session/academic-session.service';
+import { txWithRetry } from '../common/db/tx-retry';
 import { PrismaService } from '../database/prisma.service';
 import { PlatformAuditService } from '../platform/platform-audit.service';
 import { MarkAttendanceDto } from './dto/mark-attendance.dto';
@@ -338,21 +339,37 @@ export class AttendanceService {
     // re-marking a stale day never accidentally moves it forward.
     const sessionId = await this.sessions.requireActiveUnlocked(schoolId);
 
-    const results = await this.prisma.$transaction(
-      dto.entries.map((e) =>
-        this.prisma.attendance.upsert({
-          where: { studentId_date: { studentId: e.studentId, date } },
-          create: {
-            studentId: e.studentId,
-            date,
-            status: e.status,
-            schoolId,
-            sessionId,
-          },
-          update: { status: e.status },
-          select: { id: true },
-        }),
-      ),
+    // Phase RELIABILITY-II Part 2: migrated array-form $transaction
+    // to a callback-form `txWithRetry`. All upserts target the same
+    // model with no inter-operation data flow → sequential for-loop
+    // is semantically equivalent. The retry helper adds P2034
+    // protection during concurrent class-wide attendance edits;
+    // unique-key collisions on `(studentId, date)` are handled by
+    // the upsert itself, so the retry only kicks in on transient
+    // serialization failures. slowMs bumped to 3000 for a 60-student
+    // class write.
+    const results = await txWithRetry(
+      this.prisma,
+      async (tx) => {
+        const out: Array<{ id: string }> = [];
+        for (const e of dto.entries) {
+          const row = await tx.attendance.upsert({
+            where: { studentId_date: { studentId: e.studentId, date } },
+            create: {
+              studentId: e.studentId,
+              date,
+              status: e.status,
+              schoolId,
+              sessionId,
+            },
+            update: { status: e.status },
+            select: { id: true },
+          });
+          out.push(row);
+        }
+        return out;
+      },
+      { label: 'mark-attendance-bulk', slowMs: 3000 },
     );
 
     // Audit log — surfaces the originating device so multi-device

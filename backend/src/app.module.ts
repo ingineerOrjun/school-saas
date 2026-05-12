@@ -14,6 +14,7 @@ import { UserAwareThrottlerGuard } from './common/throttle/user-aware-throttler.
 import { HealthModule } from './health/health.module';
 import { NotificationsModule } from './notifications/notifications.module';
 import { OperationsModule } from './operations/operations.module';
+import { SystemModule } from './system/system.module';
 import { ExperienceModule } from './experience/experience.module';
 import { ProductizationModule } from './productization/productization.module';
 import { SessionsModule } from './sessions/sessions.module';
@@ -196,6 +197,11 @@ import { UserModule } from './user/user.module';
     // (unified /me/search powering the Cmd+K palette). Pure
     // read-side; no new schema, no new dependencies.
     ExperienceModule,
+    // System — Phase PLATFORM STABILIZATION (Parts 4+6+7). School-
+    // admin facing operational health surface (backup freshness +
+    // tenant integrity report). Distinct from OperationsModule
+    // (SUPER_ADMIN cockpit) and HealthModule (unauthenticated probes).
+    SystemModule,
     // Future feature modules will be added here
   ],
   controllers: [],

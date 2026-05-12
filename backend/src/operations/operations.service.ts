@@ -1036,11 +1036,19 @@ function categoryFor(action: PlatformAuditAction): OpsSecurityEvent['category'] 
       return 'ROLE_CHANGE';
     case 'MARKS_LOCKED':
     case 'MARKS_UNLOCKED':
+    case 'MARKS_PUBLISHED':
+    case 'MARKS_UNPUBLISHED':
     case 'ATTENDANCE_BULK_OVERWRITE':
-      // School-side data-integrity actions — bucketed under
-      // ROLE_CHANGE for now since the Operations Center doesn't yet
-      // have a dedicated "data integrity" lane. A follow-up panel
-      // can carve these out into their own category.
+    case 'STUDENT_ARCHIVED':
+    case 'STUDENT_RESTORED':
+    case 'EXAM_ARCHIVED':
+    case 'EXAM_RESTORED':
+    case 'PROMOTION_PREVIEWED':
+    case 'PROMOTION_EXECUTED':
+      // School-side data-integrity + lifecycle actions — bucketed
+      // under ROLE_CHANGE for now since the Operations Center
+      // doesn't yet have a dedicated "data integrity" lane. A
+      // follow-up panel can carve these out into their own category.
       return 'ROLE_CHANGE';
   }
 }
@@ -1097,6 +1105,22 @@ function descriptionFor(r: {
       return `${actor} unlocked marks for ${target}`;
     case 'ATTENDANCE_BULK_OVERWRITE':
       return `${actor} bulk-overwrote attendance for ${target}`;
+    case 'STUDENT_ARCHIVED':
+      return `${actor} archived student ${target}`;
+    case 'STUDENT_RESTORED':
+      return `${actor} restored student ${target}`;
+    case 'EXAM_ARCHIVED':
+      return `${actor} archived exam ${target}`;
+    case 'EXAM_RESTORED':
+      return `${actor} restored exam ${target}`;
+    case 'MARKS_PUBLISHED':
+      return `${actor} published marks for ${target}`;
+    case 'MARKS_UNPUBLISHED':
+      return `${actor} unpublished marks for ${target}`;
+    case 'PROMOTION_PREVIEWED':
+      return `${actor} previewed promotion${target ? ` (${target})` : ''}`;
+    case 'PROMOTION_EXECUTED':
+      return `${actor} executed promotion${target ? ` (${target})` : ''}`;
   }
 }
 

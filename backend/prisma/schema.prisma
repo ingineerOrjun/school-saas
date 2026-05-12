@@ -110,6 +110,25 @@ enum PlatformAuditAction {
   EXAM_ARCHIVED
   /// Exam restored from the archive.
   EXAM_RESTORED
+  /// School ADMIN published an exam — marks become visible on the
+  /// parent-facing marksheet. Orthogonal to the lock flag: a
+  /// published exam can still be unlocked for further edits.
+  /// Phase ACADEMIC TRANSITION SAFETY Part 4 (Draft/Published/Locked).
+  MARKS_PUBLISHED
+  /// School ADMIN unpublished an exam — marks return to draft state
+  /// (parent-facing surfaces hide them again). The marks themselves
+  /// are unchanged; only their visibility flips.
+  MARKS_UNPUBLISHED
+  /// Promotion preview was generated for the school (read-only,
+  /// no rows changed). Logged so audits can answer "did anyone
+  /// review the year-end roll-forward before pulling the trigger?"
+  /// Phase ACADEMIC TRANSITION SAFETY Part 1.
+  PROMOTION_PREVIEWED
+  /// Promotion run executed — full snapshot landed and the school
+  /// rolled into the next session. `after.counts` carries
+  /// promoted/retained/left totals, `after.toSessionId` the new
+  /// session's id. Phase ACADEMIC TRANSITION SAFETY Part 6.
+  PROMOTION_EXECUTED
 }
 
 /// Subscription plan tiers (Phase 4). Real billing integration is
@@ -447,6 +466,12 @@ model User {
   examsCreated        Exam[]         @relation("ExamCreatedBy")
   examsUpdated        Exam[]         @relation("ExamUpdatedBy")
   examsLocked         Exam[]         @relation("ExamLockedBy")
+  examsArchived       Exam[]         @relation("ExamArchivedBy")
+  examsPublished      Exam[]         @relation("ExamPublishedBy")
+  studentsArchived    Student[]      @relation("StudentArchivedBy")
+  /// Phase ACADEMIC TRANSITION SAFETY Part 6 — back-relation for the
+  /// StudentAcademicRecord.promotedById FK. One row per (student, run).
+  promotionsRun       StudentAcademicRecord[] @relation("PromotionRunBy")
   resultsCreated      Result[]       @relation("ResultCreatedBy")
   resultsUpdated      Result[]       @relation("ResultUpdatedBy")
   paymentsCreated     Payment[]      @relation("PaymentCreatedBy")
@@ -551,6 +576,24 @@ model Student {
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
 
+  /// Soft-delete archive fields (Phase data-lifecycle).
+  ///
+  ///   • `archivedAt` is the sentinel — when set, every default
+  ///     listing query filters this row out. The UI's "Archived"
+  ///     tab passes `includeArchived=true` to opt back in.
+  ///   • `archivedById` is the operator who archived for the audit
+  ///     trail (`SetNull` on User delete so audit history survives).
+  ///   • `archiveReason` is the free-form reason captured in the
+  ///     archive dialog. Persisted so the row can answer "why was
+  ///     this archived" without round-tripping to the audit table.
+  ///
+  /// Restoration sets all three back to null (the audit trail
+  /// retains the full lock-then-unlock-then-archive history).
+  archivedAt    DateTime?
+  archivedById  String?    @db.Uuid
+  archivedBy    User?      @relation("StudentArchivedBy", fields: [archivedById], references: [id], onDelete: SetNull)
+  archiveReason String?    @db.VarChar(500)
+
   @@unique([schoolId, symbolNumber])
   @@index([schoolId])
   @@index([classId])
@@ -558,6 +601,8 @@ model Student {
   // Tenant-scoped lookup by registration number — used by the
   // student search endpoint and the global search bar.
   @@index([schoolId, registrationNumber])
+  /// Composite for the default "non-archived first" listing.
+  @@index([schoolId, archivedAt])
   @@map("students")
 }
 
@@ -580,6 +625,9 @@ model Class {
   teachingAssignments TeachingAssignment[]
   feeStructures       FeeStructure[]
   academicRecords     StudentAcademicRecord[]
+  /// Phase ACADEMIC TRANSITION SAFETY Part 6 — back-relation for the
+  /// "promoted into this class" pointer on StudentAcademicRecord.
+  promotionTargets    StudentAcademicRecord[] @relation("PromotionNextClass")
 
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
@@ -602,6 +650,9 @@ model Section {
   // TeachingAssignment.sectionId now.
   teachingAssignments TeachingAssignment[]
   academicRecords     StudentAcademicRecord[]
+  /// Phase ACADEMIC TRANSITION SAFETY Part 6 — back-relation for
+  /// SAR.nextSectionId.
+  promotionTargets    StudentAcademicRecord[] @relation("PromotionNextSection")
 
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
@@ -685,12 +736,42 @@ model Exam {
   lockedById String?   @db.Uuid
   lockedBy   User?     @relation("ExamLockedBy", fields: [lockedById], references: [id], onDelete: SetNull)
 
+  /// Phase ACADEMIC TRANSITION SAFETY Part 4 — publication state.
+  /// `publishedAt` non-null means the exam's marks are visible on
+  /// parent-facing marksheets. Orthogonal to the lock flag: a
+  /// published exam can still be unlocked for edits, and a locked
+  /// exam need not be published (rare but legal). The three
+  /// surfaceable states map as:
+  ///   Draft     — publishedAt IS NULL  AND locked = false
+  ///   Published — publishedAt IS NOT NULL AND locked = false
+  ///   Locked    — locked = true (regardless of publishedAt)
+  /// `publishedById` snapshots the actor for the audit-trail tooltip.
+  publishedAt   DateTime?
+  publishedById String?   @db.Uuid
+  publishedBy   User?     @relation("ExamPublishedBy", fields: [publishedById], references: [id], onDelete: SetNull)
+
+  /// Soft-delete archive fields — same shape and semantics as
+  /// Student.archived* (see comment there). Archived exams are
+  /// hidden from default listings + pickers; the Result rows stay
+  /// in the DB so historical marksheets remain printable.
+  ///
+  /// Writes are also blocked: `assertEditable` on this exam throws
+  /// HTTP 410 GONE when archivedAt is set (distinct from the 423
+  /// LOCKED path for `locked = true` — locking is reversible from
+  /// the marksheet toolbar; archiving requires the dedicated
+  /// archive/restore endpoint).
+  archivedAt    DateTime?
+  archivedById  String?    @db.Uuid
+  archivedBy    User?      @relation("ExamArchivedBy", fields: [archivedById], references: [id], onDelete: SetNull)
+  archiveReason String?    @db.VarChar(500)
+
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
 
   @@unique([schoolId, name])
   @@index([schoolId])
   @@index([schoolId, sessionId])
+  @@index([schoolId, archivedAt])
   @@map("exams")
 }
 
@@ -1516,6 +1597,25 @@ model StudentAcademicRecord {
   /// Stored alongside `gpa` so historical rows remain auditable even
   /// if subject credit hours are later edited.
   totalCreditHours Float?
+
+  /// Phase ACADEMIC TRANSITION SAFETY Part 6 — historical trust.
+  /// `nextClassId` snapshots the class the student was promoted INTO
+  /// for this run (null for RETAINED / LEFT). Distinct from the live
+  /// `Student.classId`, which may have moved again in subsequent
+  /// promotion runs. Keeping the snapshot here means a five-year-old
+  /// "promoted to" line still renders correctly in the history view.
+  nextClassId String? @db.Uuid
+  nextClass   Class?  @relation("PromotionNextClass", fields: [nextClassId], references: [id], onDelete: SetNull)
+  /// Section the student was promoted into. Null when sections shuffle
+  /// year-over-year (the typical case) or when not applicable.
+  nextSectionId String?  @db.Uuid
+  nextSection   Section? @relation("PromotionNextSection", fields: [nextSectionId], references: [id], onDelete: SetNull)
+  /// User (ADMIN) who ran the promotion that produced this row.
+  /// Nullable so existing rows from before this phase are unaffected;
+  /// SetNull on user delete so an admin departure doesn't bubble FK
+  /// constraint errors during user-archive workflows.
+  promotedById String? @db.Uuid
+  promotedBy   User?   @relation("PromotionRunBy", fields: [promotedById], references: [id], onDelete: SetNull)
 
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt

@@ -5,6 +5,7 @@ import {
   NotFoundException,
 } from '@nestjs/common';
 import { Prisma, type AcademicSession } from '@prisma/client';
+import { txWithRetry } from '../common/db/tx-retry';
 import { PrismaService } from '../database/prisma.service';
 import { CreateAcademicSessionDto } from './dto/create-academic-session.dto';
 
@@ -181,23 +182,31 @@ export class AcademicSessionService {
     }
 
     try {
-      return await this.prisma.$transaction(async (tx) => {
-        if (dto.isActive) {
-          await tx.academicSession.updateMany({
-            where: { schoolId, isActive: true },
-            data: { isActive: false },
+      // Phase RELIABILITY Part 1: txWithRetry so a P2034 (e.g. two
+      // admins activating different new sessions simultaneously)
+      // retries once instead of surfacing as 500. Unique-violation
+      // P2002 falls through untouched and is mapped to 409 below.
+      return await txWithRetry(
+        this.prisma,
+        async (tx) => {
+          if (dto.isActive) {
+            await tx.academicSession.updateMany({
+              where: { schoolId, isActive: true },
+              data: { isActive: false },
+            });
+          }
+          return tx.academicSession.create({
+            data: {
+              name: dto.name.trim(),
+              startDate: new Date(dto.startDate),
+              endDate: new Date(dto.endDate),
+              isActive: dto.isActive ?? false,
+              schoolId,
+            },
           });
-        }
-        return tx.academicSession.create({
-          data: {
-            name: dto.name.trim(),
-            startDate: new Date(dto.startDate),
-            endDate: new Date(dto.endDate),
-            isActive: dto.isActive ?? false,
-            schoolId,
-          },
-        });
-      });
+        },
+        { label: 'create-session' },
+      );
     } catch (e) {
       if (isUniqueViolation(e)) {
         throw new ConflictException(
@@ -215,42 +224,100 @@ export class AcademicSessionService {
    * the same moment, the partial unique index blocks the second.
    */
   async setActive(id: string, schoolId: string): Promise<AcademicSession> {
-    return this.prisma.$transaction(async (tx) => {
-      const target = await tx.academicSession.findFirst({
-        where: { id, schoolId },
-        select: { id: true, isActive: true },
-      });
-      if (!target) throw new NotFoundException('Session not found.');
-      if (target.isActive) {
-        // Already active — short-circuit, nothing to flip.
-        return tx.academicSession.findUniqueOrThrow({ where: { id } });
-      }
-      // Demote first; a partial unique index forbids two active rows.
-      await tx.academicSession.updateMany({
-        where: { schoolId, isActive: true },
-        data: { isActive: false },
-      });
-      return tx.academicSession.update({
-        where: { id },
-        data: { isActive: true },
-      });
-    });
+    // Phase RELIABILITY Part 1: retry-aware wrapper. The partial
+    // unique index is the source of truth for "exactly one active";
+    // a concurrent flip would 409 here, but a *transient* P2034
+    // (e.g. row-lock contention with a running promotion) retries
+    // gracefully without changing semantics.
+    return txWithRetry(
+      this.prisma,
+      async (tx) => {
+        const target = await tx.academicSession.findFirst({
+          where: { id, schoolId },
+          select: { id: true, isActive: true },
+        });
+        if (!target) throw new NotFoundException('Session not found.');
+        if (target.isActive) {
+          // Already active — short-circuit, nothing to flip.
+          return tx.academicSession.findUniqueOrThrow({ where: { id } });
+        }
+        // Demote first; a partial unique index forbids two active rows.
+        await tx.academicSession.updateMany({
+          where: { schoolId, isActive: true },
+          data: { isActive: false },
+        });
+        return tx.academicSession.update({
+          where: { id },
+          data: { isActive: true },
+        });
+      },
+      { label: 'activate-session' },
+    );
   }
 
   async remove(id: string, schoolId: string): Promise<void> {
     const found = await this.prisma.academicSession.findFirst({
       where: { id, schoolId },
-      select: { id: true, isActive: true },
+      select: { id: true, name: true, isActive: true },
     });
     if (!found) throw new NotFoundException('Session not found.');
     if (found.isActive) {
+      // Phase ACADEMIC TRANSITION SAFETY Part 5+7 — explicit message
+      // tells the operator the exact remediation step.
       throw new ConflictException(
-        'Cannot delete the active session. Activate a different session first.',
+        `Cannot delete "${found.name}" while it is the active session. Activate a different session first, then retry.`,
+      );
+    }
+    // Block delete if there are any StudentAcademicRecord snapshots
+    // pinned to this session. Promotion history is the academic
+    // record of record; we don't let it be silently severed via FK
+    // SetNull at delete time.
+    const historyCount = await this.prisma.studentAcademicRecord.count({
+      where: { sessionId: id },
+    });
+    if (historyCount > 0) {
+      throw new ConflictException(
+        `Cannot delete "${found.name}" — ${historyCount} promotion history record(s) reference it. Archive the session row in a later phase instead.`,
       );
     }
     // FKs use ON DELETE SET NULL on every child table so dropping a
     // session unlinks its rows rather than blowing them away.
     await this.prisma.academicSession.delete({ where: { id } });
+  }
+
+  /**
+   * Phase ACADEMIC TRANSITION SAFETY Part 5 — guard for writes that
+   * target a SPECIFIC session id (e.g. saving results against an old
+   * exam, running an admissions report). Throws with explicit
+   * remediation copy when the session is locked / ended.
+   *
+   * Unlike `assertSessionUnlocked` this also flags an ended session
+   * — useful when the caller actually cares about "is this year still
+   * accepting writes" rather than just the lock flag.
+   */
+  async assertSessionWritable(
+    sessionId: string | null,
+  ): Promise<void> {
+    if (!sessionId) return;
+    const s = await this.prisma.academicSession.findUnique({
+      where: { id: sessionId },
+      select: { name: true, isLocked: true, endDate: true },
+    });
+    if (!s) return;
+    if (s.isLocked) {
+      throw new BadRequestException(
+        `Session "${s.name}" is locked. Unlock it from Settings → Sessions before writing.`,
+      );
+    }
+    if (new Date() > s.endDate) {
+      // ENDED is non-fatal for read paths but write paths should
+      // surface it as a sanity check.
+      throw new BadRequestException(
+        `Session "${s.name}" ended on ${s.endDate
+          .toISOString()
+          .slice(0, 10)}. Promote to the next session before writing.`,
+      );
+    }
   }
 }
 

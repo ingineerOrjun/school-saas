@@ -31,8 +31,47 @@ export interface ExamDto {
   locked?: boolean;
   lockedAt?: string | null;
   lockedById?: string | null;
+  /**
+   * Phase ACADEMIC TRANSITION SAFETY Part 4 — publication state.
+   * Orthogonal to `locked`: a published exam can still be unlocked.
+   * State derives as: locked → Locked, publishedAt → Published,
+   * otherwise → Draft. Optional in the typing for back-compat with
+   * API responses that pre-date the field.
+   */
+  publishedAt?: string | null;
+  publishedById?: string | null;
+  /**
+   * Phase DATA LIFECYCLE Part 1: soft-delete state. Non-null
+   * `archivedAt` means the exam is hidden from default listings and
+   * marks-write rejects until restored.
+   */
+  archivedAt?: string | null;
+  archivedById?: string | null;
+  archiveReason?: string | null;
   createdAt: string;
   updatedAt: string;
+}
+
+/**
+ * Phase ACADEMIC TRANSITION SAFETY Part 4 — three-state publication
+ * derivation. Used by the badges + the marksheet header chrome.
+ *
+ *   • Draft     → publishedAt = null AND locked = false (default)
+ *   • Published → publishedAt != null AND locked = false
+ *   • Locked    → locked = true (whether or not publishedAt is set)
+ *
+ * Locked dominates — once marks are frozen, the operator-relevant
+ * state is "frozen", regardless of whether visibility was ever
+ * toggled on. The audit log carries the full lock+publish trail.
+ */
+export type ExamPublicationState = "draft" | "published" | "locked";
+
+export function deriveExamState(
+  exam: Pick<ExamDto, "locked" | "publishedAt">,
+): ExamPublicationState {
+  if (exam.locked) return "locked";
+  if (exam.publishedAt) return "published";
+  return "draft";
 }
 
 export interface ResultRow {
@@ -201,12 +240,19 @@ export const examsApi = {
    * List exams. Backend defaults to the active session when
    * `sessionId` is omitted (legacy NULL fallback when no session is
    * active). Pass an explicit id to view a different session.
+   *
+   * `archived` (Phase DATA LIFECYCLE Part 1):
+   *   • true   → only archived rows
+   *   • "all"  → both active + archived
+   *   • undef  → active only (default)
    */
-  list: (sessionId?: string) => {
-    const qs = sessionId
-      ? `?sessionId=${encodeURIComponent(sessionId)}`
-      : "";
-    return api<ExamDto[]>(`/exams${qs}`);
+  list: (sessionId?: string, archived?: boolean | "all") => {
+    const params = new URLSearchParams();
+    if (sessionId) params.set("sessionId", sessionId);
+    if (archived === true) params.set("archived", "1");
+    else if (archived === "all") params.set("archived", "all");
+    const qs = params.toString();
+    return api<ExamDto[]>(`/exams${qs ? `?${qs}` : ""}`);
   },
   create: (input: CreateExamInput) =>
     api<ExamDto>("/exams", {
@@ -214,6 +260,22 @@ export const examsApi = {
       body: JSON.stringify(input),
     }),
   remove: (id: string) => api<void>(`/exams/${id}`, { method: "DELETE" }),
+
+  /**
+   * Soft-archive an exam. Idempotent. ADMIN-only server-side. The
+   * reason is shown back in the platform audit feed and the
+   * ArchivedBadge tooltip.
+   */
+  archive: (examId: string, reason?: string) =>
+    api<ExamDto>(`/exams/${encodeURIComponent(examId)}/archive`, {
+      method: "POST",
+      body: JSON.stringify({ reason: reason ?? undefined }),
+    }),
+  /** Restore an archived exam. Idempotent. ADMIN-only server-side. */
+  restore: (examId: string) =>
+    api<ExamDto>(`/exams/${encodeURIComponent(examId)}/restore`, {
+      method: "POST",
+    }),
 
   /** Per-exam analytics for the Analytics Center. */
   getAnalytics: (examId: string) =>
@@ -240,6 +302,23 @@ export const examsApi = {
   /** Mirror of `lock` — re-enables marks edits. ADMIN-only. */
   unlock: (examId: string) =>
     api<ExamDto>(`/exams/${encodeURIComponent(examId)}/unlock`, {
+      method: "PATCH",
+    }),
+
+  /**
+   * Phase ACADEMIC TRANSITION SAFETY Part 4 — publish marks (parent-
+   * facing visibility). Idempotent server-side. ADMIN-only.
+   */
+  publish: (examId: string) =>
+    api<ExamDto>(`/exams/${encodeURIComponent(examId)}/publish`, {
+      method: "PATCH",
+    }),
+  /**
+   * Unpublish — return marks to Draft state. ADMIN-only. Rejects 409
+   * if the exam is locked (unlock first).
+   */
+  unpublish: (examId: string) =>
+    api<ExamDto>(`/exams/${encodeURIComponent(examId)}/unpublish`, {
       method: "PATCH",
     }),
 };

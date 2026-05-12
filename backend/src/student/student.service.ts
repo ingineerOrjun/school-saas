@@ -4,8 +4,10 @@ import {
   Injectable,
   NotFoundException,
 } from '@nestjs/common';
-import { Prisma } from '@prisma/client';
+import { PlatformAuditAction, Prisma } from '@prisma/client';
+import { txWithRetry } from '../common/db/tx-retry';
 import { PrismaService } from '../database/prisma.service';
+import { PlatformAuditService } from '../platform/platform-audit.service';
 import {
   BulkCreateStudentsDto,
   type BulkStudentInput,
@@ -14,6 +16,19 @@ import { Gender } from '@prisma/client';
 import { CreateStudentDto } from './dto/create-student.dto';
 import { UpdateStudentDto } from './dto/update-student.dto';
 import { StudentRegistrationNumberService } from './services/student-registration-number.service';
+
+/**
+ * Shared actor shape for audit-emitting student mutations. Captured at
+ * the controller boundary (JWT claims + request headers) and passed
+ * through so the audit row carries who/where the action came from.
+ */
+export interface StudentActor {
+  userId: string;
+  email?: string | null;
+  role?: string | null;
+  ip?: string | null;
+  userAgent?: string | null;
+}
 
 /** One failure entry in the bulk-import response. */
 export interface BulkFailure {
@@ -70,6 +85,7 @@ export class StudentService {
   constructor(
     private readonly prisma: PrismaService,
     private readonly registrationNumbers: StudentRegistrationNumberService,
+    private readonly audit: PlatformAuditService,
   ) {}
 
   async create(
@@ -390,26 +406,41 @@ export class StudentService {
     );
 
     try {
-      await this.prisma.$transaction(
-        candidates.map((r, i) =>
-          this.prisma.student.create({
-            data: {
-              firstName: r.firstName,
-              lastName: r.lastName,
-              symbolNumber: r.symbolNumber,
-              schoolId,
-              classId: resolvedClassIds[i],
-              gender: r.gender,
-              dateOfBirth: r.dateOfBirth,
-              parentName: r.parentName,
-              contactNumber: r.contactNumber,
-              address: r.address,
-              admissionDate: r.admissionDate,
-              registrationNumber: registrationNumbers[i],
-            },
-            select: { id: true },
-          }),
-        ),
+      // Phase RELIABILITY-II Part 2: migrated from array-form
+      // $transaction to a callback-form txWithRetry. Behavior
+      // preservation: all creates are homogeneous (single model, no
+      // inter-operation data flow), so a sequential for-loop inside
+      // the callback produces the same end state. Wrapping via
+      // txWithRetry adds P2034 retry on transient deadlocks during
+      // concurrent imports; P2002 (unique violation) falls through
+      // untouched and is mapped to a friendly per-row reason below.
+      // slowMs is bumped to 5000 because large CSV imports legitimately
+      // exceed the default 1500ms slow-tx threshold.
+      await txWithRetry(
+        this.prisma,
+        async (tx) => {
+          for (let i = 0; i < candidates.length; i++) {
+            const r = candidates[i];
+            await tx.student.create({
+              data: {
+                firstName: r.firstName,
+                lastName: r.lastName,
+                symbolNumber: r.symbolNumber,
+                schoolId,
+                classId: resolvedClassIds[i],
+                gender: r.gender,
+                dateOfBirth: r.dateOfBirth,
+                parentName: r.parentName,
+                contactNumber: r.contactNumber,
+                address: r.address,
+                admissionDate: r.admissionDate,
+                registrationNumber: registrationNumbers[i],
+              },
+              select: { id: true },
+            });
+          }
+        },
+        { label: 'bulk-create-students', slowMs: 5000 },
       );
       return { successCount: candidates.length, failed: sortFailures(failed) };
     } catch (e) {
@@ -442,17 +473,43 @@ export class StudentService {
     }
   }
 
+  /**
+   * List students.
+   *
+   * Archive defaults (Phase DATA LIFECYCLE Part 1):
+   *   • By default `archivedAt: null` is filtered → archived students
+   *     are hidden from every normal roster, picker, dropdown, etc.
+   *   • Pass `archived: true` to fetch ONLY archived rows (drives the
+   *     "Archived" tab on the students page).
+   *   • Pass `archived: 'all'` to include both archived + active
+   *     (admin reconciliation, super-admin tools).
+   *
+   * Keeping the default `null`-filtered means every existing caller —
+   * pickers, transfer flows, cashier search, parents portal — instantly
+   * stops surfacing archived students without needing per-call flags.
+   */
   findAll(
     schoolId: string,
-    filter?: { classId?: string | null },
+    filter?: {
+      classId?: string | null;
+      archived?: boolean | 'all';
+    },
   ): Promise<StudentWithSection[]> {
     const classFilter = filter?.classId
       ? { classId: filter.classId }
       : filter?.classId === null
         ? { classId: null }
         : undefined;
+
+    const archivedFilter: Prisma.StudentWhereInput =
+      filter?.archived === true
+        ? { archivedAt: { not: null } }
+        : filter?.archived === 'all'
+          ? {}
+          : { archivedAt: null };
+
     return this.prisma.student.findMany({
-      where: { schoolId, ...classFilter },
+      where: { schoolId, ...classFilter, ...archivedFilter },
       include: studentInclude,
       orderBy: { createdAt: 'desc' },
     });
@@ -487,9 +544,11 @@ export class StudentService {
     if (trimmed.length === 0) {
       // Empty query → recent students fallback for the "no input yet"
       // dropdown state. createdAt-desc gives "students added recently"
-      // which is a useful default for new schools.
+      // which is a useful default for new schools. Archived students
+      // are filtered — a cashier issuing a fresh receipt should never
+      // accidentally pick a graduated/withdrawn child.
       return this.prisma.student.findMany({
-        where: { schoolId },
+        where: { schoolId, archivedAt: null },
         include: studentInclude,
         orderBy: { createdAt: 'desc' },
         take: cap,
@@ -499,6 +558,7 @@ export class StudentService {
     return this.prisma.student.findMany({
       where: {
         schoolId,
+        archivedAt: null,
         OR: [
           { firstName: { contains: trimmed, mode: 'insensitive' } },
           { lastName: { contains: trimmed, mode: 'insensitive' } },
@@ -651,6 +711,16 @@ export class StudentService {
     schoolId: string,
   ): Promise<StudentWithSection> {
     const existing = await this.ensureInSchool(id, schoolId);
+    // Phase DATA LIFECYCLE Part 1: archived rows are read-only. The
+    // operator must restore first if they actually want to edit the
+    // record. 409 Conflict (not 423 Locked) — the resource isn't
+    // locked, it's archived, which is closer to "wrong state for this
+    // operation."
+    if (existing.archivedAt) {
+      throw new ConflictException(
+        'This student is archived. Restore the record before editing.',
+      );
+    }
 
     if (dto.userId) {
       await this.assertUserBelongsToSchool(dto.userId, schoolId);
@@ -740,20 +810,165 @@ export class StudentService {
     return new ConflictException('Conflict with an existing record.');
   }
 
-  async remove(id: string, schoolId: string): Promise<void> {
-    await this.ensureInSchool(id, schoolId);
-    await this.prisma.student.delete({ where: { id } });
+  /**
+   * Soft-delete a student.
+   *
+   * Phase DATA LIFECYCLE Part 1+2: hard-delete is no longer offered
+   * for Student — the row carries cascading FKs (attendance, results,
+   * payments) whose loss would erase audit-relevant history. This
+   * method redirects to `archive()` so the `DELETE /students/:id`
+   * endpoint stays useful for older callers without silently dropping
+   * the soft-delete guarantee.
+   */
+  async remove(
+    id: string,
+    schoolId: string,
+    actor: StudentActor,
+  ): Promise<void> {
+    await this.archive(id, schoolId, actor, null);
+  }
+
+  /**
+   * Archive a student. Stamps `archivedAt` + `archivedById` (and an
+   * optional reason). Idempotent: re-archiving an already-archived
+   * student is a no-op — same row returned, no second audit row, no
+   * timestamp shuffle. Mirrors the lock/unlock pattern on ExamService.
+   *
+   * Emits STUDENT_ARCHIVED with explicit `schoolId` so the school-side
+   * audit feed (/audit/recent) picks it up.
+   */
+  async archive(
+    id: string,
+    schoolId: string,
+    actor: StudentActor,
+    reason: string | null,
+  ): Promise<StudentWithSection> {
+    const existing = await this.ensureInSchool(id, schoolId);
+    if (existing.archivedAt) {
+      // Already archived — return the existing row without writing or
+      // auditing. Idempotent endpoint by design.
+      return this.findOne(id, schoolId);
+    }
+
+    const trimmedReason =
+      typeof reason === 'string' && reason.trim().length > 0
+        ? reason.trim().slice(0, 500)
+        : null;
+
+    const archivedAt = new Date();
+    const updated = await this.prisma.student.update({
+      where: { id },
+      data: {
+        archivedAt,
+        archivedById: actor.userId,
+        archiveReason: trimmedReason,
+      },
+      include: studentInclude,
+    });
+
+    await this.audit.record({
+      action: PlatformAuditAction.STUDENT_ARCHIVED,
+      schoolId,
+      actor: {
+        userId: actor.userId,
+        email: actor.email,
+        role: actor.role,
+      },
+      target: {
+        type: 'Student',
+        id: updated.id,
+        label: `${updated.firstName} ${updated.lastName}`.trim(),
+      },
+      before: { archivedAt: null, archivedById: null, archiveReason: null },
+      after: {
+        archivedAt: updated.archivedAt,
+        archivedById: updated.archivedById,
+        archiveReason: updated.archiveReason,
+        studentId: updated.id,
+      },
+      reason: trimmedReason,
+      ip: actor.ip,
+      userAgent: actor.userAgent,
+    });
+
+    return updated;
+  }
+
+  /**
+   * Restore a previously archived student. Clears the archive
+   * triplet and emits STUDENT_RESTORED. Idempotent — a restore on a
+   * not-archived row returns it unchanged with no audit emit.
+   */
+  async restore(
+    id: string,
+    schoolId: string,
+    actor: StudentActor,
+  ): Promise<StudentWithSection> {
+    const existing = await this.ensureInSchool(id, schoolId);
+    if (!existing.archivedAt) {
+      return this.findOne(id, schoolId);
+    }
+
+    const before = {
+      archivedAt: existing.archivedAt,
+      archivedById: existing.archivedById,
+      archiveReason: existing.archiveReason,
+    };
+
+    const updated = await this.prisma.student.update({
+      where: { id },
+      data: {
+        archivedAt: null,
+        archivedById: null,
+        archiveReason: null,
+      },
+      include: studentInclude,
+    });
+
+    await this.audit.record({
+      action: PlatformAuditAction.STUDENT_RESTORED,
+      schoolId,
+      actor: {
+        userId: actor.userId,
+        email: actor.email,
+        role: actor.role,
+      },
+      target: {
+        type: 'Student',
+        id: updated.id,
+        label: `${updated.firstName} ${updated.lastName}`.trim(),
+      },
+      before,
+      after: {
+        archivedAt: null,
+        archivedById: null,
+        archiveReason: null,
+        studentId: updated.id,
+      },
+      ip: actor.ip,
+      userAgent: actor.userAgent,
+    });
+
+    return updated;
   }
 
   /**
    * Returns the existing row (minimal fields) if the student belongs to
    * this school, otherwise throws NotFound. Callers use the returned row
-   * to read current classId/sectionId values without a second query.
+   * to read current classId/sectionId values + archive state without a
+   * second query.
    */
   private async ensureInSchool(id: string, schoolId: string) {
     const row = await this.prisma.student.findFirst({
       where: { id, schoolId },
-      select: { id: true, classId: true, sectionId: true },
+      select: {
+        id: true,
+        classId: true,
+        sectionId: true,
+        archivedAt: true,
+        archivedById: true,
+        archiveReason: true,
+      },
     });
     if (!row) {
       throw new NotFoundException('Student not found.');

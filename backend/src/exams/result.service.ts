@@ -4,6 +4,7 @@ import {
   NotFoundException,
 } from '@nestjs/common';
 import { LetterGrade, Result } from '@prisma/client';
+import { txWithRetry } from '../common/db/tx-retry';
 import { PrismaService } from '../database/prisma.service';
 import { AcademicSessionService } from '../academic-session/academic-session.service';
 import { GradingService } from '../grading/grading.service';
@@ -256,69 +257,81 @@ export class ResultService {
 
     // Validate per-component ranges, apply NEB theory+practical pass rule,
     // then upsert each result.
-    await this.prisma.$transaction(
-      dto.entries.map((entry) => {
-        const subject = subjectById.get(entry.subjectId)!;
-        const theoryMarks = entry.theoryMarks;
-        const practicalMarks = entry.practicalMarks ?? 0;
+    //
+    // Phase RELIABILITY-II Part 2: migrated array-form $transaction to
+    // a callback-form `txWithRetry`. Validation throws (BadRequest)
+    // continue to roll back the entire callback — Prisma aborts the
+    // transaction on any thrown error inside `$transaction(async tx)`,
+    // identical to the array-form behavior. The retry helper only
+    // retries P2034 (deadlock / serialization) — never validation
+    // errors, never P2002 collisions.
+    await txWithRetry(
+      this.prisma,
+      async (tx) => {
+        for (const entry of dto.entries) {
+          const subject = subjectById.get(entry.subjectId)!;
+          const theoryMarks = entry.theoryMarks;
+          const practicalMarks = entry.practicalMarks ?? 0;
 
-        if (theoryMarks < 0 || theoryMarks > subject.theoryFullMarks) {
-          throw new BadRequestException(
-            `Theory marks for "${subject.name}" must be between 0 and ${subject.theoryFullMarks}.`,
+          if (theoryMarks < 0 || theoryMarks > subject.theoryFullMarks) {
+            throw new BadRequestException(
+              `Theory marks for "${subject.name}" must be between 0 and ${subject.theoryFullMarks}.`,
+            );
+          }
+          if (
+            practicalMarks < 0 ||
+            practicalMarks > subject.practicalFullMarks
+          ) {
+            throw new BadRequestException(
+              `Practical marks for "${subject.name}" must be between 0 and ${subject.practicalFullMarks}.`,
+            );
+          }
+
+          const { percentage, letterGrade, gradePoint } = gradeWithSplit(
+            this.grading,
+            theoryMarks,
+            subject.theoryFullMarks,
+            practicalMarks,
+            subject.practicalFullMarks,
           );
-        }
-        if (
-          practicalMarks < 0 ||
-          practicalMarks > subject.practicalFullMarks
-        ) {
-          throw new BadRequestException(
-            `Practical marks for "${subject.name}" must be between 0 and ${subject.practicalFullMarks}.`,
-          );
-        }
 
-        const { percentage, letterGrade, gradePoint } = gradeWithSplit(
-          this.grading,
-          theoryMarks,
-          subject.theoryFullMarks,
-          practicalMarks,
-          subject.practicalFullMarks,
-        );
-
-        return this.prisma.result.upsert({
-          where: {
-            studentId_subjectId: {
+          await tx.result.upsert({
+            where: {
+              studentId_subjectId: {
+                studentId: dto.studentId,
+                subjectId: entry.subjectId,
+              },
+            },
+            create: {
+              examId: exam.id,
               studentId: dto.studentId,
               subjectId: entry.subjectId,
+              theoryMarks,
+              practicalMarks,
+              percentage,
+              letterGrade,
+              gradePoint,
+              // First save → record the original author. Both audit
+              // fields point at the same user on insert.
+              createdById: userId,
+              updatedById: userId,
+              sessionId,
             },
-          },
-          create: {
-            examId: exam.id,
-            studentId: dto.studentId,
-            subjectId: entry.subjectId,
-            theoryMarks,
-            practicalMarks,
-            percentage,
-            letterGrade,
-            gradePoint,
-            // First save → record the original author. Both audit
-            // fields point at the same user on insert.
-            createdById: userId,
-            updatedById: userId,
-            sessionId,
-          },
-          update: {
-            theoryMarks,
-            practicalMarks,
-            percentage,
-            letterGrade,
-            gradePoint,
-            // Edit path leaves `createdById` alone so the original
-            // author is preserved. Only `updatedById` rolls forward.
-            updatedById: userId,
-          },
-          select: { id: true },
-        });
-      }),
+            update: {
+              theoryMarks,
+              practicalMarks,
+              percentage,
+              letterGrade,
+              gradePoint,
+              // Edit path leaves `createdById` alone so the original
+              // author is preserved. Only `updatedById` rolls forward.
+              updatedById: userId,
+            },
+            select: { id: true },
+          });
+        }
+      },
+      { label: 'save-marks', slowMs: 2000 },
     );
 
     // Phase γ — re-sync the StudentAcademicRecord GPA snapshot for the
@@ -440,69 +453,79 @@ export class ResultService {
     const sessionId = exam.sessionId ?? null;
 
     // 5. Validate marks per entry, then upsert atomically.
-    await this.prisma.$transaction(
-      dto.entries.map((entry) => {
-        const theoryMarks = entry.theoryMarks;
-        const practicalMarks = entry.practicalMarks ?? 0;
+    //
+    // Phase RELIABILITY-II Part 2: migrated array-form $transaction
+    // to callback-form `txWithRetry`. Behavior preservation: a
+    // BadRequest thrown mid-loop aborts the transaction exactly the
+    // way the original array-form did (Prisma rolls back the whole
+    // callback). P2034 retries; P2002 / 4xx fall through untouched.
+    await txWithRetry(
+      this.prisma,
+      async (tx) => {
+        for (const entry of dto.entries) {
+          const theoryMarks = entry.theoryMarks;
+          const practicalMarks = entry.practicalMarks ?? 0;
 
-        if (theoryMarks < 0 || theoryMarks > subject.theoryFullMarks) {
-          throw new BadRequestException(
-            `Theory marks for "${subject.name}" must be between 0 and ${subject.theoryFullMarks}.`,
+          if (theoryMarks < 0 || theoryMarks > subject.theoryFullMarks) {
+            throw new BadRequestException(
+              `Theory marks for "${subject.name}" must be between 0 and ${subject.theoryFullMarks}.`,
+            );
+          }
+          if (
+            practicalMarks < 0 ||
+            practicalMarks > subject.practicalFullMarks
+          ) {
+            throw new BadRequestException(
+              `Practical marks for "${subject.name}" must be between 0 and ${subject.practicalFullMarks}.`,
+            );
+          }
+
+          // Reuse the same grading helper the per-row save uses — single
+          // source of truth for the NEB pass rule + percentage math.
+          const { percentage, letterGrade, gradePoint } = gradeWithSplit(
+            this.grading,
+            theoryMarks,
+            subject.theoryFullMarks,
+            practicalMarks,
+            subject.practicalFullMarks,
           );
-        }
-        if (
-          practicalMarks < 0 ||
-          practicalMarks > subject.practicalFullMarks
-        ) {
-          throw new BadRequestException(
-            `Practical marks for "${subject.name}" must be between 0 and ${subject.practicalFullMarks}.`,
-          );
-        }
 
-        // Reuse the same grading helper the per-row save uses — single
-        // source of truth for the NEB pass rule + percentage math.
-        const { percentage, letterGrade, gradePoint } = gradeWithSplit(
-          this.grading,
-          theoryMarks,
-          subject.theoryFullMarks,
-          practicalMarks,
-          subject.practicalFullMarks,
-        );
-
-        return this.prisma.result.upsert({
-          where: {
-            studentId_subjectId: {
+          await tx.result.upsert({
+            where: {
+              studentId_subjectId: {
+                studentId: entry.studentId,
+                subjectId: subject.id,
+              },
+            },
+            create: {
+              examId: exam.id,
               studentId: entry.studentId,
               subjectId: subject.id,
+              theoryMarks,
+              practicalMarks,
+              percentage,
+              letterGrade,
+              gradePoint,
+              // Same audit pattern as the per-row save: stamp both on
+              // insert; only updatedById on edit so the original author
+              // survives later corrections.
+              createdById: userId,
+              updatedById: userId,
+              sessionId,
             },
-          },
-          create: {
-            examId: exam.id,
-            studentId: entry.studentId,
-            subjectId: subject.id,
-            theoryMarks,
-            practicalMarks,
-            percentage,
-            letterGrade,
-            gradePoint,
-            // Same audit pattern as the per-row save: stamp both on
-            // insert; only updatedById on edit so the original author
-            // survives later corrections.
-            createdById: userId,
-            updatedById: userId,
-            sessionId,
-          },
-          update: {
-            theoryMarks,
-            practicalMarks,
-            percentage,
-            letterGrade,
-            gradePoint,
-            updatedById: userId,
-          },
-          select: { id: true },
-        });
-      }),
+            update: {
+              theoryMarks,
+              practicalMarks,
+              percentage,
+              letterGrade,
+              gradePoint,
+              updatedById: userId,
+            },
+            select: { id: true },
+          });
+        }
+      },
+      { label: 'bulk-save-marks', slowMs: 3000 },
     );
 
     // Phase γ — fan out a fire-and-forget GPA snapshot recompute for
@@ -804,74 +827,84 @@ export class ResultService {
     const sessionId = exam.sessionId ?? null;
 
     // 5. Validate ranges + upsert atomically.
-    await this.prisma.$transaction(
-      writable.map((entry) => {
-        const isAbsent = entry.absent === true;
-        // Range-check non-absent rows. We still allow
-        // `obtainedMarks > 0` even when absent is true at the DTO
-        // layer — the service force-zeros it below.
-        if (!isAbsent) {
-          const m = entry.obtainedMarks!;
-          if (m < 0 || m > subject.theoryFullMarks) {
-            throw new BadRequestException(
-              `Marks for "${subject.name}" must be between 0 and ${subject.theoryFullMarks}.`,
-            );
+    //
+    // Phase RELIABILITY-II Part 2: migrated array-form $transaction
+    // to callback-form `txWithRetry`. Validation-throw rollback
+    // semantics preserved — Prisma aborts the whole callback on any
+    // throw inside the transaction. The retry helper only kicks in
+    // on transient P2034 (deadlock / serialization).
+    await txWithRetry(
+      this.prisma,
+      async (tx) => {
+        for (const entry of writable) {
+          const isAbsent = entry.absent === true;
+          // Range-check non-absent rows. We still allow
+          // `obtainedMarks > 0` even when absent is true at the DTO
+          // layer — the service force-zeros it below.
+          if (!isAbsent) {
+            const m = entry.obtainedMarks!;
+            if (m < 0 || m > subject.theoryFullMarks) {
+              throw new BadRequestException(
+                `Marks for "${subject.name}" must be between 0 and ${subject.theoryFullMarks}.`,
+              );
+            }
           }
-        }
 
-        const theoryMarks = isAbsent ? 0 : entry.obtainedMarks!;
-        // Practical stays at 0 on insert; on update we leave the
-        // existing column alone (Prisma's upsert update.set only
-        // touches the fields we name).
-        const practicalMarks = 0;
+          const theoryMarks = isAbsent ? 0 : entry.obtainedMarks!;
+          // Practical stays at 0 on insert; on update we leave the
+          // existing column alone (Prisma's upsert update.set only
+          // touches the fields we name).
+          const practicalMarks = 0;
 
-        const { percentage, letterGrade, gradePoint } = isAbsent
-          ? { percentage: 0, letterGrade: LetterGrade.NG, gradePoint: 0 }
-          : gradeWithSplit(
-              this.grading,
-              theoryMarks,
-              subject.theoryFullMarks,
-              practicalMarks,
-              subject.practicalFullMarks,
-            );
+          const { percentage, letterGrade, gradePoint } = isAbsent
+            ? { percentage: 0, letterGrade: LetterGrade.NG, gradePoint: 0 }
+            : gradeWithSplit(
+                this.grading,
+                theoryMarks,
+                subject.theoryFullMarks,
+                practicalMarks,
+                subject.practicalFullMarks,
+              );
 
-        return this.prisma.result.upsert({
-          where: {
-            studentId_subjectId: {
+          await tx.result.upsert({
+            where: {
+              studentId_subjectId: {
+                studentId: entry.studentId,
+                subjectId: subject.id,
+              },
+            },
+            create: {
+              examId: exam.id,
               studentId: entry.studentId,
               subjectId: subject.id,
+              theoryMarks,
+              practicalMarks,
+              percentage,
+              letterGrade,
+              gradePoint,
+              absent: isAbsent,
+              createdById: userId,
+              updatedById: userId,
+              sessionId,
             },
-          },
-          create: {
-            examId: exam.id,
-            studentId: entry.studentId,
-            subjectId: subject.id,
-            theoryMarks,
-            practicalMarks,
-            percentage,
-            letterGrade,
-            gradePoint,
-            absent: isAbsent,
-            createdById: userId,
-            updatedById: userId,
-            sessionId,
-          },
-          update: {
-            theoryMarks,
-            // Preserve the existing practical mark on update — bulk
-            // grid only owns the theory column. (For absent rows we
-            // DO want to zero practical too, since "absent" means
-            // "didn't appear for any component".)
-            ...(isAbsent ? { practicalMarks: 0 } : {}),
-            percentage,
-            letterGrade,
-            gradePoint,
-            absent: isAbsent,
-            updatedById: userId,
-          },
-          select: { id: true },
-        });
-      }),
+            update: {
+              theoryMarks,
+              // Preserve the existing practical mark on update — bulk
+              // grid only owns the theory column. (For absent rows we
+              // DO want to zero practical too, since "absent" means
+              // "didn't appear for any component".)
+              ...(isAbsent ? { practicalMarks: 0 } : {}),
+              percentage,
+              letterGrade,
+              gradePoint,
+              absent: isAbsent,
+              updatedById: userId,
+            },
+            select: { id: true },
+          });
+        }
+      },
+      { label: 'grid-save-marks', slowMs: 3000 },
     );
 
     // Phase γ — fire-and-forget GPA snapshot recompute for every

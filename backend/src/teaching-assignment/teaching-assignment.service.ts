@@ -7,6 +7,7 @@ import {
   NotFoundException,
 } from '@nestjs/common';
 import { Prisma } from '@prisma/client';
+import { txWithRetry } from '../common/db/tx-retry';
 import { PrismaService } from '../database/prisma.service';
 import {
   BulkAssignmentTupleDto,
@@ -313,7 +314,12 @@ export class TeachingAssignmentService {
       subjectId: tuple.subjectId ?? null,
     }));
 
-    await this.prisma.$transaction(async (tx) => {
+    // Phase RELIABILITY Part 1: retry-aware wrapper. Bulk teaching-
+    // assignment edits commonly contend with concurrent admin edits;
+    // a P2034 here retries instead of returning 500. Unique-violation
+    // P2002 is still caught + swallowed by the inner `isUniqueViolation`
+    // check (idempotent end-state).
+    await txWithRetry(this.prisma, async (tx) => {
       // ---- Removes first ----
       // Doing removes before adds means an admin who unchecks (Math, A)
       // and rechecks (Math, A) in the same save (no-op net change)
@@ -363,7 +369,7 @@ export class TeachingAssignmentService {
           if (!isUniqueViolation(e)) throw e;
         }
       }
-    });
+    }, { label: 'save-teaching-assignment' });
 
     return this.prisma.teachingAssignment.findMany({
       where: { teacherId, schoolId },

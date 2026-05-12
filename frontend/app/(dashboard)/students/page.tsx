@@ -3,7 +3,7 @@
 import * as React from "react";
 import { useRouter } from "next/navigation";
 import { useQueryClient } from "@tanstack/react-query";
-import { Plus, Search, UserPlus, RotateCw, AlertCircle, Filter, Upload } from "lucide-react";
+import { Plus, Search, UserPlus, RotateCw, AlertCircle, Filter, Upload, Archive } from "lucide-react";
 import { toast } from "sonner";
 import { ApiError } from "@/lib/api";
 import { getStoredUser, type Role } from "@/lib/auth";
@@ -17,16 +17,28 @@ import { qk } from "@/lib/query-keys";
 import { Button } from "@/components/ui/Button";
 import { Skeleton } from "@/components/ui/Skeleton";
 import { EmptyState } from "@/components/ui/EmptyState";
+import {
+  ArchiveRecordDialog,
+  RestoreRecordDialog,
+} from "@/components/ui/ArchiveRecordDialog";
 import { StudentTable } from "@/components/students/StudentTable";
 import { AddStudentDialog } from "@/components/students/AddStudentDialog";
 import { EditStudentDialog } from "@/components/students/EditStudentDialog";
-import { DeleteStudentDialog } from "@/components/students/DeleteStudentDialog";
 import { ImportStudentsDialog } from "@/components/students/ImportStudentsDialog";
 import {
   formatStudentAssignment,
   type Assignment,
 } from "@/components/students/SectionSelect";
 import { cn } from "@/lib/utils";
+
+/**
+ * Phase DATA LIFECYCLE Part 1+2: roster view mode. The students page
+ * has two tabs — Active (default) and Archived. Switching tabs
+ * refetches with the appropriate filter; per-row actions diverge:
+ *   • Active   → trash icon opens the archive dialog (with reason)
+ *   • Archived → restore icon opens the restore dialog (simple confirm)
+ */
+type StudentViewMode = "active" | "archived";
 
 /** Sentinel value for "all classes" in the filter dropdown. */
 const CLASS_FILTER_ALL = "__all__";
@@ -58,7 +70,17 @@ export default function StudentsPage() {
   // Local optimistic state below stays untouched — we mirror the
   // query data into `list` via useEffect so the existing
   // delete-with-undo + add-highlight machinery keeps working.
-  const studentsQuery = useStudents();
+  //
+  // Phase DATA LIFECYCLE Part 1+2: `viewMode` drives the archive
+  // filter on the shared hook — active rows in the default tab, only
+  // archived rows in the "Archived" tab. The qk.students key is
+  // archive-aware so the two tabs maintain independent caches.
+  const [viewMode, setViewMode] = React.useState<StudentViewMode>("active");
+  const studentsFilter = React.useMemo(
+    () => (viewMode === "archived" ? { archived: true as const } : undefined),
+    [viewMode],
+  );
+  const studentsQuery = useStudents(studentsFilter);
   const classesQuery = useClasses();
   const [list, setList] = React.useState<StudentDto[] | null>(null);
   const classes: ClassWithSections[] = classesQuery.data ?? [];
@@ -92,7 +114,10 @@ export default function StudentsPage() {
   const [addOpen, setAddOpen] = React.useState(false);
   const [importOpen, setImportOpen] = React.useState(false);
   const [editTarget, setEditTarget] = React.useState<StudentDto | null>(null);
-  const [deleteTarget, setDeleteTarget] = React.useState<StudentDto | null>(null);
+  const [archiveTarget, setArchiveTarget] = React.useState<StudentDto | null>(null);
+  const [restoreTarget, setRestoreTarget] = React.useState<StudentDto | null>(null);
+  const [archivePending, setArchivePending] = React.useState(false);
+  const [restorePending, setRestorePending] = React.useState(false);
 
   // Role-based UI gating. Reading the cached user once on mount is the
   // right tradeoff for static perms — the JWT role doesn't change at
@@ -120,9 +145,13 @@ export default function StudentsPage() {
   // Phase Ω — refresh now invalidates the shared cache instead of
   // re-running a manual fetch. Other consumers of the same query
   // keys (sidebar count, modal pickers) stay in sync automatically.
+  //
+  // Phase DATA LIFECYCLE Part 1: invalidate WITHOUT the archived
+  // filter — every cached student list (active, archived, all) keys
+  // off `["students", { ... }]` so the partial key clears both tabs.
   const refresh = React.useCallback(async () => {
     await Promise.all([
-      qc.invalidateQueries({ queryKey: qk.students() }),
+      qc.invalidateQueries({ queryKey: ["students"] }),
       qc.invalidateQueries({ queryKey: qk.classes() }),
     ]);
   }, [qc]);
@@ -202,19 +231,24 @@ export default function StudentsPage() {
     [markAsNew],
   );
 
-  // Kick off a deletion: exit animation now, API call after the undo window.
-  const scheduleDelete = React.useCallback(
-    (student: StudentDto) => {
+  // Phase DATA LIFECYCLE Part 2: archive flow.
+  //
+  // Replaces the legacy hard-delete-with-undo. The optimistic UX is
+  // preserved (instant row exit + 5-second undo window) but the
+  // backend call now soft-archives. If the user lets the undo window
+  // expire we POST /students/:id/archive with the captured reason;
+  // if they undo, we just put the row back locally — no backend
+  // round-trip needed, because the archive call hasn't fired yet.
+  const scheduleArchive = React.useCallback(
+    (student: StudentDto, reason: string | undefined) => {
       const id = student.id;
 
-      // Phase 1: exit animation begins immediately.
       setRemovingIds((prev) => {
         const next = new Set(prev);
         next.add(id);
         return next;
       });
 
-      // Phase 2: after animation completes, drop the row from local state.
       const animTimeoutId = window.setTimeout(() => {
         setList((prev) => (prev ? prev.filter((s) => s.id !== id) : prev));
         setRemovingIds((prev) => {
@@ -225,27 +259,33 @@ export default function StudentsPage() {
         });
       }, ROW_REMOVE_MS);
 
-      // Phase 3: after the undo window, call the backend for real.
       const apiTimeoutId = window.setTimeout(() => {
         pendingDeletesRef.current.delete(id);
-        studentsApi.remove(id).catch((err) => {
-          if (err instanceof ApiError && err.status === 401) {
-            router.replace("/login");
-            return;
-          }
-          // Backend failed after the undo window — restore the row so the user
-          // doesn't lose data silently.
-          restoreStudent(student);
-          const msg =
-            err instanceof ApiError
-              ? err.message
-              : err instanceof Error
+        studentsApi
+          .archive(id, reason)
+          .then(() => {
+            // Re-sync the archived-tab cache so the new row shows up
+            // when the user switches tabs without a manual refresh.
+            qc.invalidateQueries({ queryKey: ["students"] });
+          })
+          .catch((err) => {
+            if (err instanceof ApiError && err.status === 401) {
+              router.replace("/login");
+              return;
+            }
+            // Backend failed after the undo window — put the row back
+            // so the user doesn't lose visibility silently.
+            restoreStudent(student);
+            const msg =
+              err instanceof ApiError
                 ? err.message
-                : "Failed to delete student.";
-          toast.error(
-            `${student.firstName} ${student.lastName} restored — ${msg}`,
-          );
-        });
+                : err instanceof Error
+                  ? err.message
+                  : "Failed to archive student.";
+            toast.error(
+              `${student.firstName} ${student.lastName} restored — ${msg}`,
+            );
+          });
       }, UNDO_WINDOW_MS);
 
       pendingDeletesRef.current.set(id, {
@@ -254,22 +294,22 @@ export default function StudentsPage() {
         apiTimeoutId,
       });
 
-      toast(`${student.firstName} ${student.lastName} deleted`, {
-        description: "Tap undo to bring them back.",
+      toast(`${student.firstName} ${student.lastName} archived`, {
+        description: "Hidden from rosters. Tap undo to keep them active.",
         duration: UNDO_WINDOW_MS,
         action: {
           label: "Undo",
-          onClick: () => undoDelete(id),
+          onClick: () => undoArchive(id),
         },
       });
     },
-    // `undoDelete` is intentionally referenced from the same render scope here.
+    // `undoArchive` is intentionally referenced from the same render scope here.
     // eslint-disable-next-line react-hooks/exhaustive-deps
-    [router, restoreStudent],
+    [router, restoreStudent, qc],
   );
 
-  // Cancel a pending deletion within the undo window.
-  const undoDelete = React.useCallback(
+  // Cancel a pending archive within the undo window.
+  const undoArchive = React.useCallback(
     (id: string) => {
       const pending = pendingDeletesRef.current.get(id);
       if (!pending) return;
@@ -278,20 +318,60 @@ export default function StudentsPage() {
       pendingDeletesRef.current.delete(id);
       restoreStudent(pending.student);
       toast.success(
-        `${pending.student.firstName} ${pending.student.lastName} restored`,
+        `${pending.student.firstName} ${pending.student.lastName} kept active`,
       );
     },
     [restoreStudent],
   );
 
-  // On unmount: flush pending deletes so the user's intent isn't dropped.
+  // Restore an already-archived student — no undo window here, the
+  // backend is called immediately and the row is moved out of the
+  // local archived list on success. Soft no-op on the server when
+  // the student isn't actually archived.
+  const handleRestoreConfirmed = React.useCallback(
+    async (student: StudentDto) => {
+      setRestorePending(true);
+      try {
+        await studentsApi.restore(student.id);
+        // Drop from the archived view immediately; React Query refetch
+        // will bring it back into the active tab when the user
+        // switches over.
+        setList((prev) =>
+          prev ? prev.filter((s) => s.id !== student.id) : prev,
+        );
+        await qc.invalidateQueries({ queryKey: ["students"] });
+        toast.success(
+          `${student.firstName} ${student.lastName} restored`,
+          { description: "Back in the active roster." },
+        );
+        setRestoreTarget(null);
+      } catch (err) {
+        if (err instanceof ApiError && err.status === 401) {
+          router.replace("/login");
+          return;
+        }
+        const msg =
+          err instanceof ApiError
+            ? err.message
+            : err instanceof Error
+              ? err.message
+              : "Failed to restore student.";
+        toast.error(msg);
+      } finally {
+        setRestorePending(false);
+      }
+    },
+    [qc, router],
+  );
+
+  // On unmount: flush pending archives so the user's intent isn't dropped.
   React.useEffect(() => {
     const pending = pendingDeletesRef.current;
     return () => {
       pending.forEach(({ student, animTimeoutId, apiTimeoutId }) => {
         clearTimeout(animTimeoutId);
         clearTimeout(apiTimeoutId);
-        studentsApi.remove(student.id).catch(() => {
+        studentsApi.archive(student.id).catch(() => {
           /* fire-and-forget on unmount */
         });
       });
@@ -415,6 +495,13 @@ export default function StudentsPage() {
     [list, resolveAssignment, router],
   );
 
+  const archiveTargetName = archiveTarget
+    ? `${archiveTarget.firstName} ${archiveTarget.lastName}`.trim()
+    : "";
+  const restoreTargetName = restoreTarget
+    ? `${restoreTarget.firstName} ${restoreTarget.lastName}`.trim()
+    : "";
+
   return (
     <div className="space-y-6">
       <Header
@@ -425,6 +512,25 @@ export default function StudentsPage() {
         onImport={() => setImportOpen(true)}
         onRefresh={refresh}
       />
+
+      {/* Phase DATA LIFECYCLE Part 1: tabs that switch the roster
+          between Active (default) and Archived rows. Admin-only —
+          teachers don't need a view onto archived students. */}
+      {isAdmin && (
+        <div className="flex items-center gap-1 border-b border-border/60">
+          <ViewTab
+            label="Active"
+            active={viewMode === "active"}
+            onClick={() => setViewMode("active")}
+          />
+          <ViewTab
+            label="Archived"
+            active={viewMode === "archived"}
+            onClick={() => setViewMode("archived")}
+            icon={<Archive className="h-3.5 w-3.5" />}
+          />
+        </div>
+      )}
 
       {/* Search bar — own row, full width, below the header.
           Class filter sits to the right so admins can scope quickly
@@ -508,17 +614,21 @@ export default function StudentsPage() {
           <StudentTable
             students={filtered}
             classes={classes}
-            // canModify gates Edit/Delete row actions AND the inline
+            // canModify gates Edit/Archive row actions AND the inline
             // section picker (assigning a section is a PATCH the
             // backend rejects for non-admin users). Teachers see a
             // read-only roster.
             canModify={isAdmin}
             onEdit={setEditTarget}
-            onDelete={setDeleteTarget}
+            onArchive={setArchiveTarget}
+            onRestore={setRestoreTarget}
             onAssignSection={handleAssignSection}
             highlightIds={highlightIds}
             removingIds={removingIds}
             assigningIds={assigningIds}
+            // Phase DATA LIFECYCLE Part 1: archived view swaps the
+            // trash icon for a restore icon + suppresses inline edit.
+            archivedView={viewMode === "archived"}
           />
         )}
 
@@ -555,10 +665,55 @@ export default function StudentsPage() {
         onClose={() => setEditTarget(null)}
         onUpdated={handleUpdated}
       />
-      <DeleteStudentDialog
-        student={deleteTarget}
-        onClose={() => setDeleteTarget(null)}
-        onConfirm={scheduleDelete}
+      <ArchiveRecordDialog
+        open={archiveTarget !== null}
+        title="Archive student?"
+        recordLabel={archiveTargetName}
+        description={
+          <>
+            <span className="font-medium text-foreground">
+              {archiveTargetName}
+            </span>{" "}
+            will be hidden from rosters, pickers, and the cashier workspace.
+            Attendance, payment, and result history is preserved — you can
+            restore the record at any time from the Archived tab.
+          </>
+        }
+        isPending={archivePending}
+        onCancel={() => {
+          if (archivePending) return;
+          setArchiveTarget(null);
+        }}
+        onConfirm={(reason) => {
+          if (!archiveTarget) return;
+          // Hand off to the optimistic-undo scheduler. The dialog can
+          // close immediately — the snackbar drives the rest of the
+          // archive UX from here.
+          const target = archiveTarget;
+          setArchiveTarget(null);
+          scheduleArchive(target, reason);
+        }}
+      />
+      <RestoreRecordDialog
+        open={restoreTarget !== null}
+        title="Restore student?"
+        recordLabel={restoreTargetName}
+        description={
+          <>
+            Bring{" "}
+            <span className="font-medium text-foreground">
+              {restoreTargetName}
+            </span>{" "}
+            back into the active roster. They will appear in pickers,
+            attendance, and the cashier workspace again.
+          </>
+        }
+        isPending={restorePending}
+        onCancel={() => (restorePending ? undefined : setRestoreTarget(null))}
+        onConfirm={() => {
+          if (!restoreTarget) return;
+          handleRestoreConfirmed(restoreTarget);
+        }}
       />
       <ImportStudentsDialog
         open={importOpen}
@@ -656,6 +811,48 @@ function Header({
         )}
       </div>
     </div>
+  );
+}
+
+/**
+ * Phase DATA LIFECYCLE Part 1 — Active / Archived tab strip.
+ * Sits directly under the page header; the active tab carries the
+ * primary underline tone so the operator always knows which
+ * subset of students they're looking at.
+ */
+function ViewTab({
+  label,
+  active,
+  onClick,
+  icon,
+}: {
+  label: string;
+  active: boolean;
+  onClick: () => void;
+  icon?: React.ReactNode;
+}) {
+  return (
+    <button
+      type="button"
+      onClick={onClick}
+      aria-pressed={active}
+      className={cn(
+        "relative inline-flex items-center gap-1.5 px-4 py-2 text-sm font-medium transition-colors",
+        active
+          ? "text-foreground"
+          : "text-muted-foreground hover:text-foreground",
+      )}
+    >
+      {icon}
+      {label}
+      <span
+        aria-hidden
+        className={cn(
+          "absolute inset-x-1 -bottom-px h-[2px] rounded-full transition-opacity",
+          active ? "bg-primary opacity-100" : "opacity-0",
+        )}
+      />
+    </button>
   );
 }
 

@@ -6,6 +6,7 @@ import {
   NotificationSeverity,
   Prisma,
 } from '@prisma/client';
+import { txWithRetry } from '../common/db/tx-retry';
 import { PrismaService } from '../database/prisma.service';
 import { EmailChannel } from './channels/email.channel';
 import { InAppChannel } from './channels/in-app.channel';
@@ -184,7 +185,13 @@ export class NotificationService {
     }
 
     // Persist Notification + Delivery rows in one transaction.
-    const created = await this.prisma.$transaction(async (tx) => {
+    //
+    // Phase RELIABILITY Part 1: wrapped via `txWithRetry` so a P2034
+    // during high-fanout notification bursts (e.g. exam publish for
+    // a whole class) retries instead of dropping the notification.
+    // Dedupe-key unique violations stay unwrapped — the caller wants
+    // to know about them so it can short-circuit.
+    const created = await txWithRetry(this.prisma, async (tx) => {
       const notif = await tx.notification.create({
         data: {
           templateKey: input.templateKey,
@@ -209,7 +216,7 @@ export class NotificationService {
         ),
       );
       return { notif, deliveries };
-    });
+    }, { label: 'enqueue-notification' });
 
     // Render once per channel — templates may produce different
     // shapes (email subject vs in-app title).

@@ -3,6 +3,7 @@
 import * as React from "react";
 import {
   AlertTriangle,
+  Archive,
   CheckCircle2,
   Circle,
   CloudOff,
@@ -210,6 +211,74 @@ export function PublishedBadge({ size = "md", className }: PublishedBadgeProps) 
       className={className}
     />
   );
+}
+
+// ---------------------------------------------------------------------------
+// ArchivedBadge — surfaces the soft-delete state on Student / Exam
+// rows. Tooltip carries the "archived on / by" trust info so operators
+// don't have to open a detail view to see who hid the record.
+//
+// Phase DATA LIFECYCLE Part 1+5: every list that surfaces archived
+// entities should pair this badge with the row so the operator
+// understands why it's read-only.
+// ---------------------------------------------------------------------------
+
+export interface ArchivedBadgeProps {
+  /** ISO timestamp; renders the "archived on" date in the tooltip. */
+  archivedAt: string | Date | null | undefined;
+  /** Optional human label for who archived it. */
+  archivedByLabel?: string | null;
+  /** Optional reason captured at archive time. */
+  reason?: string | null;
+  size?: "sm" | "md";
+  className?: string;
+}
+
+export function ArchivedBadge({
+  archivedAt,
+  archivedByLabel,
+  reason,
+  size = "md",
+  className,
+}: ArchivedBadgeProps) {
+  if (!archivedAt) return null;
+  const dateLabel = formatArchivedDate(archivedAt);
+  const tooltipParts: string[] = [];
+  if (dateLabel) tooltipParts.push(`Archived ${dateLabel}`);
+  if (archivedByLabel) tooltipParts.push(`by ${archivedByLabel}`);
+  if (reason) tooltipParts.push(`— ${reason}`);
+  const tooltip =
+    tooltipParts.length > 0
+      ? tooltipParts.join(" ")
+      : "This record is archived. Restore it before editing.";
+  return (
+    <BadgeChrome
+      icon={Archive}
+      label="Archived"
+      tone="slate"
+      size={size}
+      tooltip={tooltip}
+      className={className}
+    />
+  );
+}
+
+/**
+ * Render an ISO timestamp into the YYYY-MM-DD form used in the
+ * archived tooltip. Falls back to the raw string when parsing fails so
+ * the tooltip stays informative rather than going blank.
+ */
+function formatArchivedDate(value: string | Date): string {
+  try {
+    const d = value instanceof Date ? value : new Date(value);
+    if (Number.isNaN(d.getTime())) return String(value);
+    const yyyy = d.getFullYear();
+    const mm = String(d.getMonth() + 1).padStart(2, "0");
+    const dd = String(d.getDate()).padStart(2, "0");
+    return `on ${yyyy}-${mm}-${dd}`;
+  } catch {
+    return String(value);
+  }
 }
 
 // ---------------------------------------------------------------------------

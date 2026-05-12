@@ -14,6 +14,7 @@ import {
   PaymentMethod,
   Prisma,
 } from '@prisma/client';
+import { txWithRetry } from '../common/db/tx-retry';
 import { PrismaService } from '../database/prisma.service';
 import BikramSambat from 'bikram-sambat-js';
 import { NotificationService } from '../notifications/notification.service';
@@ -1185,34 +1186,46 @@ export class FeesService {
     // — only the lifecycle flag — so the original receipt stays valid
     // forever. Wrapping both writes in a transaction guarantees the
     // status flip can't drift from the refund row's existence.
-    const [refundRow] = await this.prisma.$transaction([
-      this.prisma.payment.create({
-        data: {
-          studentId: source.studentId,
-          amount: -Math.abs(round(dto.amount, 2)),
-          date: today,
-          feeAssignmentId: source.feeAssignmentId,
-          schoolId,
-          receiptNumber: refundReceiptNumber,
-          notes: dto.notes ?? null,
-          method: null,
-          refundOfPaymentId: source.id,
-          refundReason: dto.reason,
-          // The refund slip itself is ACTIVE — it's a real payment row.
-          // Only the source flips to REFUNDED.
-          status: 'ACTIVE',
-          createdById: actingUserId ?? null,
-          updatedById: actingUserId ?? null,
-        },
-      }),
-      this.prisma.payment.update({
-        where: { id: source.id },
-        data: {
-          status: 'REFUNDED',
-          ...(actingUserId ? { updatedById: actingUserId } : {}),
-        },
-      }),
-    ]);
+    //
+    // Phase RELIABILITY-II Part 2: migrated array-form $transaction
+    // to callback-form `txWithRetry`. The original array form
+    // returned `[refundRow, _updated]` and destructured the first
+    // element; the callback form is equivalent — create first, update
+    // second, return the created row. Order matters here for the
+    // notification side-effect below, which reads `refundRow.id`.
+    const refundRow = await txWithRetry(
+      this.prisma,
+      async (tx) => {
+        const created = await tx.payment.create({
+          data: {
+            studentId: source.studentId,
+            amount: -Math.abs(round(dto.amount, 2)),
+            date: today,
+            feeAssignmentId: source.feeAssignmentId,
+            schoolId,
+            receiptNumber: refundReceiptNumber,
+            notes: dto.notes ?? null,
+            method: null,
+            refundOfPaymentId: source.id,
+            refundReason: dto.reason,
+            // The refund slip itself is ACTIVE — it's a real payment row.
+            // Only the source flips to REFUNDED.
+            status: 'ACTIVE',
+            createdById: actingUserId ?? null,
+            updatedById: actingUserId ?? null,
+          },
+        });
+        await tx.payment.update({
+          where: { id: source.id },
+          data: {
+            status: 'REFUNDED',
+            ...(actingUserId ? { updatedById: actingUserId } : {}),
+          },
+        });
+        return created;
+      },
+      { label: 'issue-refund' },
+    );
 
     // Phase 20 — fire the refund-receipt notification when the
     // student has a linked user with an email. Mirrors the payment-

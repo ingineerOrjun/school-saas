@@ -21,6 +21,7 @@ import { RolesGuard } from '../auth/guards/roles.guard';
 import { Roles } from '../common/decorators/roles.decorator';
 import { TeacherScopeService } from '../common/auth/teacher-scope.service';
 import type { AuthenticatedUser } from '../auth/jwt.strategy';
+import { ArchiveExamDto } from './dto/archive-exam.dto';
 import { BulkSaveResultsDto } from './dto/bulk-save-results.dto';
 import { CreateExamDto } from './dto/create-exam.dto';
 import { CreateSubjectDto } from './dto/create-subject.dto';
@@ -70,11 +71,22 @@ export class ExamsController {
   listExams(
     @CurrentUser() user: AuthenticatedUser,
     @Query('sessionId') sessionId?: string,
+    @Query('archived') archived?: string,
   ) {
     // Optional ?sessionId filter — when omitted, every exam in the
     // school comes back. Backward-compatible with callers that
     // haven't adopted the session selector yet.
-    return this.exams.findAll(user.schoolId, sessionId);
+    //
+    // Phase DATA LIFECYCLE Part 1: `?archived=` driver for the exams-
+    // page tab. '1' / 'true' → only archived; 'all' → both; else
+    // active-only default.
+    const archivedFilter: boolean | 'all' | undefined =
+      archived === '1' || archived === 'true'
+        ? true
+        : archived === 'all'
+          ? 'all'
+          : undefined;
+    return this.exams.findAll(user.schoolId, sessionId, archivedFilter);
   }
 
   /**
@@ -107,8 +119,65 @@ export class ExamsController {
   removeExam(
     @Param('id', ParseUUIDPipe) id: string,
     @CurrentUser() user: AuthenticatedUser,
+    @Req() req: ExpressRequest,
   ) {
-    return this.exams.remove(id, user.schoolId);
+    // Phase DATA LIFECYCLE Part 1: DELETE is preserved for back-compat
+    // but routes through `archiveExam()` so result history isn't lost.
+    return this.exams.remove(id, user.schoolId, {
+      userId: user.id,
+      email: user.email,
+      role: user.role,
+      ip: req.ip ?? null,
+      userAgent: req.headers['user-agent'] ?? null,
+    });
+  }
+
+  /**
+   * Soft-archive an exam. ADMIN-only — same scope as the underlying
+   * delete. Idempotent. Emits EXAM_ARCHIVED with the optional reason.
+   */
+  @Post('exams/:id/archive')
+  @HttpCode(HttpStatus.OK)
+  @Roles(Role.ADMIN)
+  archiveExam(
+    @Param('id', ParseUUIDPipe) id: string,
+    @Body() dto: ArchiveExamDto,
+    @CurrentUser() user: AuthenticatedUser,
+    @Req() req: ExpressRequest,
+  ) {
+    return this.exams.archiveExam(
+      id,
+      user.schoolId,
+      {
+        userId: user.id,
+        email: user.email,
+        role: user.role,
+        ip: req.ip ?? null,
+        userAgent: req.headers['user-agent'] ?? null,
+      },
+      dto.reason ?? null,
+    );
+  }
+
+  /**
+   * Restore a previously archived exam. ADMIN-only. Idempotent. Emits
+   * EXAM_RESTORED.
+   */
+  @Post('exams/:id/restore')
+  @HttpCode(HttpStatus.OK)
+  @Roles(Role.ADMIN)
+  restoreExam(
+    @Param('id', ParseUUIDPipe) id: string,
+    @CurrentUser() user: AuthenticatedUser,
+    @Req() req: ExpressRequest,
+  ) {
+    return this.exams.restoreExam(id, user.schoolId, {
+      userId: user.id,
+      email: user.email,
+      role: user.role,
+      ip: req.ip ?? null,
+      userAgent: req.headers['user-agent'] ?? null,
+    });
   }
 
   /**
@@ -147,6 +216,54 @@ export class ExamsController {
     @Req() req: ExpressRequest,
   ) {
     return this.exams.unlockExam(id, user.schoolId, {
+      userId: user.id,
+      email: user.email,
+      role: user.role,
+      ip: req.ip ?? null,
+      userAgent: req.headers['user-agent'] ?? null,
+    });
+  }
+
+  /**
+   * Phase ACADEMIC TRANSITION SAFETY Part 4 — publish marks. ADMIN-
+   * only. Idempotent. After this lands, parent-facing marksheets
+   * show the exam as Published (icon + tooltip).
+   *
+   * Orthogonal to lock: a published exam can still be unlocked for
+   * a correction; relock when done. The audit trail captures every
+   * toggle separately.
+   */
+  @Patch('exams/:id/publish')
+  @HttpCode(HttpStatus.OK)
+  @Roles(Role.ADMIN)
+  publishExam(
+    @Param('id', ParseUUIDPipe) id: string,
+    @CurrentUser() user: AuthenticatedUser,
+    @Req() req: ExpressRequest,
+  ) {
+    return this.exams.publishExam(id, user.schoolId, {
+      userId: user.id,
+      email: user.email,
+      role: user.role,
+      ip: req.ip ?? null,
+      userAgent: req.headers['user-agent'] ?? null,
+    });
+  }
+
+  /**
+   * Phase ACADEMIC TRANSITION SAFETY Part 4 — unpublish marks
+   * (rollback to Draft). ADMIN-only. Idempotent. Rejects locked
+   * exams with 409 — unlock first if a correction is needed.
+   */
+  @Patch('exams/:id/unpublish')
+  @HttpCode(HttpStatus.OK)
+  @Roles(Role.ADMIN)
+  unpublishExam(
+    @Param('id', ParseUUIDPipe) id: string,
+    @CurrentUser() user: AuthenticatedUser,
+    @Req() req: ExpressRequest,
+  ) {
+    return this.exams.unpublishExam(id, user.schoolId, {
       userId: user.id,
       email: user.email,
       role: user.role,

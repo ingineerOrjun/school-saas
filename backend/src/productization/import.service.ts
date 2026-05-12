@@ -5,6 +5,7 @@ import {
   NotFoundException,
 } from '@nestjs/common';
 import { type ImportRun, Prisma } from '@prisma/client';
+import { txWithRetry } from '../common/db/tx-retry';
 import { PrismaService } from '../database/prisma.service';
 import { StudentRegistrationNumberService } from '../student/services/student-registration-number.service';
 
@@ -243,7 +244,11 @@ export class ImportService {
           );
       }
 
-      await this.prisma.$transaction(async (tx) => {
+      // Phase RELIABILITY Part 1: wrapped via `txWithRetry` so a
+      // P2034 mid-import retries the whole batch atomically. We use
+      // a longer slowMs (5000) because legitimate large imports can
+      // exceed the default 1500ms threshold without being broken.
+      await txWithRetry(this.prisma, async (tx) => {
         if (run.entity === 'students') {
           for (let i = 0; i < allRows.length; i++) {
             const r = allRows[i];
@@ -278,7 +283,7 @@ export class ImportService {
             importedCount += 1;
           }
         }
-      });
+      }, { label: 'commit-import', slowMs: 5000 });
 
       const updated = await this.prisma.importRun.update({
         where: { id: run.id },
