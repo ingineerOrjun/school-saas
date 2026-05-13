@@ -3,6 +3,7 @@
 import * as React from "react";
 import { useQuery } from "@tanstack/react-query";
 import { useAuthReady } from "@/hooks/useAuthReady";
+import { isNetworkError } from "@/lib/api";
 import {
   academicSessionsApi,
   type AcademicSessionDto,
@@ -75,6 +76,7 @@ export function AcademicSessionProvider({
     refetchOnWindowFocus: false,
     refetchOnMount: false,
     retry: (failureCount, error) => {
+      if (isNetworkError(error)) return false;
       const status = (error as { status?: number } | null)?.status;
       if (status === 401 || status === 403) return false;
       return failureCount < 1;

@@ -2,7 +2,6 @@
 
 import * as React from "react";
 import Link from "next/link";
-import { useRouter } from "next/navigation";
 import {
   AlertCircle,
   ArrowRight,
@@ -22,7 +21,7 @@ import { Skeleton } from "@/components/ui/Skeleton";
 import { Table, THead, TBody, Tr, Th, Td } from "@/components/ui/Table";
 import { EmptyState } from "@/components/ui/EmptyState";
 import {
-  dashboardApi,
+  useTeacherSummary,
   type TeacherDashboardAssignment,
   type TeacherDashboardSummary,
 } from "@/lib/dashboard";
@@ -49,8 +48,33 @@ import { cn } from "@/lib/utils";
  * concerns and would be confusing on a teacher's first screen.
  */
 export function TeacherDashboardView() {
-  const router = useRouter();
-  const [data, setData] = React.useState<TeacherDashboardSummary | null>(null);
+  // Dashboard summary — sourced from the shared React Query cache
+  // via `useTeacherSummary()`. Previously this was a manual
+  // `dashboardApi.getTeacherSummary()` call inside a useEffect, which
+  // bypassed cache governance and double-fired under React StrictMode
+  // (the 1ms-gap duplicate that the RequestPressurePanel was flagging).
+  // The hook owns:
+  //   • initial fetch on mount (replaces the old `load(false)` effect)
+  //   • dedupe of simultaneous mounts via queryKey
+  //   • 30s staleTime so rapid SPA navigation hits cache
+  // The visibility-wake handler below still drives manual refreshes by
+  // calling `summaryQuery.refetch()` so the existing 2s-cooldown +
+  // visibility filter UX is preserved verbatim.
+  const summaryQuery = useTeacherSummary();
+  const data = summaryQuery.data ?? null;
+  const loading = summaryQuery.isLoading;
+  // `refreshing` distinguishes "background refetch with data already
+  // visible" from "first-paint loading" — drives the spinner on the
+  // hero / unassigned cards without re-collapsing the page to the
+  // skeleton.
+  const refreshing = summaryQuery.isFetching && !summaryQuery.isLoading;
+  const error = React.useMemo<string | null>(() => {
+    if (!summaryQuery.error) return null;
+    const err = summaryQuery.error;
+    if (err instanceof ApiError) return err.message;
+    if (err instanceof Error) return err.message;
+    return "Failed to load dashboard.";
+  }, [summaryQuery.error]);
   // Source of truth for "what am I assigned to?". Backed by the shared
   // `useMyTeachingAssignments()` React Query cache (10m staleTime /
   // 30m gcTime, no refetch-on-mount/focus) so multiple tabs and the
@@ -67,9 +91,6 @@ export function TeacherDashboardView() {
     isLoading: assignmentsLoading,
     error: assignmentsError,
   } = useMyTeachingAssignments();
-  const [loading, setLoading] = React.useState(true);
-  const [refreshing, setRefreshing] = React.useState(false);
-  const [error, setError] = React.useState<string | null>(null);
 
   // 403 here means "no Teacher row / role mismatch" — the existing UX
   // is to render the unassigned hero, NOT the page-level error banner.
@@ -87,57 +108,31 @@ export function TeacherDashboardView() {
   // simply omits the sparkline slot.
   const [trend, setTrend] = React.useState<AttendanceTrend | null>(null);
 
-  const load = React.useCallback(async (isRefresh: boolean) => {
-    if (isRefresh) {
-      // Two-layer suppression for repeated Refresh / "Check again"
-      // taps + UnassignedHero's 7s self-poll while the user is
-      // mashing buttons:
-      //   1. shared-module cooldown (2s) catches the rapid-click
-      //      race where setRefreshing(true) hasn't committed yet
-      //      so the button briefly stays clickable.
-      //   2. setRefreshing(true) drives the button's loading state
-      //      so subsequent clicks are visually blocked too.
-      if (!shouldAllowRequest("teacher-summary-refresh", 2000)) return;
-      setRefreshing(true);
-    } else {
-      setLoading(true);
-    }
-    setError(null);
-    try {
-      // Assignments flow through the React Query cache
-      // (`useMyTeachingAssignments`) above — load() is responsible
-      // only for the dashboard summary. Refreshing the assignments
-      // cache is intentionally NOT triggered from here so that
-      // background pollers (e.g. UnassignedHero's 7s self-poll) only
-      // re-check the unassigned state via the summary endpoint and
-      // never burn quota re-pulling reference data. The assignments
-      // cache updates naturally when its 10m staleTime expires.
-      const summary = await dashboardApi.getTeacherSummary();
-      setData(summary);
-    } catch (err) {
-      // 401 — token expired/invalid. Global handler in api.ts already
-      // started the redirect; keep the early return so this view
-      // doesn't try to render with partial state.
-      if (err instanceof ApiError && err.status === 401) {
-        router.replace("/login");
-        return;
-      }
-      const msg =
-        err instanceof ApiError
-          ? err.message
-          : err instanceof Error
-            ? err.message
-            : "Failed to load dashboard.";
-      setError(msg);
-    } finally {
-      if (isRefresh) setRefreshing(false);
-      else setLoading(false);
-    }
-  }, [router]);
-
-  React.useEffect(() => {
-    void load(false);
-  }, [load]);
+  // Refresh path used by the Refresh / "Check again" buttons, the
+  // visibility-wake handler, the UnassignedHero 7s self-poll, and
+  // the error banner's Try Again. The 2s shared cooldown catches
+  // the rapid-click race where the button hasn't committed its
+  // loading state yet, and `refetch()` itself is in-flight-aware so
+  // even without the cooldown a double-click wouldn't fan out.
+  //
+  // Why `void summaryQuery.refetch()` instead of awaiting:
+  //   The original `load()` was awaited only to coordinate the
+  //   manual `setLoading(false)`. With React Query owning the
+  //   `isFetching` flag now, we don't need to await — fire and
+  //   forget keeps the click handlers synchronous.
+  //
+  // Initial mount fetch is now owned by the hook itself; the
+  // `useEffect(() => void load(false), [load])` from the previous
+  // implementation has been removed. React Query fires the first
+  // request automatically when the query mounts with
+  // `enabled: true`. This also removes the StrictMode-induced 1ms
+  // double-fire that was the original symptom — React Query
+  // dedupes by queryKey so the second mount joins the in-flight
+  // first one.
+  const refresh = React.useCallback(() => {
+    if (!shouldAllowRequest("teacher-summary-refresh", 2000)) return;
+    void summaryQuery.refetch();
+  }, [summaryQuery]);
 
   // Refresh on tab focus / visibility change. Solves the common
   // "admin just added an assignment but I don't see it" surprise:
@@ -171,7 +166,7 @@ export function TeacherDashboardView() {
       const now = Date.now();
       if (now - lastFire < 2_000) return;
       lastFire = now;
-      void load(true);
+      refresh();
     };
     document.addEventListener("visibilitychange", onWake);
     window.addEventListener("focus", onWake);
@@ -179,7 +174,7 @@ export function TeacherDashboardView() {
       document.removeEventListener("visibilitychange", onWake);
       window.removeEventListener("focus", onWake);
     };
-  }, [load]);
+  }, [refresh]);
 
   // Removed: the two-phase background polling effect (5s fast-burst
   // for the first 12s, 45s thereafter). It was the single largest
@@ -287,7 +282,7 @@ export function TeacherDashboardView() {
         : "Failed to load dashboard.");
     return (
       <div className="space-y-6">
-        <ErrorBanner message={msg} onRetry={() => load(true)} />
+        <ErrorBanner message={msg} onRetry={refresh} />
       </div>
     );
   }
@@ -304,7 +299,7 @@ export function TeacherDashboardView() {
     return (
       <UnassignedHero
         teacherName={data.teacher.name}
-        onRefresh={() => load(true)}
+        onRefresh={refresh}
         refreshing={refreshing}
       />
     );
@@ -328,7 +323,7 @@ export function TeacherDashboardView() {
         scopeLabel={scopeLabel}
         attendanceMarked={data.today.attendanceMarked}
         attendanceHref={attendanceHref}
-        onRefresh={() => load(true)}
+        onRefresh={refresh}
         refreshing={refreshing}
       />
 

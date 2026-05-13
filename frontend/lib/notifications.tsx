@@ -7,7 +7,7 @@ import {
   useQueryClient,
   type UseQueryOptions,
 } from "@tanstack/react-query";
-import { ApiError, api } from "./api";
+import { ApiError, api, isNetworkError } from "./api";
 import { useAuthReady } from "@/hooks/useAuthReady";
 
 // ---------------------------------------------------------------------------
@@ -179,9 +179,15 @@ export function useUnreadCount() {
     // Don't refetch on focus — the interval is already enough for
     // a long-lived ERP tab.
     refetchOnWindowFocus: false,
-    // Don't retry the badge — a single failure isn't worth a toast
-    // and the next poll will reconcile.
-    retry: 1,
+    // One retry on transient hiccups; the next 60s poll reconciles
+    // any failure that survives. Network errors are skipped — see
+    // `isNetworkError` rationale in `lib/api.ts`. Without this
+    // guard, an offline backend produced 2 unread-count attempts
+    // per poll across every tab.
+    retry: (failureCount, error) => {
+      if (isNetworkError(error)) return false;
+      return failureCount < 1;
+    },
   });
 }
 
@@ -207,7 +213,11 @@ export function useNotificationList(
     refetchOnMount: options.refetchOnMount ?? false,
     staleTime: 30_000,
     refetchOnWindowFocus: false,
-    retry: 1,
+    // Skip retry on network failure (matches the global policy).
+    retry: (failureCount, error) => {
+      if (isNetworkError(error)) return false;
+      return failureCount < 1;
+    },
     placeholderData: (prev) => prev,
   });
 }

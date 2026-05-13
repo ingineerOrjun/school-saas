@@ -89,6 +89,11 @@ export function RefundPaymentDialog({
   const [amount, setAmount] = React.useState("");
   const [reason, setReason] = React.useState("");
   const [notes, setNotes] = React.useState("");
+  // Phase FINAL-HARDENING Part 3: typed-confirmation. The cashier
+  // must re-type the receipt number (or 'REFUND' if there's none)
+  // BEFORE the destructive button enables. Prevents fast-click
+  // mistakes where two refund dialogs are open in quick succession.
+  const [typedConfirm, setTypedConfirm] = React.useState("");
   const [submitting, setSubmitting] = React.useState(false);
 
   React.useEffect(() => {
@@ -98,8 +103,17 @@ export function RefundPaymentDialog({
       setAmount(payment.amount.toFixed(2));
       setReason("");
       setNotes("");
+      setTypedConfirm("");
     }
   }, [payment]);
+
+  // The exact string the cashier must type. Receipt number is the
+  // strongest identifier; fall back to a literal 'REFUND' for the
+  // rare legacy row that lacks one. Compared case-sensitively
+  // after trimming.
+  const expectedConfirm = (payment?.receiptNumber ?? "REFUND").trim();
+  const typedConfirmMatches =
+    typedConfirm.trim() === expectedConfirm && expectedConfirm.length > 0;
 
   // Live validation. Pulled into a memo so the render path doesn't
   // recompute on every keystroke when only one field changed.
@@ -111,6 +125,10 @@ export function RefundPaymentDialog({
     const withinCap = numeric && n <= payment.amount + 0.0001;
     const reasonLong = reason.trim().length >= REASON_MIN_LENGTH;
     return {
+      // Note: typed-confirm match is checked at the submit boundary,
+      // NOT here — adding it to `valid` would re-run this memo on
+      // every keystroke in the confirm field. The button's disabled
+      // state ANDs them together at render time below.
       valid: numeric && withinCap && reasonLong,
       amountValid: numeric && withinCap,
       reasonValid: reasonLong,
@@ -125,6 +143,16 @@ export function RefundPaymentDialog({
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
     if (!payment || submitting) return;
+    // Phase FINAL-HARDENING Part 3: defence-in-depth — the button
+    // is also disabled when the typed confirm doesn't match, but
+    // a stray Enter on the reason textarea could still try to
+    // submit. Block here too.
+    if (!typedConfirmMatches) {
+      toast.error(
+        `Type the receipt number "${expectedConfirm}" to confirm the refund.`,
+      );
+      return;
+    }
     if (!validation.valid) {
       // Defensive — the button is disabled when invalid, but a stray
       // Enter-press could still submit. Surface the first failing
@@ -201,7 +229,13 @@ export function RefundPaymentDialog({
               type="submit"
               form="refund-form"
               loading={submitting}
-              disabled={submitting || !validation.valid}
+              // Phase FINAL-HARDENING Part 3: AND in the typed-
+              // confirm match so the destructive button stays
+              // disabled until the cashier proves intent by typing
+              // the receipt number.
+              disabled={
+                submitting || !validation.valid || !typedConfirmMatches
+              }
               variant="destructive"
               leftIcon={<RotateCcw className="h-4 w-4" />}
             >
@@ -343,6 +377,51 @@ export function RefundPaymentDialog({
               placeholder="e.g. Parent prefers credit on next month · Refund handed over in cash"
               className="w-full rounded-md border border-border bg-surface px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-primary/25 focus:border-primary resize-none"
             />
+          </div>
+
+          {/* Phase FINAL-HARDENING Part 3 — typed-confirm.
+              Required FINAL field. Forces the cashier to type the
+              receipt number before the destructive button enables.
+              Prevents fast-click mistakes (two refund dialogs open
+              in quick succession; muscle memory clicks both). */}
+          <div className="flex flex-col gap-1.5">
+            <label
+              htmlFor="refund-typed-confirm"
+              className="text-sm font-medium text-foreground"
+            >
+              Type{" "}
+              <span className="font-mono text-foreground">
+                {expectedConfirm}
+              </span>{" "}
+              to confirm refund{" "}
+              <span className="text-destructive" aria-label="required">
+                *
+              </span>
+            </label>
+            <input
+              id="refund-typed-confirm"
+              type="text"
+              value={typedConfirm}
+              onChange={(e) => setTypedConfirm(e.target.value)}
+              disabled={submitting}
+              placeholder={expectedConfirm}
+              autoComplete="off"
+              spellCheck={false}
+              className={cn(
+                "h-10 w-full rounded-md border bg-surface px-3 text-sm font-mono",
+                "focus:outline-none focus:ring-2 focus:ring-destructive/25",
+                typedConfirm.length > 0 && !typedConfirmMatches
+                  ? "border-destructive focus:border-destructive"
+                  : typedConfirmMatches
+                    ? "border-destructive/50"
+                    : "border-border",
+              )}
+            />
+            <p className="text-xs text-muted-foreground">
+              {typedConfirmMatches
+                ? "Match confirmed — refund button is now enabled."
+                : "The destructive button stays disabled until this matches."}
+            </p>
           </div>
 
           {/* Warning banner — explicit about the audit-trail behaviour.

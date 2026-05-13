@@ -1,4 +1,10 @@
-import { IsOptional, IsString, MaxLength, MinLength } from 'class-validator';
+import {
+  IsDateString,
+  IsOptional,
+  IsString,
+  MaxLength,
+  MinLength,
+} from 'class-validator';
 
 export class UpdateClassDto {
   @IsOptional()
@@ -6,4 +12,12 @@ export class UpdateClassDto {
   @MinLength(1)
   @MaxLength(60)
   name?: string;
+
+  /**
+   * Phase FINAL-HARDENING Part 2: optimistic-concurrency stamp.
+   * Optional during rollout — see `common/db/optimistic-update.ts`.
+   */
+  @IsOptional()
+  @IsDateString()
+  updatedAt?: string;
 }

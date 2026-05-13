@@ -73,4 +73,16 @@ export class UpdateStudentDto {
   @IsOptional()
   @IsUUID()
   sectionId?: string | null;
+
+  /**
+   * Phase FINAL-HARDENING Part 2: optimistic-concurrency stamp the
+   * client round-trips from the GET. The service-layer
+   * `assertNotStaleAndUpdate` uses this to reject a write whose
+   * row has moved since the client loaded it. Optional during the
+   * rollout window — clients that omit it fall back to last-write-
+   * wins. New clients SHOULD include it.
+   */
+  @IsOptional()
+  @IsDateString()
+  updatedAt?: string;
 }

@@ -219,8 +219,12 @@ export function AssignmentsDialog({
       // Diagnostic — surfaces what the admin's perspective just
       // wrote. Pair this with the teacher-dashboard log to spot
       // mismatches between "what I saved" and "what the teacher's
-      // dashboard reads back".
-      console.log("Assignments (admin save result):", updated);
+      // dashboard reads back". Dev-only — silent in production so
+      // operator consoles stay clean.
+      if (process.env.NODE_ENV !== "production") {
+        // eslint-disable-next-line no-console
+        console.log("Assignments (admin save result):", updated);
+      }
       // Re-seed initial state from the just-saved cells so isDirty
       // flips back to false. Server is the source of truth, so we
       // also rebuild from `updated` rather than from cellState — that

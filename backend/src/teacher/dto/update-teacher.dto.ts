@@ -1,4 +1,11 @@
-import { IsOptional, IsString, IsUUID, MaxLength, MinLength } from 'class-validator';
+import {
+  IsDateString,
+  IsOptional,
+  IsString,
+  IsUUID,
+  MaxLength,
+  MinLength,
+} from 'class-validator';
 
 /**
  * Edit-teacher payload. After the legacy column drop in 20260511,
@@ -17,4 +24,12 @@ export class UpdateTeacherDto {
   @IsOptional()
   @IsUUID()
   userId?: string;
+
+  /**
+   * Phase FINAL-HARDENING Part 2: optimistic-concurrency stamp.
+   * Optional during rollout — see `common/db/optimistic-update.ts`.
+   */
+  @IsOptional()
+  @IsDateString()
+  updatedAt?: string;
 }

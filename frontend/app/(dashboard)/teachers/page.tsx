@@ -393,7 +393,11 @@ function Header({
         <h1 className="text-3xl font-semibold tracking-tight text-foreground">
           Teachers
         </h1>
-        <p className="text-sm text-muted-foreground">
+        {/* Hydration fix: was `<p>`. The loading branch renders <Skeleton/>
+            which is a <div>; HTML forbids <div> inside <p>. Same visual
+            output — `text-sm text-muted-foreground` renders identically on
+            both, and Tailwind preflight strips the default <p> margin. */}
+        <div className="text-sm text-muted-foreground">
           {loading ? (
             <Skeleton className="inline-block h-3 w-28" />
           ) : count === 0 ? (
@@ -405,7 +409,7 @@ function Header({
               {count === 1 ? "member" : "members"}.
             </>
           )}
-        </p>
+        </div>
       </div>
       <div className="flex flex-wrap items-center gap-2">
         <Button

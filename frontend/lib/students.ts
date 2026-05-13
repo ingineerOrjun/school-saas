@@ -1,5 +1,5 @@
 import { useQuery } from "@tanstack/react-query";
-import { api } from "./api";
+import { api, isNetworkError } from "./api";
 import { useAuthReady } from "@/hooks/useAuthReady";
 import { qk } from "./query-keys";
 import { STALE } from "./query-client";
@@ -83,6 +83,13 @@ export interface UpdateStudentInput {
   userId?: string;
   classId?: string | null;
   sectionId?: string | null;
+  /**
+   * Phase FINAL-HARDENING Part 2: optimistic-concurrency stamp.
+   * Round-trip the value the GET returned so the backend can
+   * detect a cross-tab race. Omitted → backend falls back to
+   * last-write-wins (legacy clients during rollout).
+   */
+  updatedAt?: string;
 }
 
 export interface ListStudentsFilter {
@@ -242,6 +249,7 @@ export function useStudents(filter?: ListStudentsFilter) {
     refetchOnWindowFocus: false,
     refetchOnMount: false,
     retry: (failureCount, error) => {
+      if (isNetworkError(error)) return false;
       const status = (error as { status?: number } | null)?.status;
       if (status === 401 || status === 403) return false;
       return failureCount < 1;

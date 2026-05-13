@@ -1,5 +1,5 @@
 import { useQuery } from "@tanstack/react-query";
-import { api } from "./api";
+import { api, isNetworkError } from "./api";
 import { qk } from "./query-keys";
 
 export interface AssignmentClassRef {
@@ -140,6 +140,8 @@ export function useMyTeachingAssignments(options?: { enabled?: boolean }) {
     refetchOnWindowFocus: false,
     refetchOnMount: false,
     retry: (failureCount, error) => {
+      // Backend unreachable → don't retry; retries just spam.
+      if (isNetworkError(error)) return false;
       // Never retry auth errors — teacher is either assigned or not.
       const status = (error as { status?: number } | null)?.status;
       if (status === 401 || status === 403) return false;

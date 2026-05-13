@@ -19,16 +19,29 @@ import { RegisterAdminDto } from './dto/register-admin.dto';
 
 /**
  * Phase 9 — sensitive endpoints carry tighter rate limits than the
- * global default. The buckets themselves are configured in
- * AppModule (`ThrottlerModule.forRoot`):
+ * global default. Phase RELIABILITY-IV moved these limits OFF the
+ * global ThrottlerModule.forRoot config (where they applied to
+ * every request and silently blocked the dashboard) and INTO this
+ * file as per-route @Throttle decorators that override the
+ * `default` bucket's values for these two routes only.
  *
- *   • register → 5 requests / hour / IP. Provisioning a new tenant
- *     is a high-impact, low-volume action — five per hour is well
- *     above legitimate usage and well below an enumeration attack.
- *   • login    → 10 requests / minute / IP. The login form will
- *     occasionally retry on a typo; ten per minute leaves
- *     headroom for that without becoming a credential-stuffing
- *     channel.
+ *   • register → 5 requests / hour. Provisioning a new tenant is a
+ *     high-impact, low-volume action — five per hour is well above
+ *     legitimate usage and well below an enumeration attack.
+ *   • login    → 10 requests / minute. The login form will
+ *     occasionally retry on a typo; ten per minute leaves headroom
+ *     for that without becoming a credential-stuffing channel.
+ *
+ * Both decorators use the `default` bucket name because that's the
+ * bucket already evaluated globally — the per-route values
+ * override its limit / ttl / blockDuration for this route only.
+ * Every other endpoint in the app continues to use the wide
+ * 600/min global default.
+ *
+ * `blockDuration` is set EXPLICITLY equal to `ttl` so the lock-out
+ * window matches the rate-limit window. Without it, @nestjs/throttler
+ * defaults blockDuration to ttl anyway (see throttler.guard.js), but
+ * setting it makes the contract obvious to the next reader.
  *
  * Phase 17 follow-up — `POST /auth/logout` revokes the calling
  * session's row. JwtAuthGuard-protected so only an authenticated
@@ -44,7 +57,9 @@ export class AuthController {
 
   @Post('register')
   @HttpCode(HttpStatus.CREATED)
-  @Throttle({ register: { limit: 5, ttl: 60 * 60_000 } })
+  @Throttle({
+    default: { limit: 5, ttl: 60 * 60_000, blockDuration: 60 * 60_000 },
+  })
   register(@Body() dto: RegisterAdminDto, @Req() req: Request) {
     return this.auth.registerAdmin(dto, {
       ip: req.ip ?? null,
@@ -54,7 +69,9 @@ export class AuthController {
 
   @Post('login')
   @HttpCode(HttpStatus.OK)
-  @Throttle({ auth: { limit: 10, ttl: 60_000 } })
+  @Throttle({
+    default: { limit: 10, ttl: 60_000, blockDuration: 60_000 },
+  })
   login(@Body() dto: LoginDto, @Req() req: Request) {
     return this.auth.login(
       dto,

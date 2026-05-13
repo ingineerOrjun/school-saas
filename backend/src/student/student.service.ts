@@ -5,6 +5,7 @@ import {
   NotFoundException,
 } from '@nestjs/common';
 import { PlatformAuditAction, Prisma } from '@prisma/client';
+import { assertNotStaleAndUpdate } from '../common/db/optimistic-update';
 import { txWithRetry } from '../common/db/tx-retry';
 import { PrismaService } from '../database/prisma.service';
 import { PlatformAuditService } from '../platform/platform-audit.service';
@@ -745,41 +746,69 @@ export class StudentService {
       );
     }
 
+    // Phase FINAL-HARDENING Part 2: optimistic-concurrency-aware
+    // update. When `dto.updatedAt` is present (frontend round-
+    // tripped it from the GET), the helper does a conditional
+    // `WHERE id = ? AND updatedAt = ?` and throws 409 on mismatch.
+    // When absent (legacy callers / scripts that haven't migrated),
+    // the helper falls back to a plain UPDATE — preserves
+    // backward compatibility during the rollout window.
+    const data: Prisma.StudentUpdateInput = {
+      firstName: dto.firstName,
+      lastName: dto.lastName,
+      symbolNumber: dto.symbolNumber,
+      // Apply demographic / contact fields ONLY when present in the
+      // payload — undefined leaves the column alone, while explicit
+      // values overwrite it.
+      ...(dto.userId !== undefined
+        ? { user: { connect: { id: dto.userId } } }
+        : {}),
+      ...(dto.gender !== undefined ? { gender: dto.gender } : {}),
+      ...(dto.dateOfBirth !== undefined
+        ? { dateOfBirth: new Date(dto.dateOfBirth) }
+        : {}),
+      ...(dto.parentName !== undefined ? { parentName: dto.parentName } : {}),
+      ...(dto.contactNumber !== undefined
+        ? { contactNumber: dto.contactNumber }
+        : {}),
+      ...(dto.address !== undefined
+        ? { address: dto.address?.trim() ? dto.address.trim() : null }
+        : {}),
+      ...(dto.admissionDate !== undefined
+        ? {
+            admissionDate: dto.admissionDate
+              ? new Date(dto.admissionDate)
+              : null,
+          }
+        : {}),
+      ...(assignmentPatch
+        ? {
+            classId: assignmentPatch.classId,
+            sectionId: assignmentPatch.sectionId,
+          }
+        : {}),
+    };
+
     try {
-      return await this.prisma.student.update({
-        where: { id },
-        data: {
-          firstName: dto.firstName,
-          lastName: dto.lastName,
-          symbolNumber: dto.symbolNumber,
-          userId: dto.userId,
-          // Apply demographic / contact fields ONLY when present in the
-          // payload — undefined leaves the column alone, while explicit
-          // values overwrite it.
-          ...(dto.gender !== undefined ? { gender: dto.gender } : {}),
-          ...(dto.dateOfBirth !== undefined
-            ? { dateOfBirth: new Date(dto.dateOfBirth) }
-            : {}),
-          ...(dto.parentName !== undefined
-            ? { parentName: dto.parentName }
-            : {}),
-          ...(dto.contactNumber !== undefined
-            ? { contactNumber: dto.contactNumber }
-            : {}),
-          ...(dto.address !== undefined
-            ? { address: dto.address?.trim() ? dto.address.trim() : null }
-            : {}),
-          ...(dto.admissionDate !== undefined
-            ? {
-                admissionDate: dto.admissionDate
-                  ? new Date(dto.admissionDate)
-                  : null,
-              }
-            : {}),
-          ...(assignmentPatch ?? {}),
+      // Cast at the call site: Prisma's narrow generic types don't
+      // line up with the helper's `unknown`-typed `include`, but
+      // every Prisma model delegate satisfies the shape the helper
+      // calls — the cast tells TypeScript "I know this delegate
+      // matches" without leaking the loose typing back into the
+      // helper signature.
+      const row = (await assertNotStaleAndUpdate(
+        this.prisma.student as unknown as Parameters<
+          typeof assertNotStaleAndUpdate
+        >[0],
+        {
+          entity: 'Student',
+          id,
+          expectedUpdatedAt: dto.updatedAt,
+          data: data as unknown as Record<string, unknown>,
+          include: studentInclude,
         },
-        include: studentInclude,
-      });
+      )) as StudentWithSection;
+      return row;
     } catch (e) {
       throw this.translateUniqueViolation(e);
     }

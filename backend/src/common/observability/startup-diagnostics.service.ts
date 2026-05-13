@@ -120,6 +120,18 @@ export class StartupDiagnosticsService {
     const missing: string[] = [];
     if (!process.env.DATABASE_URL) missing.push('DATABASE_URL');
     if (!process.env.JWT_SECRET) missing.push('JWT_SECRET');
+    // Phase FINAL-HARDENING Part 1: FRONTEND_URL is required in
+    // production for the CORS allowlist. `resolveCorsOrigins()` in
+    // main.ts also throws if it's missing, but reporting it here
+    // gives the operator a single, structured failure surface
+    // ("startup diagnostics failed: missing env: …") instead of an
+    // opaque CORS-init error later in the boot sequence.
+    if (
+      process.env.NODE_ENV === 'production' &&
+      !process.env.FRONTEND_URL
+    ) {
+      missing.push('FRONTEND_URL');
+    }
     if (missing.length > 0) {
       return { fail: `missing env: ${missing.join(', ')}` };
     }

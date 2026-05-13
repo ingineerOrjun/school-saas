@@ -1,5 +1,5 @@
 import { useQuery } from "@tanstack/react-query";
-import { api } from "./api";
+import { api, isNetworkError } from "./api";
 import { useAuthReady } from "@/hooks/useAuthReady";
 import { qk } from "./query-keys";
 import { STALE } from "./query-client";
@@ -120,6 +120,7 @@ export function useRecentActivity(filters: AuditFilters = {}) {
     refetchOnWindowFocus: false,
     refetchOnMount: false,
     retry: (failureCount, error) => {
+      if (isNetworkError(error)) return false;
       const status = (error as { status?: number } | null)?.status;
       // 403 → user isn't ADMIN/STAFF; no point retrying. Render an
       // empty state and move on.

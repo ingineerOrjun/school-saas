@@ -758,7 +758,13 @@ function Header({
         <h1 className="text-3xl font-semibold tracking-tight text-foreground">
           Students
         </h1>
-        <p className="text-sm text-muted-foreground">
+        {/* Hydration fix: was `<p>`. The loading branch renders <Skeleton/>
+            which is a <div>; HTML forbids <div> inside <p>, which surfaced
+            a "<div> cannot be a descendant of <p>" warning in dev. Visual
+            output identical — `text-sm text-muted-foreground` renders the
+            same on <p> and <div>, and Tailwind's preflight removes the
+            default <p> margin so layout is unchanged. */}
+        <div className="text-sm text-muted-foreground">
           {loading ? (
             <span className="inline-flex items-center gap-2">
               <Skeleton className="inline-block h-3 w-28" />
@@ -774,7 +780,7 @@ function Header({
               {count === 1 ? "student" : "students"} enrolled in your school.
             </>
           )}
-        </p>
+        </div>
       </div>
       {/* Action cluster — Refresh always renders. Import + Add are
           admin-only; the backend rejects them for teachers anyway, so

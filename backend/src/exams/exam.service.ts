@@ -13,6 +13,7 @@ import {
   Prisma,
 } from '@prisma/client';
 import { AcademicSessionService } from '../academic-session/academic-session.service';
+import { assertNotStaleAndUpdate } from '../common/db/optimistic-update';
 import { PrismaService } from '../database/prisma.service';
 import { PlatformAuditService } from '../platform/platform-audit.service';
 import { CreateExamDto } from './dto/create-exam.dto';
@@ -406,10 +407,24 @@ export class ExamService {
     // is frozen.
     await this.sessions.assertSessionUnlocked(existing.sessionId);
     try {
-      return await this.prisma.exam.update({
-        where: { id },
-        data: { ...dto, updatedById: userId },
-      });
+      // Phase FINAL-HARDENING Part 2: optimistic-concurrency-aware.
+      // Falls back to last-write-wins when the client didn't
+      // round-trip `updatedAt` (legacy callers during rollout).
+      const { updatedAt: _expectedUpdatedAt, ...rest } = dto;
+      return (await assertNotStaleAndUpdate(
+        this.prisma.exam as unknown as Parameters<
+          typeof assertNotStaleAndUpdate
+        >[0],
+        {
+          entity: 'Exam',
+          id,
+          expectedUpdatedAt: _expectedUpdatedAt,
+          data: { ...rest, updatedById: userId } as unknown as Record<
+            string,
+            unknown
+          >,
+        },
+      )) as Exam;
     } catch (e) {
       if (isUniqueViolation(e)) {
         throw new ConflictException(

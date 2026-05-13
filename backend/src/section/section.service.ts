@@ -5,6 +5,7 @@ import {
 } from '@nestjs/common';
 import { Prisma, Section } from '@prisma/client';
 import { ClassService } from '../class/class.service';
+import { assertNotStaleAndUpdate } from '../common/db/optimistic-update';
 import { PrismaService } from '../database/prisma.service';
 import { CreateSectionDto } from './dto/create-section.dto';
 import { UpdateSectionDto } from './dto/update-section.dto';
@@ -50,10 +51,19 @@ export class SectionService {
     await this.ensureInSchool(id, schoolId);
 
     try {
-      return await this.prisma.section.update({
-        where: { id },
-        data: dto,
-      });
+      // Phase FINAL-HARDENING Part 2: optimistic-concurrency-aware.
+      const { updatedAt, ...rest } = dto;
+      return (await assertNotStaleAndUpdate(
+        this.prisma.section as unknown as Parameters<
+          typeof assertNotStaleAndUpdate
+        >[0],
+        {
+          entity: 'Section',
+          id,
+          expectedUpdatedAt: updatedAt,
+          data: rest as unknown as Record<string, unknown>,
+        },
+      )) as Section;
     } catch (e) {
       if (isUniqueViolation(e)) {
         throw new ConflictException(

@@ -1,5 +1,5 @@
 import { useQuery } from "@tanstack/react-query";
-import { api } from "./api";
+import { api, isNetworkError } from "./api";
 import { useAuthReady } from "@/hooks/useAuthReady";
 import { qk } from "./query-keys";
 import { STALE } from "./query-client";
@@ -80,6 +80,7 @@ export function useClasses() {
     // 401 → no point retrying; the user is logged out. Other errors
     // get one retry via the global default in lib/query-client.
     retry: (failureCount, error) => {
+      if (isNetworkError(error)) return false;
       const status = (error as { status?: number } | null)?.status;
       if (status === 401 || status === 403) return false;
       return failureCount < 1;

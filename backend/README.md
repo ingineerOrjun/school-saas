@@ -29,7 +29,35 @@
 
 ```bash
 $ npm install
+$ cp .env.example .env
 ```
+
+Then edit `.env` and fill in the real `DATABASE_URL` + `JWT_SECRET`.
+
+### Local development with the frontend
+
+The Next.js frontend binds its dev server to **port 3100** by design
+(see `frontend/package.json`: `"dev": "next dev -p 3100"`).
+
+The backend's CORS layer rejects every origin that isn't on its
+allowlist. The hardcoded dev fallback in `src/main.ts` only permits
+ports 3000 / 3001, so port 3100 must be added explicitly via the
+`FRONTEND_URL` env var. The shipped `.env.example` already includes
+it:
+
+```
+FRONTEND_URL=http://localhost:3100
+```
+
+If your `.env` is missing that line, every browser request from the
+dashboard will fail with `Access-Control-Allow-Origin` preflight
+errors. Add the line, restart `npm run start:dev`, and refresh the
+browser.
+
+In production `FRONTEND_URL` is required (boot fails fast if absent).
+Set it to the deployed frontend's https origin, comma-separated for
+multiple frontends. Wildcards / arbitrary-origin reflection are
+intentionally not supported.
 
 ## Compile and run the project
 

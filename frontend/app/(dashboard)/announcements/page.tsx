@@ -239,7 +239,11 @@ function Header({
         <h1 className="text-3xl font-semibold tracking-tight text-foreground">
           Announcements
         </h1>
-        <p className="text-sm text-muted-foreground">
+        {/* Hydration fix: was `<p>`. <Skeleton/> renders a <div>, which
+            HTML forbids inside <p>. `text-sm text-muted-foreground` renders
+            the same on <p> and <div>; Tailwind preflight strips the default
+            <p> margin so layout is unchanged. */}
+        <div className="text-sm text-muted-foreground">
           {loading ? (
             <Skeleton className="inline-block h-3 w-32" />
           ) : count === 0 ? (
@@ -250,7 +254,7 @@ function Header({
               {count === 1 ? "announcement" : "announcements"} posted.
             </>
           )}
-        </p>
+        </div>
       </div>
       {/* flex-wrap so the cluster reflows onto two rows on narrow phones. */}
       <div className="flex flex-wrap items-center gap-2">

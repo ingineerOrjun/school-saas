@@ -106,6 +106,10 @@ export function EditStudentDialog({
         admissionDate: admissionDate || null,
         classId: assignment.classId,
         sectionId: assignment.sectionId,
+        // Phase FINAL-HARDENING Part 2 — round-trip the
+        // updatedAt stamp the GET returned so the backend's
+        // assertNotStaleAndUpdate can detect cross-tab races.
+        updatedAt: student.updatedAt,
       });
       toast.success(`${updated.firstName} ${updated.lastName} updated`, {
         description: `Assignment: ${formatStudentAssignment(updated)}`,
@@ -113,14 +117,32 @@ export function EditStudentDialog({
       onUpdated(updated);
       onClose();
     } catch (err) {
-      const msg =
-        err instanceof ApiError
-          ? err.message
-          : err instanceof Error
+      // Phase FINAL-HARDENING Part 2: friendly stale-write handling.
+      // The backend returns 409 with copy:
+      //   "This student was updated by another user. Refresh and
+      //    try again."
+      // The form values are preserved (we don't reset state) so
+      // the operator can re-apply their intent after refresh.
+      if (
+        err instanceof ApiError &&
+        err.status === 409 &&
+        /updated by another user/i.test(err.message)
+      ) {
+        const msg =
+          "This student was just changed by someone else. " +
+          "Your edits are preserved — close, reopen, and re-apply.";
+        setError(msg);
+        toast.error(msg, { duration: 8_000 });
+      } else {
+        const msg =
+          err instanceof ApiError
             ? err.message
-            : "Failed to update student.";
-      setError(msg);
-      toast.error(msg);
+            : err instanceof Error
+              ? err.message
+              : "Failed to update student.";
+        setError(msg);
+        toast.error(msg);
+      }
     } finally {
       setSubmitting(false);
     }

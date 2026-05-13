@@ -40,10 +40,74 @@ export class ApiError extends Error {
     public readonly status: number,
     message: string,
     public readonly body?: unknown,
+    /**
+     * `Retry-After` header value (seconds) when the server provided
+     * one. Populated on 429 responses so callers can render a
+     * useful "try again in N seconds" message. Null when the server
+     * sent no header or the value was unparseable. Optional + last
+     * so existing 3-arg `new ApiError(...)` call sites stay
+     * source-compatible.
+     */
+    public readonly retryAfter?: number | null,
   ) {
     super(message);
     this.name = "ApiError";
   }
+}
+
+/**
+ * Sentinel status used when `fetch()` itself rejects (no HTTP
+ * response was ever produced). Real HTTP responses never return
+ * status 0 — using it as a "this was a network failure" marker
+ * keeps the existing `error.status` pattern intact across the app.
+ */
+export const NETWORK_ERROR_STATUS = 0;
+
+/**
+ * True when `error` came from a `fetch()` rejection (no HTTP
+ * response landed) — i.e. backend is unreachable. Covers:
+ *
+ *   • `ERR_CONNECTION_REFUSED` (backend port not listening)
+ *   • DNS failures / `ERR_NAME_NOT_RESOLVED`
+ *   • Network unreachable / offline
+ *   • CORS preflight failures (these surface as TypeError too)
+ *
+ * The helper is the single source of truth — every retry policy
+ * across the app composes through it so all queries treat
+ * server-unavailable consistently. Used by:
+ *
+ *   • Default retry guard in `query-client.ts`
+ *   • Per-hook retry overrides in `lib/*.ts` and providers
+ *
+ * Returns true ONLY when the error originated below the HTTP layer.
+ * 4xx/5xx responses still throw `ApiError` with their real status
+ * (>= 100) and are handled by existing per-status branches.
+ */
+export function isNetworkError(error: unknown): boolean {
+  if (error instanceof ApiError) return error.status === NETWORK_ERROR_STATUS;
+  // Native fetch network failures surface as TypeError in every
+  // major browser. Match by class + message to avoid false positives
+  // on TypeErrors thrown elsewhere in app code.
+  if (error instanceof TypeError) {
+    const msg = (error.message ?? "").toLowerCase();
+    return (
+      msg.includes("failed to fetch") || // Chrome / Edge
+      msg.includes("networkerror") || // Firefox
+      msg.includes("load failed") || // Safari
+      msg.includes("network request failed") // older WebKit / RN
+    );
+  }
+  return false;
+}
+
+/**
+ * Convenience alias: true when the backend appears unreachable.
+ * Identical to `isNetworkError` today; kept as a separate export so
+ * call sites that want to communicate intent ("show offline banner
+ * because the server is unavailable") read naturally.
+ */
+export function isServerUnavailable(error: unknown): boolean {
+  return isNetworkError(error);
 }
 
 export interface ApiOptions extends RequestInit {
@@ -99,14 +163,6 @@ export async function api<T = unknown>(
     }
   }
 
-  // 429 backoff loop. We retry up to MAX_429_RETRIES with
-  // exponential backoff seeded from `Retry-After` (or a sane
-  // default). React Query's own retry layer is configured to
-  // not double-retry on 429 — this in-line handler owns that
-  // class of response.
-  let attempt = 0;
-  // Re-declare so the loop body can reassign on retry.
-  let res: Response;
   // Phase performance governance — track request volume in dev so
   // the RequestPressurePanel can spot duplicate-within-5s patterns.
   // No-op in production.
@@ -114,38 +170,67 @@ export async function api<T = unknown>(
   // Phase Ω observability — measure round-trip time so we can warn
   // on slow queries in dev (>1s = something to investigate).
   const startedAt = typeof performance !== "undefined" ? performance.now() : 0;
-  // eslint-disable-next-line no-constant-condition
-  while (true) {
+
+  // fetch() rejects with TypeError when the connection itself
+  // fails (ERR_CONNECTION_REFUSED, DNS, offline). Convert to a
+  // structured ApiError so:
+  //   • The caller sees a typed error with status=0 instead of a
+  //     raw TypeError it has to string-match against.
+  //   • React Query's retry guards in `query-client.ts` and per-hook
+  //     overrides can short-circuit via `isNetworkError()` rather
+  //     than retrying into a dead backend.
+  //   • No console-spam: a single readable warning per dead-backend
+  //     call, gated on dev. The previous behavior produced a raw
+  //     "Failed to load resource" entry for every retry + every
+  //     polled endpoint.
+  let res: Response;
+  try {
     res = await fetch(`${API_BASE}${path}`, { ...rest, headers });
-    if (res.status !== 429) break;
-    attempt += 1;
-    // Long-cooldown short-circuit: if the server's Retry-After is
-    // longer than 5s, the bucket isn't going to refill within a
-    // reasonable retry window — sitting on it would just freeze the
-    // UI for 6+ seconds before surfacing the same error. Bail out
-    // immediately so the caller can render its error state. The
-    // header check skips when no header is present or when the
-    // value is <= 5s (existing exponential backoff still applies).
-    if (retryAfterExceedsSeconds(res, 5)) {
-      notifyThrottledOnce(path);
-      break;
-    }
-    if (attempt > MAX_429_RETRIES) {
-      // Phase governance — pass the path so the toast layer can
-      // dedupe per-endpoint with a 60s cooldown instead of one
-      // global 5s window. Background retries that recover within
-      // MAX_429_RETRIES never surface a toast.
-      notifyThrottledOnce(path);
-      break;
-    }
-    const waitMs = parseRetryAfter(res, attempt);
-    if (process.env.NODE_ENV !== "production") {
-      // eslint-disable-next-line no-console
-      console.warn(
-        `[api] 429 from ${path} — retry ${attempt}/${MAX_429_RETRIES} in ${waitMs}ms`,
+  } catch (err) {
+    if (isNetworkError(err)) {
+      if (process.env.NODE_ENV !== "production") {
+        // eslint-disable-next-line no-console
+        console.warn(
+          `[api] network error reaching ${path} — backend unreachable. ` +
+            "React Query retries are short-circuited; the next user " +
+            "action or reconnect will retry once.",
+        );
+      }
+      throw new ApiError(
+        NETWORK_ERROR_STATUS,
+        "Server unavailable. Please check your connection and try again.",
+        null,
       );
     }
-    await sleep(waitMs);
+    throw err;
+  }
+
+  // 429 → throw immediately. NEVER retry.
+  //
+  // Why no retry: a 429 is the server telling the client to stop.
+  // Each automatic retry consumes another bucket slot, preventing
+  // the throttler window from draining. Combined with React Query
+  // refetch-on-mount/focus, the previous exponential-backoff retry
+  // created a self-sustaining loop that only resolved with a
+  // backend restart. The correct behaviour is: surface the 429
+  // once, let the caller decide (typically: show a toast, give the
+  // user a chance to manually retry after the cooldown).
+  //
+  // The Retry-After header (if present) is preserved on the
+  // ApiError so the UI can render "try again in N seconds" copy.
+  // `notifyThrottledOnce` still fires for the visible toast — it
+  // has its own per-endpoint 60s + global 30s dedupe baked in, so
+  // a burst of 429s surfaces at most one toast.
+  if (res.status === 429) {
+    const headerValue = res.headers.get("Retry-After");
+    const retryAfterSec = parseRetryAfterHeader(headerValue);
+    notifyThrottledOnce(path);
+    throw new ApiError(
+      429,
+      "Too many requests. Please slow down and try again in a moment.",
+      null,
+      retryAfterSec,
+    );
   }
 
   if (!res.ok) {
@@ -210,61 +295,31 @@ export async function api<T = unknown>(
 }
 
 // ---------------------------------------------------------------------------
-// 429 backoff helpers.
+// 429 header helper.
 // ---------------------------------------------------------------------------
 
-const MAX_429_RETRIES = 3;
-const DEFAULT_RETRY_BASE_MS = 500;
-
 /**
- * Parse `Retry-After` if present (seconds OR HTTP-date), otherwise
- * use exponential backoff with jitter: 500ms, 1s, 2s, 4s.
- */
-function parseRetryAfter(res: Response, attempt: number): number {
-  const header = res.headers.get("Retry-After");
-  if (header) {
-    const sec = Number.parseInt(header, 10);
-    if (!Number.isNaN(sec) && sec >= 0) return Math.min(sec * 1000, 30_000);
-    // HTTP-date form
-    const t = Date.parse(header);
-    if (!Number.isNaN(t)) return Math.max(0, Math.min(t - Date.now(), 30_000));
-  }
-  const base = DEFAULT_RETRY_BASE_MS * Math.pow(2, attempt - 1);
-  // ±25% jitter so a wave of 429s doesn't re-fire in lockstep.
-  const jittered = base * (0.75 + Math.random() * 0.5);
-  return Math.min(jittered, 30_000);
-}
-
-/**
- * True when the response carries a `Retry-After` header asking for
- * MORE than `thresholdSec` seconds of cooldown. Used by the 429
- * retry loop to short-circuit on long-cooldown responses — sitting
- * on a multi-second wait freezes the UI without buying anything,
- * since the bucket won't refill in time anyway.
+ * Parse a `Retry-After` header value into seconds, or null when the
+ * header is missing / unparseable. Accepts both forms RFC 9110
+ * §10.2.3 lists:
  *
- * Returns false when:
- *   • the header is absent (no server hint → stay with backoff),
- *   • the value parses to <= thresholdSec (existing behavior),
- *   • the value can't be parsed at all (defensive fallback to retry).
+ *   • delta-seconds: `Retry-After: 30`
+ *   • HTTP-date:     `Retry-After: Wed, 21 Oct 2026 07:28:00 GMT`
  *
- * Accepts both header forms RFC 9110 §10.2.3 lists: a delta-seconds
- * integer ("Retry-After: 30") and an HTTP-date.
+ * Returns null on any failure to parse — the caller renders a
+ * generic message when null. We never auto-retry the request itself
+ * (see the 429-handling block in `api`).
  */
-function retryAfterExceedsSeconds(
-  res: Response,
-  thresholdSec: number,
-): boolean {
-  const header = res.headers.get("Retry-After");
-  if (!header) return false;
+function parseRetryAfterHeader(header: string | null): number | null {
+  if (!header) return null;
   const sec = Number.parseInt(header, 10);
-  if (!Number.isNaN(sec) && sec >= 0) return sec > thresholdSec;
+  if (!Number.isNaN(sec) && sec >= 0) return sec;
   const t = Date.parse(header);
-  if (!Number.isNaN(t)) return (t - Date.now()) / 1000 > thresholdSec;
-  return false;
-}
-
-function sleep(ms: number): Promise<void> {
-  return new Promise((resolve) => setTimeout(resolve, ms));
+  if (!Number.isNaN(t)) {
+    const diffSec = Math.max(0, Math.round((t - Date.now()) / 1000));
+    return diffSec;
+  }
+  return null;
 }
 
 /**
@@ -280,12 +335,15 @@ function sleep(ms: number): Promise<void> {
  *   • Global cap: at most ONE toast per 30s regardless of which
  *     endpoint triggered it. A storm hitting 5 endpoints at once
  *     surfaces ONE toast, not five.
- *   • Background retries that recover within MAX_429_RETRIES never
- *     fire a toast — only exhausted retries do.
+ *
+ * 429 retry policy: NEVER retry. Every 429 throws an ApiError
+ * immediately (see the 429 block in `api`). This toast is the
+ * one user-visible signal — beyond it, the caller decides what
+ * to do (typically: leave the failure visible until the user
+ * manually retries).
  *
  * Result: the user sees "slowing down" once per minute at most,
- * even under sustained throttle pressure. Transient retries are
- * silent.
+ * even under sustained throttle pressure.
  */
 const ENDPOINT_TOAST_WINDOW_MS = 60_000;
 const GLOBAL_TOAST_WINDOW_MS = 30_000;

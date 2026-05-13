@@ -62,44 +62,46 @@ import { UserModule } from './user/user.module';
     }),
     // Phase 9 — global rate limiter.
     //
-    // Buckets:
-    //   • default — wide safety net (600/min). Keyed PER-USER for
-    //     authenticated requests (see UserAwareThrottlerGuard) and
-    //     per-IP for the unauthenticated tail. Each logged-in user
-    //     gets their own quota, so a busy dashboard tab can't burn
-    //     another user's allowance even when both share an IP.
-    //   • auth    — login bucket. 10/min. Keyed per-IP (the user
-    //     isn't authenticated yet by definition).
-    //   • register — tenant-creation bucket. 5/hour per-IP.
-    //
-    // Why 600/min on the default:
-    //   Authenticated dashboards fan out hard. A single page load
-    //   triggers 5-10 reads, React StrictMode double-fires in dev,
-    //   polled endpoints (/platform/health, /me/features, /dashboard/*)
-    //   add a steady baseline, and the operator may have multiple
-    //   tabs open during incident response. 600/min/user is comfortably
-    //   above legitimate usage and still catches a runaway client.
     // Named throttle buckets — each surface gets its own budget
     // so traffic from one (e.g. notification polling) doesn't
     // exhaust the user's allowance for another (e.g. dashboard
     // navigation).
     //
-    // Sizing rationale:
-    //   • default (general)   — 600/min/user. Wide safety net for
-    //     the long tail of dashboard endpoints. Per-user keying
-    //     via UserAwareThrottlerGuard means one busy admin doesn't
-    //     starve another at the same NAT.
-    //   • notifications       — 120/min/user. Per spec. Handles
-    //     polling (1/min unread + list fetches) plus optimistic
-    //     mutations comfortably.
-    //   • platform            — 300/min/user. SUPER_ADMIN traffic
-    //     is bursty (open the ops cockpit + drill into a school +
+    // CRITICAL: every named bucket listed here is evaluated on
+    // EVERY request. There is no "this bucket only applies to
+    // this route" mechanism at the module level. If you add a
+    // bucket with limit=5 here, EVERY authenticated request burns
+    // a slot, and the 6th request anywhere in the app gets 429.
+    //
+    // Buckets that should only apply to specific endpoints (login,
+    // register) live on the controller as
+    //   @Throttle({ default: { limit, ttl, blockDuration } })
+    // which OVERRIDES the `default` bucket's values for that one
+    // route while leaving every other endpoint on the wide 600/min
+    // budget. See `auth.controller.ts` for the canonical pattern.
+    //
+    // Sizing rationale for the three globally-evaluated buckets:
+    //   • default        — 600/min/user. Wide safety net for the
+    //     long tail of dashboard endpoints. Per-user keying via
+    //     UserAwareThrottlerGuard means one busy admin doesn't
+    //     starve another at the same NAT. A page load fanout (5-10
+    //     reads × React StrictMode × polled endpoints × multiple
+    //     tabs) needs comfortable headroom; 600/min covers it.
+    //   • notifications  — 120/min/user. Per spec. Handles polling
+    //     (1/min unread + list fetches) plus optimistic mutations.
+    //   • platform       — 300/min/user. SUPER_ADMIN traffic is
+    //     bursty (open the ops cockpit + drill into a school +
     //     check audit log + open notifications all in one minute).
-    //   • auth                — 10/min/IP. Login. Per-IP because
-    //     the user has no identity yet. Strict on purpose.
-    //   • register            — 5/hour/IP. Tenant creation is
-    //     low-volume + high-impact — strict guards against
-    //     enumeration / spam.
+    //
+    // What's NOT here (intentionally):
+    //   • `auth` and `register` — these used to be globally-
+    //     evaluated buckets with very small limits (10/min, 5/hour).
+    //     Because every named bucket runs on every request, the
+    //     `register` bucket was blocking the entire app for an
+    //     hour after just 5 dashboard loads. Phase RELIABILITY-IV
+    //     moved both to per-route @Throttle decorators in
+    //     auth.controller.ts. Adding them back here will re-break
+    //     dashboard traffic — DO NOT.
     ThrottlerModule.forRoot([
       {
         name: 'default',
@@ -115,16 +117,6 @@ import { UserModule } from './user/user.module';
         name: 'platform',
         ttl: 60_000,
         limit: 300,
-      },
-      {
-        name: 'auth',
-        ttl: 60_000,
-        limit: 10,
-      },
-      {
-        name: 'register',
-        ttl: 60 * 60_000,
-        limit: 5,
       },
     ]),
     DatabaseModule,

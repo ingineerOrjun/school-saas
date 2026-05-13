@@ -1,5 +1,5 @@
 import { useQuery } from "@tanstack/react-query";
-import { api } from "./api";
+import { api, isNetworkError } from "./api";
 import { useAuthReady } from "@/hooks/useAuthReady";
 import { qk } from "./query-keys";
 import { STALE } from "./query-client";
@@ -133,6 +133,7 @@ export function useTeachers() {
     refetchOnWindowFocus: false,
     refetchOnMount: false,
     retry: (failureCount, error) => {
+      if (isNetworkError(error)) return false;
       const status = (error as { status?: number } | null)?.status;
       if (status === 401 || status === 403) return false;
       return failureCount < 1;

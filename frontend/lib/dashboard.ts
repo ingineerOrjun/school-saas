@@ -1,4 +1,8 @@
-import { api } from "./api";
+import { useQuery } from "@tanstack/react-query";
+import { useAuthReady } from "@/hooks/useAuthReady";
+import { api, isNetworkError } from "./api";
+import { qk } from "./query-keys";
+import { STALE } from "./query-client";
 
 /** One row in the dashboard's "Recent enrollments" card. */
 export interface DashboardRecentStudent {
@@ -133,3 +137,55 @@ export const dashboardApi = {
   getTeacherSummary: () =>
     api<TeacherDashboardSummary>("/dashboard/teacher-summary"),
 };
+
+// ---------------------------------------------------------------------------
+// useTeacherSummary — shared cache for the teacher-dashboard endpoint.
+//
+// Previously the TeacherDashboardView called `dashboardApi.getTeacherSummary()`
+// directly inside a useEffect, which:
+//   • Bypassed React Query's automatic in-flight dedupe — in dev,
+//     React StrictMode double-fires every effect, producing TWO
+//     identical /dashboard/teacher-summary requests 1ms apart.
+//   • Couldn't share state with future consumers that need the same
+//     data (other dashboard widgets, future re-render previews).
+//   • Forced manual `loading` / `refreshing` / `error` / `data` state
+//     scaffolding in every consumer.
+//
+// Migrating to this hook fixes all three:
+//   • React Query dedupes by `queryKey` automatically. The StrictMode
+//     double-mount becomes ONE request because the second mount sees
+//     an in-flight query against the same key and joins it.
+//   • Future consumers reuse the cache.
+//   • The hook owns loading/refreshing/error.
+//
+// Refetch policy:
+//   • `staleTime: STALE.LIVE_OPERATOR` (30s) — attendance counters
+//     move during the day. 30s keeps the dashboard live-feeling
+//     while still serving cache hits across rapid SPA navigation.
+//   • `refetchOnWindowFocus: false` — the TeacherDashboardView wires
+//     its own visibility-wake handler with a 2s cooldown that filters
+//     spurious focus events (DevTools attach, OS notification steal,
+//     etc.). The hook trusts that handler to call `.refetch()` when
+//     appropriate.
+//   • `refetchOnMount: false` — share cache across page navigation
+//     within the 30s staleTime window.
+//   • Auth errors (401/403) are NEVER retried.
+//   • Otherwise one retry on transient failures.
+// ---------------------------------------------------------------------------
+export function useTeacherSummary(options?: { enabled?: boolean }) {
+  const { authReady, isAuthenticated } = useAuthReady();
+  return useQuery({
+    queryKey: qk.dashboardTeacherSummary,
+    queryFn: () => dashboardApi.getTeacherSummary(),
+    enabled: (options?.enabled ?? true) && authReady && isAuthenticated,
+    staleTime: STALE.LIVE_OPERATOR,
+    refetchOnWindowFocus: false,
+    refetchOnMount: false,
+    retry: (failureCount, error) => {
+      if (isNetworkError(error)) return false;
+      const status = (error as { status?: number } | null)?.status;
+      if (status === 401 || status === 403) return false;
+      return failureCount < 1;
+    },
+  });
+}

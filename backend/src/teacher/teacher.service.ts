@@ -6,6 +6,7 @@ import {
   NotFoundException,
 } from '@nestjs/common';
 import { Prisma, Role, type User } from '@prisma/client';
+import { assertNotStaleAndUpdate } from '../common/db/optimistic-update';
 import { HashingService } from '../common/hashing/hashing.service';
 import { PrismaService } from '../database/prisma.service';
 import { CreateTeacherDto } from './dto/create-teacher.dto';
@@ -305,14 +306,22 @@ export class TeacherService {
     }
 
     try {
-      const updated = await this.prisma.teacher.update({
-        where: { id },
-        data: {
-          name: dto.name,
-          userId: dto.userId,
+      // Phase FINAL-HARDENING Part 2: optimistic-concurrency-aware.
+      const updated = (await assertNotStaleAndUpdate(
+        this.prisma.teacher as unknown as Parameters<
+          typeof assertNotStaleAndUpdate
+        >[0],
+        {
+          entity: 'Teacher',
+          id,
+          expectedUpdatedAt: dto.updatedAt,
+          data: {
+            name: dto.name,
+            userId: dto.userId,
+          } as unknown as Record<string, unknown>,
+          include: teacherInclude,
         },
-        include: teacherInclude,
-      });
+      )) as Prisma.TeacherGetPayload<{ include: typeof teacherInclude }>;
       return this.toDto(updated);
     } catch (e) {
       if (isUniqueViolation(e)) {

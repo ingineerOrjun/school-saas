@@ -5,6 +5,7 @@ import {
   type InvalidateQueryFilters,
   type QueryKey,
 } from "@tanstack/react-query";
+import { isNetworkError } from "./api";
 
 // ---------------------------------------------------------------------------
 // Global query client + tiered staleTime defaults.
@@ -103,10 +104,24 @@ export function createQueryClient(): QueryClient {
         // for back/forward navigation to feel instant, but don't
         // hold dead caches forever.
         gcTime: 30 * 60_000,
-        // One retry on transient failure. The api-layer 429 backoff
-        // (lib/api.ts) handles rate-limit specifically; this catches
-        // network hiccups + 5xx blips.
-        retry: 1,
+        // One retry on transient failure. The api-layer 429 path
+        // (lib/api.ts) handles rate-limit by throwing immediately
+        // with status 429; this catches 5xx blips. NETWORK errors
+        // (ERR_CONNECTION_REFUSED, DNS, offline) are NEVER retried
+        // here — `lib/api.ts` rethrows them as ApiError(status=0)
+        // and `isNetworkError()` short-circuits this guard to
+        // prevent retry storms into a dead backend. The browser's
+        // own `online` event + `refetchOnReconnect: true` below
+        // gives queries a chance to recover when connectivity
+        // returns; the retry guard is the in-request defense.
+        retry: (failureCount, error) => {
+          if (isNetworkError(error)) return false;
+          const status = (error as { status?: number } | null)?.status;
+          if (status === 401 || status === 403 || status === 429) {
+            return false;
+          }
+          return failureCount < 1;
+        },
         // ERP dashboards are long-lived tabs. Auto-refocus refetch
         // is noise + the cause of a previous 429 wave.
         refetchOnWindowFocus: false,

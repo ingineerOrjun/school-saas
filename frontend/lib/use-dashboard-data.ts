@@ -2,7 +2,7 @@
 
 import * as React from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { ApiError } from "./api";
+import { ApiError, isNetworkError } from "./api";
 import { getStoredSchool } from "./auth";
 import {
   dashboardApi,
@@ -100,6 +100,10 @@ export function useDashboardData(): UseDashboardData {
     refetchOnWindowFocus: false,
     refetchOnMount: false,
     retry: (failureCount, error) => {
+      // Network failure (ERR_CONNECTION_REFUSED, DNS, offline) —
+      // don't retry. Backend is unreachable; retries spam the
+      // console with the same TypeError.
+      if (isNetworkError(error)) return false;
       // 401 → user is logged out, no point retrying.
       if (error?.status === 401 || error?.status === 403) return false;
       return failureCount < 1;
