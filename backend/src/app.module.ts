@@ -32,6 +32,9 @@ import { FeatureFlagsModule } from './feature-flags/feature-flags.module';
 import { FeesModule } from './fees/fees.module';
 import { GradingModule } from './grading/grading.module';
 import { PlatformModule } from './platform/platform.module';
+import { ContinuousRecordModule } from './continuous-record/continuous-record.module';
+import { LearningOutcomeModule } from './learning-outcome/learning-outcome.module';
+import { PortfolioItemModule } from './portfolio-item/portfolio-item.module';
 import { PromotionModule } from './promotion/promotion.module';
 import { SchoolModule } from './school/school.module';
 import { SectionModule } from './section/section.module';
@@ -143,6 +146,20 @@ import { UserModule } from './user/user.module';
     UserModule,
     AnnouncementModule,
     PromotionModule,
+    // CDC continuous-evaluation foundation — read-only catalogue.
+    // Feature-gated behind `conEvaluation` (defaults disabled per
+    // pilot rollout). See backend/src/learning-outcome/.
+    LearningOutcomeModule,
+    // CDC continuous-evaluation WRITE surface (Session 3). POST single,
+    // POST bulk, GET list. Same feature flag (`conEvaluation`); the
+    // write-side guards (session lock, teacher scope, AFTER_SUPPORT
+    // precondition, audit history append) all live in the service.
+    ContinuousRecordModule,
+    // CDC portfolio-item WRITE surface (Session 4). POST create,
+    // PATCH description-only edit, GET list. Same `conEvaluation`
+    // feature flag, same guard stack, same session-lock + teacher-
+    // scope enforcement as ContinuousRecord.
+    PortfolioItemModule,
     // Platform Control Layer — SUPER_ADMIN-only, multi-tenant
     // operations. Mounted here at the AppModule level (not nested
     // under SchoolModule) because its surface deliberately bypasses

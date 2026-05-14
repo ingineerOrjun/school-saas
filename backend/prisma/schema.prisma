@@ -414,6 +414,10 @@ model School {
   supportNotes           SupportNote[]
   dataExportRuns         DataExportRun[]
   importRuns             ImportRun[]
+  // CDC continuous-evaluation write surface (Session 3).
+  continuousRecords      ContinuousRecord[]
+  // CDC portfolio-item write surface (Session 4).
+  portfolioItems         PortfolioItem[]
 
   @@index([status])
   @@map("schools")
@@ -488,6 +492,16 @@ model User {
   announcementDismissals AnnouncementDismissal[] @relation("AnnouncementDismisser")
   exportsRequested     DataExportRun[]       @relation("ExportRequestedBy")
   importsRequested     ImportRun[]           @relation("ImportRequestedBy")
+  // CDC continuous-evaluation audit back-relations (Session 3). Named
+  // explicitly because ContinuousRecord and ContinuousRecordHistory
+  // each carry two FKs into User (createdBy/updatedBy and changedBy).
+  continuousRecordsCreated ContinuousRecord[]        @relation("ContinuousRecordCreatedBy")
+  continuousRecordsUpdated ContinuousRecord[]        @relation("ContinuousRecordUpdatedBy")
+  continuousRecordHistory  ContinuousRecordHistory[] @relation("ContinuousRecordHistoryChangedBy")
+  // CDC portfolio-item audit back-relations (Session 4).
+  portfolioItemsCreated    PortfolioItem[]           @relation("PortfolioItemCreatedBy")
+  portfolioItemsUpdated    PortfolioItem[]           @relation("PortfolioItemUpdatedBy")
+  portfolioItemHistory     PortfolioItemHistory[]    @relation("PortfolioItemHistoryChangedBy")
 
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
@@ -572,6 +586,10 @@ model Student {
   academicRecords StudentAcademicRecord[]
   // Phase 23 — guardian linking foundations.
   guardianLinks  StudentGuardianLink[]
+  // CDC continuous-evaluation write surface (Session 3).
+  continuousRecords ContinuousRecord[]
+  // CDC portfolio-item write surface (Session 4).
+  portfolioItems    PortfolioItem[]
 
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
@@ -1344,6 +1362,10 @@ model AcademicSession {
   attendance      Attendance[]
   announcements   Announcement[]
   academicRecords StudentAcademicRecord[]
+  // CDC continuous-evaluation write surface (Session 3).
+  continuousRecords ContinuousRecord[]
+  // CDC portfolio-item write surface (Session 4).
+  portfolioItems    PortfolioItem[]
 
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
@@ -1624,6 +1646,13 @@ model StudentAcademicRecord {
   @@index([sessionId])
   @@index([classId])
   @@index([schoolId])
+  /// Session 5 — promote the index that migration
+  /// 20260715000000_promotion_safety_publish_state created at the SQL
+  /// level into the schema, so schema + migrations + dev DB agree. The
+  /// index speeds up promotion-history reads that filter by the actor
+  /// (audit feed). A separate Session 5 migration creates it on dev
+  /// DBs that never had it.
+  @@index([promotedById])
   @@map("student_academic_records")
 }
 
@@ -1993,4 +2022,308 @@ model BackupRun {
   @@index([status, createdAt(sort: Desc)])
   @@index([retentionUntil])
   @@map("backup_runs")
+}
+
+// -----------------------------------------------------------------------------
+// CDC Continuous Evaluation — learning outcomes catalogue (seed data).
+// -----------------------------------------------------------------------------
+//
+// Sourced from the CDC विद्यार्थी मूल्याङ्कन मार्गदर्शन २०८३. Versioned by
+// curriculum year (BS, e.g. "2083") so a future revision can co-exist
+// without overwriting the prior year's outcomes — every school keeps
+// reading the version they were trained on until the operator explicitly
+// switches.
+//
+// Tenant scope: NONE. This is platform-global seed data, identical for
+// every school in Nepal that follows the CDC curriculum. Per-tenant
+// overlays (custom outcomes, teacher-defined rubrics) are deliberately
+// out of scope for this foundational session and will live on a
+// different model when introduced.
+//
+// Mutation policy: this table is INSERT-ONLY at runtime. The seed
+// runner upserts new rows; nothing in the application code path edits
+// existing rows. Future curriculum revisions should land as new
+// `curriculumVersion` rows, not in-place edits.
+//
+// Feature gating: read access is gated behind the `conEvaluation`
+// feature flag (FeatureFlagsGuard at controller level). See
+// `backend/src/learning-outcome/learning-outcome.controller.ts`.
+
+/// CDC continuous-evaluation learning outcome (seed data, immutable).
+/// Sourced from the CDC विद्यार्थी मूल्याङ्कन मार्गदर्शन २०८३.
+/// Versioned by curriculum year; never modified at runtime.
+model LearningOutcome {
+  id                String      @id @default(cuid())
+  classLevel        Int         // 4 (will expand to 1-5 in future sessions)
+  subjectCode       SubjectCode
+  curriculumVersion String      @default("2083") // BS year
+  unitNumber        Int
+  unitTitleEn       String?
+  unitTitleNp       String?
+  sortOrder         Int         // position within the unit
+  skillArea         SkillArea
+  descriptionEn     String?
+  descriptionNp     String?
+  createdAt         DateTime    @default(now())
+
+  // CDC continuous-evaluation back-relation (Session 3). LearningOutcome
+  // itself stays seed-only (immutable reference data) — this is just the
+  // inverse side of ContinuousRecord.outcome so Prisma can navigate.
+  continuousRecords ContinuousRecord[]
+  // CDC portfolio-item back-relation (Session 4). Same rationale —
+  // inverse side of PortfolioItem.outcome, LearningOutcome stays
+  // immutable.
+  portfolioItems    PortfolioItem[]
+
+  @@unique([classLevel, subjectCode, unitNumber, sortOrder, curriculumVersion])
+  @@index([classLevel, subjectCode])
+  @@index([classLevel, subjectCode, unitNumber])
+  @@map("learning_outcomes")
+}
+
+enum SubjectCode {
+  NEPALI
+  ENGLISH
+  MATHEMATICS
+  SCIENCE_TECHNOLOGY
+  SOCIAL_STUDIES
+  HEALTH_PHYSICAL
+  ARTS_EDUCATION
+}
+
+enum SkillArea {
+  // Language skills (English uses 4; Nepali will use all 6 in future)
+  LISTENING
+  SPEAKING
+  READING
+  WRITING
+  VOCABULARY
+  LANGUAGE_STRUCTURE
+  // Non-language fallback
+  CONTENT_AREA
+}
+
+// ============================================================================
+// CDC Continuous-evaluation WRITE side (Session 3).
+//
+// One ContinuousRecord per (student, outcome, session, phase). The row
+// records a teacher's rating (1..4) for a student against a single CDC
+// learning-outcome indicator within one academic session. Phases:
+//
+//   • REGULAR        — the normal classroom assessment.
+//   • AFTER_SUPPORT  — re-assessment after the teacher gave extra help.
+//                      Only valid when a REGULAR row exists for the
+//                      same (student, outcome, session) AND that
+//                      REGULAR.rating ≤ 2. The application layer
+//                      enforces this precondition; the DB only
+//                      enforces the (1..4) rating range via CHECK.
+//
+// Multi-tenant scoping: `schoolId` on every row. Reads + writes flow
+// through `ContinuousRecordService`, which gates each call on the
+// `conEvaluation` feature flag + `TeacherScopeService` + the active
+// session's `isLocked` flag.
+//
+// outcomeId is a plain String (NOT @db.Uuid) because LearningOutcome.id
+// is `cuid()`. Migrating that to uuid is intentionally out of scope —
+// the seed layer (Sessions 1+2) is settled.
+// ============================================================================
+model ContinuousRecord {
+  id String @id @default(uuid()) @db.Uuid
+
+  schoolId String @db.Uuid
+  school   School @relation(fields: [schoolId], references: [id], onDelete: Cascade)
+
+  studentId String  @db.Uuid
+  student   Student @relation(fields: [studentId], references: [id], onDelete: Cascade)
+
+  /// FK to LearningOutcome.id. String (cuid), not @db.Uuid — see note above.
+  outcomeId String
+  outcome   LearningOutcome @relation(fields: [outcomeId], references: [id], onDelete: Restrict)
+
+  sessionId String          @db.Uuid
+  session   AcademicSession @relation(fields: [sessionId], references: [id], onDelete: Restrict)
+
+  phase EvalPhase
+
+  /// Integer 1..4. Enforced at the API boundary (@IsInt @Min(1) @Max(4))
+  /// AND at the DB level via the named CHECK constraint
+  /// `continuous_records_rating_range_check` added by the migration.
+  rating Int
+
+  /// Optional free-text teacher remarks ("कैफियत" column in the CDC
+  /// rubric). Capped soft via API validation, not the column type.
+  notes String?
+
+  /// Audit. Both nullable + onDelete: SetNull so deleting the actor
+  /// keeps the row but loses the link. Mirrors the Result pattern.
+  createdById String? @db.Uuid
+  createdBy   User?   @relation("ContinuousRecordCreatedBy", fields: [createdById], references: [id], onDelete: SetNull)
+  updatedById String? @db.Uuid
+  updatedBy   User?   @relation("ContinuousRecordUpdatedBy", fields: [updatedById], references: [id], onDelete: SetNull)
+
+  createdAt DateTime @default(now())
+  /// Bumped on every successful upsert. Surfaced to clients so future
+  /// bulk endpoints can implement stale-write rejection
+  /// (`expectedUpdatedAt` round-trip). No DB-level lock — application
+  /// layer compares the value inside the transaction.
+  updatedAt DateTime @updatedAt
+
+  history ContinuousRecordHistory[]
+
+  @@unique([studentId, outcomeId, sessionId, phase])
+  @@index([schoolId])
+  @@index([sessionId])
+  @@index([studentId, sessionId])
+  @@map("continuous_records")
+}
+
+/// Append-only audit log for ContinuousRecord. One row per accepted
+/// upsert (CREATE on first insert, UPDATE on every subsequent change).
+/// Never updated or deleted from the application layer; the schema
+/// has no operation to express either. Scalar fields only — no JSON
+/// snapshots — so audits stay queryable.
+model ContinuousRecordHistory {
+  id String @id @default(uuid()) @db.Uuid
+
+  recordId String           @db.Uuid
+  record   ContinuousRecord @relation(fields: [recordId], references: [id], onDelete: Cascade)
+
+  changeKind ChangeKind
+
+  /// State AFTER the change.
+  rating Int
+  phase  EvalPhase
+  notes  String?
+
+  /// State BEFORE the change. Null on CREATE rows.
+  previousRating Int?
+  previousNotes  String?
+
+  changedById String? @db.Uuid
+  changedBy   User?   @relation("ContinuousRecordHistoryChangedBy", fields: [changedById], references: [id], onDelete: SetNull)
+  changedAt   DateTime @default(now())
+
+  @@index([recordId])
+  @@index([changedAt])
+  @@map("continuous_record_history")
+}
+
+enum EvalPhase {
+  REGULAR
+  AFTER_SUPPORT
+}
+
+enum ChangeKind {
+  CREATE
+  UPDATE
+}
+
+// ============================================================================
+// CDC Portfolio-item WRITE side (Session 4).
+//
+// One PortfolioItem per evidence artifact for a student. Lives alongside
+// ContinuousRecord but is structurally simpler:
+//   • No phase/two-stage progression (no AFTER_SUPPORT analogue).
+//   • No DB-level rating range check (no rating at all — qualitative
+//     evidence, not a scored row).
+//   • No optimistic concurrency primitive (description-only edits are
+//     low-contention; teachers occasionally clarify a caption hours
+//     after upload, no last-write-wins risk).
+//   • Append-mostly: teachers may PATCH the `description` and that's
+//     it. No teacher-facing delete (a future ADMIN/SUPER_ADMIN delete
+//     surface is intentionally out of scope for Session 4).
+//
+// Multi-tenant scope + write gates mirror ContinuousRecord exactly:
+// feature flag `conEvaluation`, JWT + role guard, session lock via
+// AcademicSessionService.assertSessionUnlocked, teacher scope via
+// TeacherScopeService.assertPortfolioItemAccess.
+//
+// outcomeId is plain String? (NOT @db.Uuid) because LearningOutcome.id
+// is cuid(). Same precedent as ContinuousRecord.outcomeId; matching
+// the referenced PK type is required for the FK to even compile.
+// ============================================================================
+model PortfolioItem {
+  id String @id @default(uuid()) @db.Uuid
+
+  schoolId String @db.Uuid
+  school   School @relation(fields: [schoolId], references: [id], onDelete: Cascade)
+
+  studentId String  @db.Uuid
+  student   Student @relation(fields: [studentId], references: [id], onDelete: Cascade)
+
+  sessionId String          @db.Uuid
+  session   AcademicSession @relation(fields: [sessionId], references: [id], onDelete: Restrict)
+
+  /// outcomeId is plain `String?` (NOT @db.Uuid) because LearningOutcome.id
+  /// uses cuid(), not uuid(). This matches the precedent set by
+  /// ContinuousRecord.outcomeId. Do NOT change this to @db.Uuid even if it
+  /// looks inconsistent with surrounding fields — the FK type must match
+  /// the referenced primary key type exactly.
+  outcomeId String?
+  outcome   LearningOutcome? @relation(fields: [outcomeId], references: [id], onDelete: SetNull)
+
+  type PortfolioItemType
+
+  /// Free-form 1–2000 char caption / context for the artifact. Service
+  /// layer trims and rejects empty-after-trim.
+  description String
+
+  /// The day this artifact represents. Service-layer validates
+  /// `occurredOn ≤ today` AND `occurredOn ≥ session.startDate`.
+  /// `@db.Date` strips time-of-day to keep equality checks predictable.
+  occurredOn DateTime @db.Date
+
+  /// Optional already-uploaded file URL (https://… only). File upload
+  /// is out of scope for this session — callers pass a URL produced
+  /// by whatever external upload pipeline they use.
+  fileUrl String?
+
+  createdById String? @db.Uuid
+  createdBy   User?   @relation("PortfolioItemCreatedBy", fields: [createdById], references: [id], onDelete: SetNull)
+
+  updatedById String? @db.Uuid
+  updatedBy   User?   @relation("PortfolioItemUpdatedBy", fields: [updatedById], references: [id], onDelete: SetNull)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  history PortfolioItemHistory[]
+
+  @@index([schoolId])
+  @@index([studentId, sessionId])
+  @@index([sessionId])
+  @@index([occurredOn])
+  @@map("portfolio_items")
+}
+
+/// Append-only audit log for PortfolioItem. One row per create AND
+/// one row per description edit. Scalar fields only (no JSON snapshot).
+/// `previousDescription` is NULL on the create row to flag the
+/// "first version" event; subsequent rows always carry the snapshot.
+model PortfolioItemHistory {
+  id String @id @default(uuid()) @db.Uuid
+
+  portfolioItemId String        @db.Uuid
+  portfolioItem   PortfolioItem @relation(fields: [portfolioItemId], references: [id], onDelete: Cascade)
+
+  previousDescription String?
+  newDescription      String
+
+  changedById String? @db.Uuid
+  changedBy   User?   @relation("PortfolioItemHistoryChangedBy", fields: [changedById], references: [id], onDelete: SetNull)
+
+  changedAt DateTime @default(now())
+
+  @@index([portfolioItemId])
+  @@index([changedAt])
+  @@map("portfolio_item_history")
+}
+
+enum PortfolioItemType {
+  CLASS_WORK
+  PROJECT
+  CREATIVE
+  HOMEWORK
+  PRESENTATION
+  OBSERVATION
 }

@@ -1,7 +1,40 @@
 import { ForbiddenException, Injectable } from '@nestjs/common';
-import { Role } from '@prisma/client';
+import { Role, SubjectCode } from '@prisma/client';
 import { PrismaService } from '../../database/prisma.service';
 import type { AuthenticatedUser } from '../../auth/jwt.strategy';
+
+// CDC continuous-evaluation scope helper — Session 3.
+//
+// LearningOutcome.subjectCode is a strict enum (NEPALI, ENGLISH, …),
+// but TeachingAssignment binds teachers to a free-text Subject.name.
+// There is no FK between the two layers yet (the linkage migration is
+// out of scope for this session). The map below bridges enum → set of
+// acceptable lowercase-trimmed names so a school's actual Subject
+// catalog can match the CDC subject for scope checks.
+//
+// Multiple aliases per code so we accept the variants real schools
+// type into their catalog without forcing them to rename rows.
+// Adding a new alias here is the lightest-weight migration; once the
+// catalog gains a SubjectCode column we can throw this map away.
+const SUBJECT_CODE_NAME_ALIASES: Record<SubjectCode, ReadonlyArray<string>> = {
+  NEPALI: ['nepali'],
+  ENGLISH: ['english'],
+  MATHEMATICS: ['mathematics', 'math', 'maths'],
+  SCIENCE_TECHNOLOGY: [
+    'science and technology',
+    'science & technology',
+    'science technology',
+    'science',
+  ],
+  SOCIAL_STUDIES: ['social studies', 'social'],
+  HEALTH_PHYSICAL: [
+    'health and physical education',
+    'health & physical education',
+    'health and physical',
+    'health & physical',
+  ],
+  ARTS_EDUCATION: ['arts education', 'creative arts', 'arts', 'art'],
+};
 
 /**
  * One row of resolved scope for a TEACHER user. Mirrors a single
@@ -313,6 +346,227 @@ export class TeacherScopeService {
           'You are not assigned to this subject/class.',
         );
       }
+    }
+  }
+
+  /**
+   * CDC continuous-evaluation scope guard — Session 3.
+   *
+   * Throws 403 unless the caller is allowed to rate a CDC outcome for
+   * the given student. ADMIN + STAFF bypass; TEACHER must have at
+   * least one TeachingAssignment matching:
+   *
+   *   • student's effective classId (student.classId ?? student.section.classId)
+   *   • student's effective sectionId (when set) — class-bound
+   *     assignments (assignment.sectionId IS NULL) authorize any
+   *     section of that class, matching the looser rule used by
+   *     `assertBulkMarksAccess`.
+   *   • a Subject whose lowercase-trimmed name is in
+   *     SUBJECT_CODE_NAME_ALIASES[subjectCode]. The CDC outcome layer
+   *     uses a strict SubjectCode enum; teacher assignments use the
+   *     school's free-text Subject.name. See the alias map for the
+   *     bridge logic; once an FK lands between Subject and SubjectCode
+   *     this can switch to a direct comparison.
+   *
+   * No role-other-than-TEACHER-handling beyond the ADMIN/STAFF bypass
+   * because the higher-level RolesGuard restricts the endpoint to
+   * TEACHER + ADMIN + STAFF + SUPER_ADMIN (SUPER_ADMIN does not pass
+   * through this guard — the controller's @Roles decorator filters
+   * them out before reaching the service for tenant-scoped writes).
+   */
+  async assertContinuousRecordAccess(
+    user: AuthenticatedUser,
+    input: { studentId: string; subjectCode: SubjectCode },
+  ): Promise<void> {
+    if (user.role === Role.ADMIN || user.role === Role.STAFF) return;
+    if (user.role !== Role.TEACHER) {
+      throw new ForbiddenException(
+        'You are not assigned to evaluate this student for this subject.',
+      );
+    }
+
+    // 1. Resolve student → effective class/section + tenant guard.
+    const student = await this.prisma.student.findFirst({
+      where: { id: input.studentId, schoolId: user.schoolId },
+      select: {
+        classId: true,
+        sectionId: true,
+        section: { select: { classId: true } },
+      },
+    });
+    if (!student) {
+      throw new ForbiddenException(
+        'You are not assigned to evaluate this student for this subject.',
+      );
+    }
+    const studentClassId =
+      student.classId ?? student.section?.classId ?? null;
+    if (!studentClassId) {
+      throw new ForbiddenException(
+        'You are not assigned to evaluate this student for this subject.',
+      );
+    }
+    const studentSectionId = student.sectionId ?? null;
+
+    // 2. Resolve the teacher row.
+    const teacher = await this.prisma.teacher.findFirst({
+      where: { userId: user.id, schoolId: user.schoolId },
+      select: { id: true },
+    });
+    if (!teacher) {
+      throw new ForbiddenException(
+        'You are not assigned to evaluate this student for this subject.',
+      );
+    }
+
+    // 3. Pull assignments on the student's class, with the bridge subject
+    //    eagerly fetched so the name comparison happens in JS.
+    const assignments = await this.prisma.teachingAssignment.findMany({
+      where: {
+        teacherId: teacher.id,
+        schoolId: user.schoolId,
+        classId: studentClassId,
+      },
+      select: {
+        sectionId: true,
+        subject: { select: { name: true } },
+      },
+    });
+
+    // 4. A row matches when section + subject both align. Section rule:
+    //    assignment is class-bound (sectionId null) OR section equal.
+    //    Subject rule: assignment.subject.name (lowercase trim) sits in
+    //    the alias set for the requested SubjectCode.
+    const allowedNames = new Set(
+      SUBJECT_CODE_NAME_ALIASES[input.subjectCode],
+    );
+    const allowed = assignments.some((a) => {
+      const sectionOk =
+        a.sectionId === null || a.sectionId === studentSectionId;
+      const subjectOk =
+        a.subject !== null &&
+        allowedNames.has(a.subject.name.toLowerCase().trim());
+      return sectionOk && subjectOk;
+    });
+
+    if (!allowed) {
+      throw new ForbiddenException(
+        'You are not assigned to evaluate this student for this subject.',
+      );
+    }
+  }
+
+  /**
+   * CDC portfolio-item scope guard — Session 4.
+   *
+   * Same general shape as `assertContinuousRecordAccess` BUT with one
+   * critical relaxation: portfolio items may exist WITHOUT a linked
+   * outcome ("general observation" entries that aren't tied to a
+   * specific CDC indicator). When the caller passes a `subjectCode`,
+   * we enforce the full subject + class match. When they pass null /
+   * undefined, we drop the subject requirement and only check that
+   * the teacher has SOME TeachingAssignment for the student's class.
+   *
+   * ADMIN + STAFF bypass unconditionally (school-wide academic scope,
+   * matching every other guard on this service).
+   */
+  async assertPortfolioItemAccess(
+    user: AuthenticatedUser,
+    input: { studentId: string; subjectCode?: SubjectCode | null },
+  ): Promise<void> {
+    if (user.role === Role.ADMIN || user.role === Role.STAFF) return;
+    if (user.role !== Role.TEACHER) {
+      throw new ForbiddenException(
+        'You are not assigned to record portfolio items for this student.',
+      );
+    }
+
+    // 1. Resolve student → effective class/section + tenant guard.
+    //    Same shape as assertContinuousRecordAccess so the failure
+    //    mode is identical (a tampered request that names a student
+    //    in another school sees a 403, not a 404 — info disclosure
+    //    parity with the rest of this service).
+    const student = await this.prisma.student.findFirst({
+      where: { id: input.studentId, schoolId: user.schoolId },
+      select: {
+        classId: true,
+        sectionId: true,
+        section: { select: { classId: true } },
+      },
+    });
+    if (!student) {
+      throw new ForbiddenException(
+        'You are not assigned to record portfolio items for this student.',
+      );
+    }
+    const studentClassId =
+      student.classId ?? student.section?.classId ?? null;
+    if (!studentClassId) {
+      throw new ForbiddenException(
+        'You are not assigned to record portfolio items for this student.',
+      );
+    }
+    const studentSectionId = student.sectionId ?? null;
+
+    // 2. Resolve the teacher row.
+    const teacher = await this.prisma.teacher.findFirst({
+      where: { userId: user.id, schoolId: user.schoolId },
+      select: { id: true },
+    });
+    if (!teacher) {
+      throw new ForbiddenException(
+        'You are not assigned to record portfolio items for this student.',
+      );
+    }
+
+    // 3. Pull assignments on the student's class. Subject is hydrated
+    //    so the optional subject-name match can run in JS without a
+    //    second round-trip.
+    const assignments = await this.prisma.teachingAssignment.findMany({
+      where: {
+        teacherId: teacher.id,
+        schoolId: user.schoolId,
+        classId: studentClassId,
+      },
+      select: {
+        sectionId: true,
+        subject: { select: { name: true } },
+      },
+    });
+
+    // 4. Section rule: class-bound assignment (sectionId null) covers
+    //    any section of that class. Subject rule depends on whether
+    //    the caller passed a subjectCode:
+    //      • subjectCode null/undefined → no subject filter; ANY
+    //        assignment for this class is enough. This is the
+    //        "general observation" path: a teacher who runs Music
+    //        Club but isn't formally assigned to "English" can still
+    //        snap a photo of the same student's English-class poster
+    //        and log it as a portfolio item, as long as they teach
+    //        SOME subject in that class.
+    //      • subjectCode set → enforce the same name-alias match as
+    //        assertContinuousRecordAccess.
+    const requireSubject =
+      input.subjectCode !== undefined && input.subjectCode !== null;
+    const allowedNames = requireSubject
+      ? new Set(SUBJECT_CODE_NAME_ALIASES[input.subjectCode as SubjectCode])
+      : null;
+
+    const allowed = assignments.some((a) => {
+      const sectionOk =
+        a.sectionId === null || a.sectionId === studentSectionId;
+      if (!sectionOk) return false;
+      if (!requireSubject) return true;
+      return (
+        a.subject !== null &&
+        allowedNames!.has(a.subject.name.toLowerCase().trim())
+      );
+    });
+
+    if (!allowed) {
+      throw new ForbiddenException(
+        'You are not assigned to record portfolio items for this student.',
+      );
     }
   }
 

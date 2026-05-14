@@ -41,6 +41,13 @@ export const FeatureKey = {
   Transport: 'transport',
   /** Hostel management — placeholder for future. */
   Hostel: 'hostel',
+  /**
+   * CDC continuous-evaluation. Phase: foundational session — exposes
+   * the read-only learning-outcomes catalogue. No teacher write
+   * surfaces yet. Default disabled (opt-in) so pilot schools can
+   * trial it before broader rollout.
+   */
+  ConEvaluation: 'conEvaluation',
 } as const;
 
 export type FeatureKeyValue = (typeof FeatureKey)[keyof typeof FeatureKey];
@@ -111,6 +118,13 @@ export const FEATURE_CATALOG: readonly FeatureDefinition[] = [
     description: 'Room allocation, attendance, and hostel fee tracking.',
     defaultEnabled: false,
     comingSoon: true,
+  },
+  {
+    key: FeatureKey.ConEvaluation,
+    label: 'Continuous Evaluation',
+    description:
+      'CDC-aligned continuous evaluation foundation — read-only learning-outcomes catalogue. Pilot release.',
+    defaultEnabled: false,
   },
 ];
 
