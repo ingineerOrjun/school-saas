@@ -41,6 +41,12 @@ export const FeatureKey = {
   Sms: "sms",
   Transport: "transport",
   Hostel: "hostel",
+  // Session 3+ CDC continuous-evaluation module. Pilot rollout —
+  // defaults OFF on the backend (`defaultEnabled: false`), mirrored
+  // here. The /me/features endpoint flips this on for schools that
+  // are in the pilot; everyone else lands on the feature-disabled
+  // panel via FeatureGate.
+  ConEvaluation: "conEvaluation",
 } as const;
 
 export type FeatureKeyValue = (typeof FeatureKey)[keyof typeof FeatureKey];
@@ -81,6 +87,10 @@ export const FEATURE_DEFAULTS: Record<string, boolean> = {
   [FeatureKey.Sms]: false,
   [FeatureKey.Transport]: false,
   [FeatureKey.Hostel]: false,
+  // Pilot — default OFF (matches the backend catalog). Schools in
+  // the pilot list flip this on via the platform feature-overrides
+  // surface; everyone else lands on FeatureGate's disabled panel.
+  [FeatureKey.ConEvaluation]: false,
 };
 
 export const featuresApi = {

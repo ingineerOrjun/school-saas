@@ -152,6 +152,67 @@ export const qk = {
   announcements: (sessionId?: string | null) =>
     ["announcements", { sessionId: sessionId ?? null }] as const,
 
+  // ---- CDC Continuous-evaluation (Session 6a) ----
+  //
+  // Learning outcomes are near-static curriculum data (30m staleTime in
+  // the hook). One cache entry per (classLevel, subject) pair so two
+  // pages — the units-overview screen and the unit-view screen —
+  // share the same underlying fetch.
+  learningOutcomes: (classLevel: number, subject: string) =>
+    ["learning-outcomes", classLevel, subject] as const,
+
+  // Continuous records for one student in one session, optionally
+  // narrowed by subjectCode. The narrowed and unnarrowed variants
+  // intentionally produce DIFFERENT cache keys — the backend returns
+  // different rowsets, so collapsing them would serve stale results.
+  // Caller passes the subjectCode the same way it'll pass to the
+  // endpoint; we don't try to derive one from the other here.
+  continuousRecordsForStudent: (
+    studentId: string,
+    sessionId: string,
+    subjectCode?: string,
+  ) =>
+    subjectCode
+      ? ([
+          "continuous-records",
+          "student",
+          studentId,
+          sessionId,
+          subjectCode,
+        ] as const)
+      : ([
+          "continuous-records",
+          "student",
+          studentId,
+          sessionId,
+        ] as const),
+
+  // Class-wide records are NOT a single endpoint call — the backend
+  // GET /continuous-records requires studentId. The rating screen
+  // fans out N per-student queries via useQueries. This key is
+  // reserved for the future class-wide endpoint OR an aggregated
+  // cache slot the hook can populate. Not used in Session 6a; lives
+  // here so Session 6b doesn't have to rename keys.
+  continuousRecordsForClass: (
+    classId: string,
+    sessionId: string,
+    subjectCode?: string,
+  ) =>
+    subjectCode
+      ? ([
+          "continuous-records",
+          "class",
+          classId,
+          sessionId,
+          subjectCode,
+        ] as const)
+      : ([
+          "continuous-records",
+          "class",
+          classId,
+          sessionId,
+        ] as const),
+
   // ---- Dashboard rollups (1m) ----
   dashboardSummary: ["dashboard", "summary"] as const,
   dashboardTeacherSummary: ["dashboard", "teacher-summary"] as const,
