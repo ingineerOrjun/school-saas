@@ -252,6 +252,21 @@ export class AuthService {
       throw new UnauthorizedException('Invalid credentials.');
     }
 
+    // Session 6c.1 — soft-deleted users cannot log in. The check
+    // runs AFTER the password compare so the failure path takes
+    // the same wall-clock time as a wrong-password attempt: the
+    // attacker can't probe whether an email is "deactivated" vs
+    // "unknown" by timing the response. The error message + reason
+    // code are kept generic for the same reason.
+    if (user.deletedAt !== null) {
+      this.health.recordLoginFailure({
+        email: dto.email,
+        ip,
+        reason: 'invalid_credentials',
+      });
+      throw new UnauthorizedException('Invalid credentials.');
+    }
+
     const userWithoutSchool = user;
 
     // Tenant gate: a SUSPENDED or EXPIRED school blocks ALL of its

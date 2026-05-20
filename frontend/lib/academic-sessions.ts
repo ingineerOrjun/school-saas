@@ -12,9 +12,19 @@ import { api } from "./api";
 export interface AcademicSessionDto {
   id: string;
   name: string;
-  /** YYYY-MM-DD (DATE column, no time component). */
+  /**
+   * ISO-8601 timestamp string. Despite the backend column being a
+   * Postgres DATE (no time component), Prisma serializes Date objects
+   * through JSON as full ISO timestamps — e.g. "2026-04-01T00:00:00.000Z".
+   *
+   * Callers passing this value to an endpoint that accepts YYYY-MM-DD
+   * (notably `/attendance/report`, whose DTO has a strict
+   * `^\d{4}-\d{2}-\d{2}$` regex validator) MUST slice the leading 10
+   * characters first. The `useStudentAttendanceReport` hook handles
+   * this transparently via its internal `toYMD()` helper.
+   */
   startDate: string;
-  /** YYYY-MM-DD. */
+  /** ISO-8601 timestamp string. See `startDate` for the format gotcha. */
   endDate: string;
   isActive: boolean;
   /**

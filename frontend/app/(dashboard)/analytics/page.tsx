@@ -14,7 +14,7 @@ import {
 } from "lucide-react";
 import { cn } from "@/lib/utils";
 import { getStoredUser } from "@/lib/auth";
-import { classesApi, type ClassWithSections } from "@/lib/classes";
+import { useClasses, type ClassWithSections } from "@/lib/classes";
 import { DateRangeMenu } from "@/components/analytics/DateRangeMenu";
 import { OverviewTab } from "./_tabs/OverviewTab";
 import { FeesTab } from "./_tabs/FeesTab";
@@ -395,25 +395,16 @@ function ClassSectionSelectors({
   sectionId: string;
   setFilters: (patch: Partial<AnalyticsFilters>) => void;
 }) {
-  const [classes, setClasses] = React.useState<ClassWithSections[] | null>(
-    null,
-  );
-
-  React.useEffect(() => {
-    let cancelled = false;
-    classesApi
-      .list()
-      .then((rows) => {
-        if (!cancelled) setClasses(rows);
-      })
-      .catch(() => {
-        // Soft-fail — analytics still works without class filtering.
-        if (!cancelled) setClasses([]);
-      });
-    return () => {
-      cancelled = true;
-    };
-  }, []);
+  // Classes via the shared React Query hook (10m staleTime). Was an
+  // inline classesApi.list() in this filter bar; the cached hook
+  // closes a /classes dupe with the rest of the page tree. Soft-fail
+  // semantics preserved: while loading the dropdown is disabled
+  // (null sentinel), on error we render [] so the analytics page
+  // still works without class filtering — same as the old try/catch.
+  const classesQuery = useClasses();
+  const classes: ClassWithSections[] | null = classesQuery.isError
+    ? []
+    : classesQuery.data ?? null;
 
   const selectedClass = classes?.find((c) => c.id === classId);
   const sections = selectedClass?.sections ?? [];

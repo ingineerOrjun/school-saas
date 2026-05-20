@@ -1,5 +1,9 @@
-import { useQuery } from "@tanstack/react-query";
-import { api, isNetworkError } from "./api";
+import {
+  useMutation,
+  useQuery,
+  useQueryClient,
+} from "@tanstack/react-query";
+import { api, ApiError, isNetworkError } from "./api";
 import { useAuthReady } from "@/hooks/useAuthReady";
 import { qk } from "./query-keys";
 import { STALE } from "./query-client";
@@ -138,5 +142,40 @@ export function useTeachers() {
       if (status === 401 || status === 403) return false;
       return failureCount < 1;
     },
+  });
+}
+
+/**
+ * Session 6c.3 — soft-delete a teacher. Hits the same backend route
+ * as before (DELETE /teachers/:id, 204 NO_CONTENT) but the backend
+ * now routes through `UserService.softDelete`:
+ *
+ *   • The Teacher row stays in the DB — historical joins keep
+ *     resolving.
+ *   • The linked User row gets `deletedAt` set — login is blocked
+ *     immediately, every active-list query filters them out.
+ *   • Active TeachingAssignments produce a 409 refusal (the backend
+ *     message is admin-friendly and surfaced verbatim).
+ *
+ * On success, both `qk.teachers()` and `qk.users()` are invalidated:
+ * the deleted teacher disappears from the teachers list AND the
+ * underlying user disappears from the users picker.
+ *
+ * Retry policy mirrors `useDeleteUser`: `false`, because every
+ * failure class is user-actionable (403 = wrong actor, 404 = stale
+ * row, 409 = active assignments).
+ */
+export function useDeleteTeacher() {
+  const queryClient = useQueryClient();
+  return useMutation<void, ApiError, string>({
+    mutationFn: (teacherId) => teachersApi.remove(teacherId),
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: qk.teachers() });
+      // Also invalidate the users cache — the same row was just
+      // soft-deleted there too. Keeps Settings → Users & roles in
+      // sync with the teachers page after a delete.
+      queryClient.invalidateQueries({ queryKey: qk.users() });
+    },
+    retry: false,
   });
 }

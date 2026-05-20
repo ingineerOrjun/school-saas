@@ -1016,8 +1016,12 @@ export class StudentService {
     userId: string,
     schoolId: string,
   ): Promise<void> {
+    // Session 6c.1 — soft-deleted users can't be linked to a new
+    // Student row. Mirrors the same guard in TeacherService and
+    // keeps the deleted-user-is-404 stance uniform across both
+    // profile-creation paths.
     const user = await this.prisma.user.findFirst({
-      where: { id: userId, schoolId },
+      where: { id: userId, schoolId, deletedAt: null },
       select: { id: true },
     });
     if (!user) {

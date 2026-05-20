@@ -20,7 +20,7 @@ import {
 import { toast } from "sonner";
 import { ApiError } from "@/lib/api";
 import { getStoredUser } from "@/lib/auth";
-import { classesApi, type ClassWithSections } from "@/lib/classes";
+import { useClasses, type ClassWithSections } from "@/lib/classes";
 import {
   examsApi,
   marksGridApi,
@@ -263,8 +263,17 @@ function BulkEntry() {
 
   // ----- Reference data -----
   const [exams, setExams] = React.useState<ExamDto[]>([]);
-  const [classes, setClasses] = React.useState<ClassWithSections[]>([]);
-  const [refLoading, setRefLoading] = React.useState(true);
+  // Classes come from the shared `useClasses()` React Query hook
+  // (10m staleTime). Was a Promise.all leg in the old useEffect
+  // below; splitting it off into the cached hook closes the
+  // /classes dupe flagged by the request-pressure panel.
+  const classesQuery = useClasses();
+  const classes: ClassWithSections[] = classesQuery.data ?? [];
+  const [examsLoading, setExamsLoading] = React.useState(true);
+  // Combined "reference data still loading" — preserves the previous
+  // gate that withheld the picker until BOTH exams and classes
+  // landed.
+  const refLoading = examsLoading || classesQuery.isLoading;
   const [refError, setRefError] = React.useState<string | null>(null);
 
   // ----- Selection -----
@@ -315,21 +324,16 @@ function BulkEntry() {
     return rawAssignments ?? [];
   }, [isWideScope, rawAssignments, assignmentsError]);
 
-  // ----- Load reference data (exams + classes only — assignments are
-  // hooked above) -----
+  // ----- Load exams (classes via useClasses() hook above) -----
   React.useEffect(() => {
     let cancelled = false;
     (async () => {
-      setRefLoading(true);
+      setExamsLoading(true);
       setRefError(null);
       try {
-        const [exs, cls] = await Promise.all([
-          examsApi.list(),
-          classesApi.list(),
-        ]);
+        const exs = await examsApi.list();
         if (cancelled) return;
         setExams(exs);
-        setClasses(cls);
       } catch (err) {
         if (cancelled) return;
         if (err instanceof ApiError && err.status === 401) {
@@ -338,13 +342,25 @@ function BulkEntry() {
         }
         setRefError(extractMessage(err, "Failed to load reference data."));
       } finally {
-        if (!cancelled) setRefLoading(false);
+        if (!cancelled) setExamsLoading(false);
       }
     })();
     return () => {
       cancelled = true;
     };
   }, [router]);
+
+  // Bridge classesQuery.error into refError — the previous Promise.all
+  // catch funneled BOTH leg failures into refError; preserve that
+  // single-error-banner surface so a classes-load failure still
+  // shows up here.
+  React.useEffect(() => {
+    if (classesQuery.error) {
+      setRefError((prev) =>
+        prev ?? extractMessage(classesQuery.error, "Failed to load classes."),
+      );
+    }
+  }, [classesQuery.error]);
 
   // ----- Derived: filtered classes + sections + subjects -----
   const allowedClasses = React.useMemo(() => {

@@ -186,9 +186,18 @@ export class GlobalSearchService {
     schoolId: string,
     q: string,
   ): Promise<SearchHit[]> {
+    // Session 6c.1 — hide teachers whose User has been soft-deleted.
+    // The Teacher row itself stays in the DB (User soft-delete does
+    // NOT cascade — that preserves FK history for ContinuousRecord
+    // and friends), but surfacing the stale email + linking through
+    // to a dead profile would be confusing. The `user: { deletedAt:
+    // null }` clause is AND-merged with the existing OR (Prisma
+    // treats sibling clauses as AND), so it tightens the result set
+    // without breaking the name/email match.
     const rows = await this.prisma.teacher.findMany({
       where: {
         schoolId,
+        user: { deletedAt: null },
         OR: [
           { name: { contains: q, mode: 'insensitive' } },
           { user: { email: { contains: q, mode: 'insensitive' } } },

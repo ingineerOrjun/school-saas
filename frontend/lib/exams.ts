@@ -1,4 +1,8 @@
-import { api } from "./api";
+import * as React from "react";
+import { useQueries, useQuery } from "@tanstack/react-query";
+import { api, isNetworkError } from "./api";
+import { useAuthReady } from "@/hooks/useAuthReady";
+import { qk } from "./query-keys";
 import type { LetterGrade } from "./grading";
 
 export interface ExamSubjectDto {
@@ -527,3 +531,139 @@ export const marksGridApi = {
       body: JSON.stringify(input),
     }),
 };
+
+// ---------------------------------------------------------------------------
+// Detail-page hooks (Session 6c-detail).
+// ---------------------------------------------------------------------------
+
+/**
+ * useExams — list exams for the active (or specified) session.
+ *
+ * Same cache key for all consumers regardless of sessionId today
+ * (per the existing `qk.exams()` factory which takes no args). That
+ * works because the existing /exams page also calls `examsApi.list`
+ * with a session id and overwrites the cache for that one slot.
+ *
+ * Used by the student-detail page's exam-scores section as the first
+ * leg of a two-step fan-out: list all exams, then issue one
+ * `useStudentExamResults` query per exam to populate scores.
+ */
+export function useExams(sessionId?: string | null) {
+  const { authReady, isAuthenticated } = useAuthReady();
+  return useQuery({
+    queryKey: qk.exams(),
+    queryFn: () => examsApi.list(sessionId ?? undefined),
+    enabled: authReady && isAuthenticated,
+    staleTime: 60_000,
+    refetchOnWindowFocus: false,
+    refetchOnMount: false,
+    retry: (failureCount, error) => {
+      if (isNetworkError(error)) return false;
+      const status = (error as { status?: number } | null)?.status;
+      if (status === 401 || status === 403) return false;
+      return failureCount < 1;
+    },
+  });
+}
+
+/**
+ * Composed per-exam result for one student, used by the student-
+ * detail page's exam-scores section.
+ *   • `byExamId` — Map<examId, StudentReport | null>. Null means the
+ *     exam exists but no results have been entered for this student;
+ *     the section renders an "—" row instead of dropping the exam.
+ *   • `isLoading` — any one query still loading.
+ *   • `errorCount` — number of per-exam queries that errored.
+ */
+export interface StudentExamResultsResult {
+  byExamId: Map<string, StudentReport | null>;
+  isLoading: boolean;
+  isError: boolean;
+  errorCount: number;
+}
+
+/**
+ * useStudentExamResults — fan-out fetch of one student's results
+ * across every exam id supplied. Mirrors the CDC class-records
+ * pattern (`useContinuousRecordsForClassStudents`): one query per
+ * id, shared cache slot, single primitive signature for memoizing
+ * the result object so consumer effects don't loop.
+ *
+ * Empty array → returns an empty Map, fires nothing.
+ *
+ * A 404 from `/results?examId=…&studentId=…` (no results entered
+ * yet for this exam-student pair) surfaces as the query data being
+ * null in the result map; callers render "—" rather than treating
+ * it as an error.
+ */
+export function useStudentExamResults(
+  examIds: ReadonlyArray<string>,
+  studentId: string | undefined,
+  options?: { enabled?: boolean },
+): StudentExamResultsResult {
+  const { authReady, isAuthenticated } = useAuthReady();
+  const enabled =
+    (options?.enabled ?? true) &&
+    authReady &&
+    isAuthenticated &&
+    Boolean(studentId) &&
+    examIds.length > 0;
+
+  const queries = useQueries({
+    queries: examIds.map((examId) => ({
+      queryKey: qk.studentExamResult(examId, studentId ?? ""),
+      queryFn: async () => {
+        try {
+          return await resultsApi.get(examId, studentId as string);
+        } catch (err) {
+          // 404 = no results entered yet for this (exam, student) —
+          // not an error from the page's perspective; show "—".
+          const status = (err as { status?: number } | null)?.status;
+          if (status === 404) return null;
+          throw err;
+        }
+      },
+      enabled,
+      staleTime: 60_000,
+      refetchOnWindowFocus: false,
+      refetchOnMount: false,
+      retry: (failureCount: number, error: unknown) => {
+        if (isNetworkError(error)) return false;
+        const status = (error as { status?: number } | null)?.status;
+        if (status === 401 || status === 403 || status === 404) return false;
+        return failureCount < 1;
+      },
+    })),
+  });
+
+  // Memoize on a primitive signature — see
+  // `useContinuousRecordsForClassStudents` for the rationale. Without
+  // this, every render rebuilds the Map and breaks consumer effect
+  // dep arrays.
+  const querySignature = queries
+    .map((q) => `${q.status}:${q.dataUpdatedAt}:${q.errorUpdatedAt}`)
+    .join("|");
+  const examIdsKey = examIds.join(",");
+
+  return React.useMemo<StudentExamResultsResult>(() => {
+    const byExamId = new Map<string, StudentReport | null>();
+    let anyLoading = false;
+    let errorCount = 0;
+    examIds.forEach((id, idx) => {
+      const q = queries[idx];
+      if (q.isLoading) anyLoading = true;
+      if (q.isError) errorCount += 1;
+      // `data` can be null when the queryFn caught a 404; preserve
+      // null so the Map distinguishes "not entered" from "still
+      // loading" (loading = not yet in the Map).
+      if (q.data !== undefined) byExamId.set(id, q.data);
+    });
+    return {
+      byExamId,
+      isLoading: anyLoading,
+      isError: errorCount > 0 && errorCount === examIds.length,
+      errorCount,
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [examIdsKey, querySignature]);
+}

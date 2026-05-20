@@ -129,7 +129,15 @@ export class ImpersonationService {
         school: { select: { id: true, name: true, slug: true, status: true } },
       },
     });
-    if (!target) throw new NotFoundException('User not found.');
+    // Session 6c.1 — soft-deleted users surface as 404 here. Any
+    // token minted against a deactivated account would be rejected
+    // on the next request anyway (JwtStrategy short-circuits on
+    // `deletedAt`); refusing up-front keeps the operator UX clean
+    // ("can't impersonate, user is gone") instead of issuing a
+    // token that turns out to be a brick.
+    if (!target || target.deletedAt) {
+      throw new NotFoundException('User not found.');
+    }
 
     if (target.role === Role.SUPER_ADMIN) {
       throw new ForbiddenException(
@@ -236,11 +244,27 @@ export class ImpersonationService {
     ip?: string | null;
     userAgent?: string | null;
   }): Promise<EndImpersonationResult> {
+    // Session 6c.1 — also refuse the re-issue if the original
+    // SUPER_ADMIN was soft-deleted mid-impersonation. The existing
+    // role check would still pass (the row still has role
+    // SUPER_ADMIN) but the user is deactivated; mirror the
+    // deleted-or-demoted branch so the operator gets bounced to
+    // /login the same way.
     const superAdmin = await this.prisma.user.findUnique({
       where: { id: input.impersonatedBy },
-      select: { id: true, email: true, role: true, schoolId: true },
+      select: {
+        id: true,
+        email: true,
+        role: true,
+        schoolId: true,
+        deletedAt: true,
+      },
     });
-    if (!superAdmin || superAdmin.role !== Role.SUPER_ADMIN) {
+    if (
+      !superAdmin ||
+      superAdmin.role !== Role.SUPER_ADMIN ||
+      superAdmin.deletedAt
+    ) {
       // Either the SUPER_ADMIN was deleted/demoted while the session
       // was open, or the token's `impersonatedBy` claim was tampered
       // with. Either way: refuse to issue a fresh token. The client

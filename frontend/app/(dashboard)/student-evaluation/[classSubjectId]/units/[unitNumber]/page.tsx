@@ -24,6 +24,10 @@ import {
   subjectNameToCode,
   type SubjectCode,
 } from "@/lib/subject-aliases";
+import {
+  extractClassLevel,
+  isCdcEligibleClassLevel,
+} from "@/lib/class-level";
 import { cn } from "@/lib/utils";
 import { SyncStatusBar } from "../../../_components/SyncStatusBar";
 
@@ -68,14 +72,8 @@ function skillLabel(s: SkillArea): string {
     .join(" ");
 }
 
-function extractClassLevel(name: string | null | undefined): number | null {
-  if (!name) return null;
-  const m = name.match(/\b(\d{1,2})\b/);
-  if (!m) return null;
-  const n = Number.parseInt(m[1], 10);
-  if (!Number.isInteger(n) || n < 1 || n > 12) return null;
-  return n;
-}
+// extractClassLevel is imported from @/lib/class-level — see that
+// file's header for the parser's fragility notes.
 
 export default function UnitViewPage() {
   return (
@@ -147,6 +145,28 @@ function UnitView() {
     [router, search],
   );
 
+  // -------------------------------------------------------------------------
+  // RULES OF HOOKS — every hook MUST be declared BEFORE any early return.
+  // -------------------------------------------------------------------------
+  // This `useMemo` used to live below the `if (assignments.isLoading)` /
+  // `if (!classLevel || !subjectCode)` early returns. On the first render
+  // (loading), the function bailed at the early return after 8 hook calls;
+  // on the next render (loaded), control flowed past the return and called
+  // the 9th hook. React's hook-order invariant requires the SAME hooks in
+  // the SAME order on every render, so the loading→loaded transition
+  // triggered the dev warning:
+  //
+  //   "React has detected a change in the order of Hooks called by UnitView."
+  //
+  // The `outcomes.data ?? []` keeps this safe to call when data is still
+  // loading — the memo returns []; the unit-filter render branch never
+  // reads the empty array because we bail above first.
+  // -------------------------------------------------------------------------
+  const unitOutcomes: LearningOutcomeDto[] = React.useMemo(
+    () => (outcomes.data ?? []).filter((o) => o.unitNumber === unitNumber),
+    [outcomes.data, unitNumber],
+  );
+
   // ----- Early-exit branches: missing data / parse failure -----
   if (assignments.isLoading) {
     return (
@@ -178,12 +198,9 @@ function UnitView() {
     );
   }
 
-  // ----- Filter outcomes to this unit -----
-  const unitOutcomes: LearningOutcomeDto[] = React.useMemo(
-    () => (outcomes.data ?? []).filter((o) => o.unitNumber === unitNumber),
-    [outcomes.data, unitNumber],
-  );
-
+  // (unitOutcomes is computed above the early returns — see the
+  // "RULES OF HOOKS" block. Plain values below this point are
+  // re-derivations of it, not hook calls, so they can live here.)
   const unitTitle = unitOutcomes[0]?.unitTitleEn ?? `Unit ${unitNumber}`;
 
   // Skills actually present in this unit (might skip e.g. VOCABULARY).

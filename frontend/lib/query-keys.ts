@@ -25,6 +25,15 @@
 export const qk = {
   // ---- Auth / current user ----
   me: ["me"] as const,
+  /**
+   * School-side users list — Settings → Users & roles. Session 6c.2
+   * adds the key so `useDeleteUser`'s mutation can invalidate it.
+   * The list itself doesn't use React Query yet (Settings page still
+   * does an imperative fetch); this key future-proofs the migration
+   * and lets the soft-delete mutation invalidate via the canonical
+   * taxonomy instead of inventing one.
+   */
+  users: () => ["users"] as const,
   /** Resolved feature map + catalog for the calling user. */
   meFeatures: ["me", "features"] as const,
   /** User's own session list. */
@@ -99,6 +108,41 @@ export const qk = {
       },
     ] as const,
   studentDetail: (id: string) => ["students", "detail", id] as const,
+  /**
+   * Per-student attendance report for the active (or specified)
+   * session. Used by the student-detail page's Attendance section.
+   * Distinct from the roster + report keys below — that endpoint
+   * takes class/section scope; this one is student-scoped.
+   */
+  studentAttendanceReport: (
+    studentId: string,
+    sessionId: string | null,
+    fromDate: string,
+    toDate: string,
+  ) =>
+    [
+      "students",
+      "detail",
+      studentId,
+      "attendance-report",
+      sessionId ?? "active",
+      fromDate,
+      toDate,
+    ] as const,
+  /**
+   * Per-student fees report. Driven by /fees/student/:id. ADMIN-only
+   * server-side; the hook's `enabled` flag gates the call for non-
+   * admin roles so the cache key doesn't fill with 403s.
+   */
+  studentFees: (studentId: string) =>
+    ["students", "detail", studentId, "fees"] as const,
+  /**
+   * Per-(exam, student) result row for the student-detail page's
+   * exam-scores section. Fan-out across all exams in the session via
+   * useQueries — one cache slot per exam id.
+   */
+  studentExamResult: (examId: string, studentId: string) =>
+    ["exams", "detail", examId, "student", studentId] as const,
 
   // ---- Attendance (1m — daily writes) ----
   attendance: (filters: {

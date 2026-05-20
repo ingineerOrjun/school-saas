@@ -33,6 +33,12 @@ interface UserRow {
   email: string;
   role: Role;
   schoolId: string;
+  /**
+   * Session 6c.1 — soft-delete timestamp. Defaults to null; the
+   * "impersonation start refused for soft-deleted target" test
+   * flips this to a Date.
+   */
+  deletedAt: Date | null;
   school?: {
     id: string;
     name: string;
@@ -108,6 +114,7 @@ const makeUser = (overrides: Partial<UserRow> = {}): UserRow => ({
   email: 'admin@school-a.edu',
   role: Role.ADMIN,
   schoolId: 's-1',
+  deletedAt: null,
   school: {
     id: 's-1',
     name: 'School A',
@@ -189,6 +196,23 @@ describe('ImpersonationService.start', () => {
           targetUserId: 'missing',
         }),
       ).rejects.toBeInstanceOf(NotFoundException);
+    });
+
+    it('Session 6c.1: REJECTS impersonation start for a soft-deleted target (404)', async () => {
+      const h = buildHarness();
+      h.users.set(
+        'u-target',
+        makeUser({ deletedAt: new Date('2026-05-01') }),
+      );
+      await expect(
+        h.service.start({
+          actor: SUPER_ACTOR,
+          targetUserId: 'u-target',
+        }),
+      ).rejects.toBeInstanceOf(NotFoundException);
+      // No token minted on a refused start.
+      expect((h.jwt.sign as jest.Mock).mock.calls).toHaveLength(0);
+      expect(h.auditCalls).toHaveLength(0);
     });
   });
 

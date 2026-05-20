@@ -36,8 +36,8 @@ import {
   type StudentAttendanceReport,
   type StudentReportRow,
 } from "@/lib/attendance";
-import { classesApi, type ClassWithSections } from "@/lib/classes";
-import { studentsApi, type StudentDto } from "@/lib/students";
+import { useClasses, type ClassWithSections } from "@/lib/classes";
+import { useStudents, type StudentDto } from "@/lib/students";
 import { Button } from "@/components/ui/Button";
 import { Skeleton } from "@/components/ui/Skeleton";
 import { EmptyState } from "@/components/ui/EmptyState";
@@ -68,9 +68,19 @@ function parseScope(value: ScopeValue): {
 export default function AttendanceInsightsPage() {
   const router = useRouter();
 
-  const [classes, setClasses] = React.useState<ClassWithSections[]>([]);
-  const [students, setStudents] = React.useState<StudentDto[]>([]);
-  const [loadingMeta, setLoadingMeta] = React.useState(true);
+  // Classes + students via the shared React Query hooks. Both are
+  // reference data with a shared cache slot — fast back/forward
+  // navigation between this page and other consumers (the picker
+  // dialog in /students, the /exams/* pages) is a cache hit.
+  const classesQuery = useClasses();
+  const studentsQuery = useStudents();
+  const classes: ClassWithSections[] = classesQuery.data ?? [];
+  const students: StudentDto[] = React.useMemo(
+    () => studentsQuery.data ?? [],
+    [studentsQuery.data],
+  );
+  // Combined loading flag — used by the empty-state branches below.
+  const loadingMeta = classesQuery.isLoading || studentsQuery.isLoading;
 
   const [fromDate, setFromDate] = React.useState<string>(daysAgoISO(30));
   const [toDate, setToDate] = React.useState<string>(todayISO());
@@ -81,35 +91,38 @@ export default function AttendanceInsightsPage() {
   const [loading, setLoading] = React.useState(false);
   const [error, setError] = React.useState<string | null>(null);
 
-  // Load classes + students once on mount.
+  // Bridge classesQuery.error into the local error display — the
+  // previous useEffect's catch branch funneled the classes failure
+  // into `setError(...)`; preserve that behavior at render time.
   React.useEffect(() => {
-    let cancelled = false;
-    (async () => {
-      try {
-        const [cls, stu] = await Promise.all([
-          classesApi.list(),
-          studentsApi.list(),
-        ]);
-        if (!cancelled) {
-          setClasses(cls);
-          setStudents(stu);
-        }
-      } catch (err) {
-        if (err instanceof ApiError && err.status === 401) {
-          router.replace("/login");
-          return;
-        }
-        const msg =
-          err instanceof ApiError ? err.message : "Failed to load classes.";
-        if (!cancelled) setError(msg);
-      } finally {
-        if (!cancelled) setLoadingMeta(false);
-      }
-    })();
-    return () => {
-      cancelled = true;
-    };
-  }, [router]);
+    if (classesQuery.error) {
+      const msg =
+        classesQuery.error instanceof ApiError
+          ? classesQuery.error.message
+          : "Failed to load classes.";
+      setError((prev) => prev ?? msg);
+    }
+  }, [classesQuery.error]);
+
+  // Mirror the same error bridge for the students hook. The original
+  // try/catch funneled non-401 errors into `setError(...)`; the React
+  // Query retry layer drops 401s without retry so the only error
+  // landing here that matters is a real load failure.
+  React.useEffect(() => {
+    if (!studentsQuery.error) return;
+    if (
+      studentsQuery.error instanceof ApiError &&
+      studentsQuery.error.status === 401
+    ) {
+      router.replace("/login");
+      return;
+    }
+    const msg =
+      studentsQuery.error instanceof ApiError
+        ? studentsQuery.error.message
+        : "Failed to load students.";
+    setError((prev) => prev ?? msg);
+  }, [studentsQuery.error, router]);
 
   // Student picker is now section-independent — lists ALL students. When
   // a scope is selected we narrow the list (section → students of that

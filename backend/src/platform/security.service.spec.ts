@@ -35,6 +35,12 @@ interface UserRow {
   schoolId: string;
   password: string;
   tokensValidAfter: Date | null;
+  /**
+   * Session 6c.1 — soft-delete timestamp. Defaults to null in
+   * `makeUser`; tests that exercise the deleted-user branch
+   * override this to a Date.
+   */
+  deletedAt: Date | null;
   school?: { name: string } | null;
 }
 
@@ -189,6 +195,7 @@ const makeUser = (overrides: Partial<UserRow> = {}): UserRow => ({
   schoolId: 's-1',
   password: 'old-hash',
   tokensValidAfter: null,
+  deletedAt: null,
   school: { name: 'School A' },
   ...overrides,
 });
@@ -245,6 +252,19 @@ describe('SecurityService', () => {
       await expect(
         h.service.forceLogoutUser('missing', ACTOR, null),
       ).rejects.toBeInstanceOf(NotFoundException);
+    });
+
+    it('Session 6c.1: soft-deleted user surfaces as 404 and writes nothing', async () => {
+      const h = buildHarness();
+      const dead = makeUser({ deletedAt: new Date('2026-05-01') });
+      h.users.set(dead.id, dead);
+
+      await expect(
+        h.service.forceLogoutUser(dead.id, ACTOR, 'attempt on dead user'),
+      ).rejects.toBeInstanceOf(NotFoundException);
+
+      expect(dead.tokensValidAfter).toBeNull();
+      expect(h.auditCalls).toHaveLength(0);
     });
   });
 
@@ -387,6 +407,24 @@ describe('SecurityService', () => {
 
       // The watermark + password change still happened.
       expect(user.tokensValidAfter).toBeInstanceOf(Date);
+    });
+
+    it('Session 6c.1: soft-deleted user surfaces as 404 and the password / watermark are untouched', async () => {
+      const h = buildHarness();
+      const dead = makeUser({
+        deletedAt: new Date('2026-05-01'),
+        password: 'old-hash',
+      });
+      h.users.set(dead.id, dead);
+
+      await expect(
+        h.service.resetPassword(dead.id, ACTOR, 'attempted reset on dead user'),
+      ).rejects.toBeInstanceOf(NotFoundException);
+
+      expect(dead.password).toBe('old-hash');
+      expect(dead.tokensValidAfter).toBeNull();
+      expect(h.auditCalls).toHaveLength(0);
+      expect(h.notificationCalls).toHaveLength(0);
     });
   });
 });

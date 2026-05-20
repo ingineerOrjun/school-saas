@@ -3,7 +3,6 @@ import {
   ConflictException,
   ForbiddenException,
   Injectable,
-  UnprocessableEntityException,
 } from '@nestjs/common';
 import {
   ChangeKind,
@@ -61,8 +60,10 @@ import type { ListContinuousRecordDto } from './dto/list-continuous-record.dto';
 /** Service-layer copy IDs — stable strings for tests + frontend. */
 export const CONTINUOUS_RECORD_FAILURE = {
   SESSION_LOCKED: 'This session is locked. Writes are no longer permitted.',
-  AFTER_SUPPORT_REQUIRES_REGULAR:
-    'After-support assessment requires a regular assessment with rating 1 or 2 first.',
+  // AFTER_SUPPORT_REQUIRES_REGULAR removed in Deviation 001 —
+  // AFTER_SUPPORT is now allowed for any REGULAR rating value (or
+  // even when no REGULAR exists). See backend/docs/cdc-compliance-
+  // deviations.md.
   TEACHER_NOT_ASSIGNED:
     'You are not assigned to evaluate this student for this subject.',
   DUPLICATE_BULK_ENTRY:
@@ -109,11 +110,12 @@ export class ContinuousRecordService {
       subjectCode: outcome.subjectCode,
     });
 
-    // 4. AFTER_SUPPORT precondition. Read before opening the transaction
-    //    so the failure path stays cheap (no tx overhead).
-    if (input.phase === EvalPhase.AFTER_SUPPORT) {
-      await this.assertAfterSupportAllowed(input);
-    }
+    // 4. AFTER_SUPPORT is allowed for any REGULAR rating per
+    //    Deviation 001 (see backend/docs/cdc-compliance-deviations.md).
+    //    The CDC framework originally restricted AFTER_SUPPORT to
+    //    REGULAR ≤ 2 cases, but the product allows universal
+    //    AFTER_SUPPORT for UX reasons. The frontend renders
+    //    AFTER_SUPPORT buttons inline for every student.
 
     // 5. Write under a retryable transaction so concurrent upserts of
     //    the same composite key never duplicate the history row.
@@ -171,9 +173,9 @@ export class ContinuousRecordService {
         studentId: input.studentId,
         subjectCode: outcome.subjectCode,
       });
-      if (input.phase === EvalPhase.AFTER_SUPPORT) {
-        await this.assertAfterSupportAllowed(input);
-      }
+      // AFTER_SUPPORT precondition removed per Deviation 001
+      // (see backend/docs/cdc-compliance-deviations.md). Bulk path
+      // mirrors the single-record path: any phase is acceptable.
     }
 
     // 2. All-or-nothing transaction. Per-record optimistic-concurrency
@@ -311,37 +313,11 @@ export class ContinuousRecordService {
     return outcome;
   }
 
-  /**
-   * Enforce the AFTER_SUPPORT precondition:
-   *   • A REGULAR record for the same (student, outcome, session)
-   *     must exist.
-   *   • That REGULAR.rating must be ≤ 2.
-   *
-   * Read uses the composite unique key so it's a single B-tree lookup.
-   */
-  private async assertAfterSupportAllowed(
-    input: Pick<
-      CreateContinuousRecordDto,
-      'studentId' | 'outcomeId' | 'sessionId'
-    >,
-  ): Promise<void> {
-    const regular = await this.prisma.continuousRecord.findUnique({
-      where: {
-        studentId_outcomeId_sessionId_phase: {
-          studentId: input.studentId,
-          outcomeId: input.outcomeId,
-          sessionId: input.sessionId,
-          phase: EvalPhase.REGULAR,
-        },
-      },
-      select: { rating: true },
-    });
-    if (!regular || regular.rating > 2) {
-      throw new UnprocessableEntityException(
-        CONTINUOUS_RECORD_FAILURE.AFTER_SUPPORT_REQUIRES_REGULAR,
-      );
-    }
-  }
+  // Note: the `assertAfterSupportAllowed` private method and the
+  // `AFTER_SUPPORT_REQUIRES_REGULAR` failure copy were removed in
+  // Deviation 001 (see backend/docs/cdc-compliance-deviations.md).
+  // If we ever restore CDC-strict mode, both should come back as a
+  // unit — the message string was part of the user-facing contract.
 
   /**
    * Apply one upsert + history row inside a transaction client. The

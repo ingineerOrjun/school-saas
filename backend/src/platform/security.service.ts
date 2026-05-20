@@ -103,6 +103,11 @@ export class SecurityService {
     actor: ActorCtx,
     reason: string | null,
   ): Promise<ForceLogoutUserResult> {
+    // Session 6c.1 — soft-deleted users surface as 404 here. They
+    // have no live tokens to revoke (JwtStrategy rejects them) and
+    // their watermark is moot. Surfacing them would let an operator
+    // try to "force-logout" a row that's already deactivated, which
+    // is confusing.
     const target = await this.prisma.user.findUnique({
       where: { id: userId },
       select: {
@@ -110,10 +115,13 @@ export class SecurityService {
         email: true,
         role: true,
         schoolId: true,
+        deletedAt: true,
         school: { select: { name: true } },
       },
     });
-    if (!target) throw new NotFoundException('User not found.');
+    if (!target || target.deletedAt) {
+      throw new NotFoundException('User not found.');
+    }
     if (target.role === Role.SUPER_ADMIN) {
       throw new ForbiddenException(
         'Cannot force-logout a SUPER_ADMIN through the platform API.',
@@ -233,6 +241,9 @@ export class SecurityService {
     actor: ActorCtx,
     reason: string | null,
   ): Promise<ResetPasswordResult> {
+    // Session 6c.1 — soft-deleted users can't log in, so resetting
+    // their password is a no-op. Surface 404 instead of writing a
+    // new hash + bumping the watermark on a dead row.
     const target = await this.prisma.user.findUnique({
       where: { id: userId },
       select: {
@@ -240,10 +251,13 @@ export class SecurityService {
         email: true,
         role: true,
         schoolId: true,
+        deletedAt: true,
         school: { select: { name: true } },
       },
     });
-    if (!target) throw new NotFoundException('User not found.');
+    if (!target || target.deletedAt) {
+      throw new NotFoundException('User not found.');
+    }
     if (target.role === Role.SUPER_ADMIN) {
       throw new ForbiddenException(
         'Cannot reset a SUPER_ADMIN password through the platform API.',
@@ -336,11 +350,15 @@ export class SecurityService {
    * targets per the same rules as forceLogoutUser.
    */
   async listUserSessions(userId: string): Promise<SessionRow[]> {
+    // Session 6c.1 — soft-deleted users return an empty list (same
+    // shape as "user doesn't exist"). Their sessions are dead at
+    // the JWT layer anyway; the operator UX is "they're gone, no
+    // sessions to show."
     const target = await this.prisma.user.findUnique({
       where: { id: userId },
-      select: { id: true, role: true },
+      select: { id: true, role: true, deletedAt: true },
     });
-    if (!target) return [];
+    if (!target || target.deletedAt) return [];
     if (target.role === Role.SUPER_ADMIN) {
       // Don't expose SUPER_ADMIN session lists through the
       // platform API — symmetric with the impersonation +
@@ -363,11 +381,22 @@ export class SecurityService {
     actor: ActorCtx;
     reason: string | null;
   }): Promise<{ revokedAt: string }> {
+    // Session 6c.1 — soft-deleted users surface the same
+    // programmer-error path; this method is called from
+    // controllers that already filter the target list via
+    // `listUserSessions`, so a soft-deleted id reaching here is
+    // a UI bug worth surfacing rather than silently no-op'ing.
     const target = await this.prisma.user.findUnique({
       where: { id: input.userId },
-      select: { id: true, email: true, role: true, school: { select: { name: true } } },
+      select: {
+        id: true,
+        email: true,
+        role: true,
+        deletedAt: true,
+        school: { select: { name: true } },
+      },
     });
-    if (!target) {
+    if (!target || target.deletedAt) {
       throw new Error('User not found.'); // surfaces as 500 only on programmer error
     }
     if (target.role === Role.SUPER_ADMIN) {

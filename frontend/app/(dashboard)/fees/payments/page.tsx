@@ -22,7 +22,7 @@ import {
   type PaymentHistoryResponse,
   type PaymentMethod,
 } from "@/lib/fees";
-import { classesApi, type ClassWithSections } from "@/lib/classes";
+import { useClasses, type ClassWithSections } from "@/lib/classes";
 import { formatCurrency } from "@/lib/currency";
 import { formatByMode } from "@/lib/date";
 import { getStoredUser } from "@/lib/auth";
@@ -73,7 +73,14 @@ export default function PaymentsHistoryPage() {
   const [debouncedQ, setDebouncedQ] = React.useState("");
   const [page, setPage] = React.useState(1);
   const [data, setData] = React.useState<PaymentHistoryResponse | null>(null);
-  const [classes, setClasses] = React.useState<ClassWithSections[]>([]);
+  // Classes via the shared React Query hook (10m staleTime). Same
+  // soft-fail semantics as the previous inline classesApi.list() —
+  // on error, surface as `[]` so the dropdown disappears but the
+  // rest of the payments page keeps working.
+  const classesQuery = useClasses();
+  const classes: ClassWithSections[] = classesQuery.isError
+    ? []
+    : classesQuery.data ?? [];
   const [loading, setLoading] = React.useState(true);
   const [error, setError] = React.useState<string | null>(null);
   // Refund dialog target. The dialog is admin-only — non-admin viewers
@@ -142,23 +149,11 @@ export default function PaymentsHistoryPage() {
     fetchData();
   }, [fetchData]);
 
-  // Class list is loaded once — the dropdown is a static reference
-  // that doesn't change while this page is mounted.
-  React.useEffect(() => {
-    let cancelled = false;
-    classesApi
-      .list()
-      .then((cs) => {
-        if (!cancelled) setClasses(cs);
-      })
-      .catch(() => {
-        // Soft-fail: the page works without the class filter.
-        if (!cancelled) setClasses([]);
-      });
-    return () => {
-      cancelled = true;
-    };
-  }, []);
+  // (Classes loaded via `useClasses()` above — the previous
+  // useEffect → classesApi.list() pattern was removed and is now
+  // a shared React Query cache hit. Soft-fail semantics preserved
+  // by the `isError ? [] : data ?? []` shape on the `classes`
+  // value above.)
 
   const handleExport = () => {
     if (!data || data.rows.length === 0) {

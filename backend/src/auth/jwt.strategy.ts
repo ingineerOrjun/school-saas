@@ -69,10 +69,16 @@ export class JwtStrategy extends PassportStrategy(Strategy) {
         role: true,
         schoolId: true,
         tokensValidAfter: true,
+        // Session 6c.1 — soft-delete state. A non-null `deletedAt`
+        // means this user's tokens must be rejected regardless of
+        // expiry / watermark / session status. The check lands below
+        // alongside the schoolId match so all three "token isn't
+        // valid anymore" reasons share the same 401 path.
+        deletedAt: true,
       },
     });
 
-    if (!user || user.schoolId !== payload.schoolId) {
+    if (!user || user.schoolId !== payload.schoolId || user.deletedAt) {
       throw new UnauthorizedException('Token is no longer valid.');
     }
 

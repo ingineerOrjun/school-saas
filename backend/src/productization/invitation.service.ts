@@ -99,17 +99,28 @@ export class InvitationService {
       throw new BadRequestException('Invalid email address.');
     }
 
-    // No re-inviting an existing user. Tenant-scoped: emails are
-    // unique per (schoolId, email), not globally — a user with the
-    // same email at another school is a different person and is not
-    // a conflict here.
+    // No re-inviting an ACTIVE existing user. Tenant-scoped: emails
+    // are unique per (schoolId, email), not globally — a user with
+    // the same email at another school is a different person and is
+    // not a conflict here.
+    //
+    // Session 6c.1 — a soft-deleted user under the same email is
+    // NOT a collision: the operator's intent in re-inviting is to
+    // restore access for someone who was previously deactivated,
+    // and we want that to be a one-click workflow. The compound
+    // unique index `(schoolId, email)` still applies, so when the
+    // invitation is later accepted the row creation will need to
+    // either re-use the existing User id (the cleaner future
+    // direction) or hit the same constraint — that's a Phase 2 UX
+    // concern, not a Phase 1 audit one. The check here only
+    // gates whether to surface the collision to the operator.
     const existingUser = await this.prisma.user.findUnique({
       where: {
         schoolId_email: { schoolId: input.schoolId, email },
       },
-      select: { id: true },
+      select: { id: true, deletedAt: true },
     });
-    if (existingUser) {
+    if (existingUser && existingUser.deletedAt === null) {
       throw new ConflictException(
         'An account with this email already exists at this school. Reset the password instead of re-inviting.',
       );

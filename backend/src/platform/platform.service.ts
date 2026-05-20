@@ -546,8 +546,12 @@ export class PlatformService {
     // status change. Each call dedupes per (school, transition event)
     // so a same-millisecond double-click won't double-send.
     try {
+      // Session 6c.1 — skip soft-deleted admins when picking the
+      // status-change notification recipient. If every admin is
+      // deactivated the notify branch is a no-op; the status
+      // change itself is unaffected (already persisted above).
       const admin = await this.prisma.user.findFirst({
-        where: { schoolId, role: Role.ADMIN },
+        where: { schoolId, role: Role.ADMIN, deletedAt: null },
         orderBy: { createdAt: 'asc' },
         select: { id: true, email: true },
       });
@@ -731,10 +735,15 @@ export class PlatformService {
     });
     if (!exists) throw new NotFoundException('School not found.');
 
+    // Session 6c.1 — soft-deleted users are hidden from the
+    // platform-side school detail page's default user list. A
+    // future "deleted users" tab can opt in by inverting the
+    // filter; the active workflow always sees living rows only.
     const users = await this.prisma.user.findMany({
       where: {
         schoolId,
         role: { not: Role.SUPER_ADMIN },
+        deletedAt: null,
       },
       select: { id: true, email: true, role: true, createdAt: true },
       orderBy: [{ role: 'asc' }, { email: 'asc' }],

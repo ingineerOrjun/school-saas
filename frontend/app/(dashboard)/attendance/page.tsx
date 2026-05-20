@@ -18,7 +18,7 @@ import { toast } from "sonner";
 import { cn } from "@/lib/utils";
 import { ApiError } from "@/lib/api";
 import { getStoredUser } from "@/lib/auth";
-import { classesApi, type ClassWithSections } from "@/lib/classes";
+import { useClasses, type ClassWithSections } from "@/lib/classes";
 import {
   useMyTeachingAssignments,
   type TeachingAssignmentDto,
@@ -152,7 +152,13 @@ export default function AttendancePage() {
   // render — afterwards the picker is the source of truth.
   const initialScope = useInitialScopeFromQuery();
   const [date, setDate] = React.useState<string>(todayISO());
-  const [classes, setClasses] = React.useState<ClassWithSections[]>([]);
+  // Classes catalog — via the shared React Query hook so multiple
+  // pages on the same SPA session share one /classes fetch (reference
+  // data, 10m staleTime). Previously this page used a private
+  // useEffect → classesApi.list() → setState pattern which produced a
+  // /classes dupe flagged by the request-pressure panel.
+  const classesQuery = useClasses();
+  const classes: ClassWithSections[] = classesQuery.data ?? [];
   // For TEACHER users we filter the picker to only their assigned
   // classes/sections — they can't act outside their scope anyway, and
   // showing the full catalog would just waste their time. ADMIN keeps
@@ -204,7 +210,11 @@ export default function AttendancePage() {
   // data; populated from the cache's `updatedAt` when we fall back
   // to IndexedDB. Drives the "⚠ Showing last synced roster" pill.
   const [staleSince, setStaleSince] = React.useState<number | null>(null);
-  const [loadingClasses, setLoadingClasses] = React.useState(true);
+  // Classes loading derives from the React Query hook directly — no
+  // local mirror state. `error` below stays local because it's also
+  // set by the roster-fetch path; the classes-load failure is bridged
+  // into the same display panel via `displayError` further down.
+  const loadingClasses = classesQuery.isLoading;
   const [loadingRoster, setLoadingRoster] = React.useState(false);
   const [error, setError] = React.useState<string | null>(null);
   const [savingIds, setSavingIds] = React.useState<Set<string>>(
@@ -218,35 +228,14 @@ export default function AttendancePage() {
   const [pendingBulk, setPendingBulk] =
     React.useState<AttendanceStatus | null>(null);
 
-  // Load classes only — assignments now flow through the React Query
-  // cache via `useMyTeachingAssignments()` above. The two used to be
-  // fetched together via Promise.all; splitting them removes the
-  // duplicate /teachers/me/assignments hits across pages without
-  // changing the user-visible loading flow (see `referenceLoading`
-  // below, which combines both halves before the dropdown is enabled).
-  React.useEffect(() => {
-    let cancelled = false;
-    (async () => {
-      try {
-        const classList = await classesApi.list();
-        if (cancelled) return;
-        setClasses(classList);
-      } catch (err) {
-        if (err instanceof ApiError && err.status === 401) {
-          router.replace("/login");
-          return;
-        }
-        const msg =
-          err instanceof ApiError ? err.message : "Failed to load classes.";
-        setError(msg);
-      } finally {
-        if (!cancelled) setLoadingClasses(false);
-      }
-    })();
-    return () => {
-      cancelled = true;
-    };
-  }, [router]);
+  // (Classes load is now handled by `useClasses()` above. The
+  // previous useEffect → classesApi.list() → setState pattern was
+  // removed: it bypassed the shared React Query cache and surfaced
+  // as a /classes dupe in the request-pressure panel. The 401
+  // auto-redirect that lived in this useEffect's catch branch is
+  // still in place — `lib/api.ts` handles it inside the fetch call
+  // itself, so the redirect happens regardless of whether the
+  // failure originated from this hook or any other.)
 
   /**
    * Roster fetch — offline-aware:
@@ -701,8 +690,12 @@ export default function AttendancePage() {
         </div>
       )}
 
-      {/* Error banner */}
-      {error && (
+      {/* Error banner. Bridges both the roster-fetch path's local
+          `error` state AND the classes-fetch path's React Query
+          error — when the classes hook fails the panel still
+          surfaces, preserving the previous behavior where the old
+          setError(msg) call funneled the classes failure here. */}
+      {(error || classesQuery.error) && (
         <div className="glass rounded-xl p-5 flex items-start gap-3 border-destructive/20 animate-fade-in">
           <div className="flex h-10 w-10 shrink-0 items-center justify-center rounded-full bg-destructive/10 text-destructive">
             <AlertCircle className="h-5 w-5" />
@@ -711,13 +704,18 @@ export default function AttendancePage() {
             <h3 className="text-md font-semibold tracking-tight text-foreground">
               Something went wrong
             </h3>
-            <p className="mt-1 text-sm text-muted-foreground">{error}</p>
+            <p className="mt-1 text-sm text-muted-foreground">
+              {error ??
+                (classesQuery.error instanceof ApiError
+                  ? classesQuery.error.message
+                  : "Failed to load classes.")}
+            </p>
           </div>
         </div>
       )}
 
       {/* Roster states */}
-      {!scopeSelected && !noClasses && !error && (
+      {!scopeSelected && !noClasses && !error && !classesQuery.error && (
         <div className="glass rounded-xl animate-fade-in-up">
           <EmptyState
             icon={<CalendarCheck className="h-10 w-10" strokeWidth={1.5} />}

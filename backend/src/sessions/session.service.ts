@@ -271,12 +271,24 @@ export class SessionService {
     }>
   > {
     const limit = Math.min(100, Math.max(1, input.limit ?? 50));
-    const where: Record<string, unknown> = { revokedAt: null };
+    // Session 6c.1 — exclude sessions whose owner has been
+    // soft-deleted. Those sessions are dead at the JWT layer
+    // already (the strategy rejects them), so showing them in
+    // the operator viewer would just be confusing. Seed the
+    // user-relation filter with `deletedAt: null` so subsequent
+    // branches that spread `where.user` preserve it.
+    const where: Record<string, unknown> = {
+      revokedAt: null,
+      user: { deletedAt: null },
+    };
     if (input.onlyOnline) {
       where.lastActiveAt = { gte: new Date(Date.now() - 15 * 60_000) };
     }
     if (input.schoolId) {
-      where.user = { schoolId: input.schoolId };
+      where.user = {
+        ...((where.user as object) ?? {}),
+        schoolId: input.schoolId,
+      };
     }
     if (input.q && input.q.trim().length > 0) {
       const q = input.q.trim();

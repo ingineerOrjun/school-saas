@@ -27,7 +27,7 @@ import {
   type ExamSubjectDto,
   type StudentReport,
 } from "@/lib/exams";
-import { studentsApi, type StudentDto } from "@/lib/students";
+import { useStudents, type StudentDto } from "@/lib/students";
 import { getStoredUser } from "@/lib/auth";
 import {
   useMyTeachingAssignments,
@@ -42,7 +42,19 @@ import { EmptyState } from "@/components/ui/EmptyState";
 export default function ExamsPage() {
   const router = useRouter();
   const [exams, setExams] = React.useState<ExamDto[] | null>(null);
-  const [students, setStudents] = React.useState<StudentDto[]>([]);
+  // Students now flow through the shared React Query hook. Was a leg
+  // of the original `Promise.all([examsApi.list, studentsApi.list])`
+  // in `refresh`; splitting it out means:
+  //   • multiple pages calling useStudents() share one underlying
+  //     request (the dupe flagged by the request-pressure panel)
+  //   • students no longer refetch when the user switches academic
+  //     session (the old Promise.all leg incidentally did — students
+  //     are session-independent, so this is a silent fix)
+  const studentsQuery = useStudents();
+  const students: StudentDto[] = React.useMemo(
+    () => studentsQuery.data ?? [],
+    [studentsQuery.data],
+  );
   // Teacher-only filter set. ADMIN keeps it null → no filtering applied.
   // Backed by the shared React Query cache via `useMyTeachingAssignments`
   // — admins/staff are gated out via `enabled: isTeacher` so they
@@ -86,14 +98,12 @@ export default function ExamsPage() {
     setLoading(true);
     setError(null);
     try {
-      // Assignments now flow through `useMyTeachingAssignments()`
-      // above — refresh() is responsible only for exams + students.
-      const [examList, studentList] = await Promise.all([
-        examsApi.list(selectedSession?.id),
-        studentsApi.list(),
-      ]);
+      // Assignments now flow through `useMyTeachingAssignments()` and
+      // students through `useStudents()` above — refresh() is
+      // responsible only for the exams list, which is the only leg
+      // that needs to refetch on session switch.
+      const examList = await examsApi.list(selectedSession?.id);
       setExams(examList);
-      setStudents(studentList);
     } catch (err) {
       if (err instanceof ApiError && err.status === 401) {
         router.replace("/login");
@@ -113,6 +123,25 @@ export default function ExamsPage() {
   React.useEffect(() => {
     refresh();
   }, [refresh]);
+
+  // Bridge studentsQuery.error into the same local error surface that
+  // the original try/catch used. React Query drops 401s without retry
+  // so the only error landing here is a real failure.
+  React.useEffect(() => {
+    if (!studentsQuery.error) return;
+    if (
+      studentsQuery.error instanceof ApiError &&
+      studentsQuery.error.status === 401
+    ) {
+      router.replace("/login");
+      return;
+    }
+    const msg =
+      studentsQuery.error instanceof ApiError
+        ? studentsQuery.error.message
+        : "Failed to load students.";
+    setError((prev) => prev ?? msg);
+  }, [studentsQuery.error, router]);
 
   const selectedExam = React.useMemo(
     () => exams?.find((e) => e.id === selectedExamId) ?? null,
@@ -399,11 +428,12 @@ export default function ExamsPage() {
     return s ? `${s.firstName} ${s.lastName}` : "";
   }, [students, selectedStudentId]);
 
-  // Combined "reference data not ready yet" flag — the imperative
-  // exams/students fetch and the assignments hook resolve independently
-  // now (used to share a Promise.all). Gate skeletons on both so the
-  // body never renders mid-load with a partially-filtered picker.
-  const referenceLoading = loading || (isTeacher && assignmentsLoading);
+  // Combined "reference data not ready yet" flag — exams, students,
+  // and assignments now resolve independently (used to share a
+  // Promise.all). Gate skeletons on all three so the body never
+  // renders mid-load with a partially-filtered picker.
+  const referenceLoading =
+    loading || studentsQuery.isLoading || (isTeacher && assignmentsLoading);
   const noStudents = !referenceLoading && students.length === 0;
   const noExams = !referenceLoading && exams?.length === 0;
 

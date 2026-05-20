@@ -26,6 +26,7 @@ import { getStoredUser, type Role } from "@/lib/auth";
 import { schoolApi, resolveLogoUrl, type SchoolDto } from "@/lib/school";
 import { subjectsApi, useSubjects, type SubjectDto } from "@/lib/subjects";
 import { usersApi, type UserDto } from "@/lib/users";
+import { DeleteUserDialog } from "@/components/users/DeleteUserDialog";
 import { Button } from "@/components/ui/Button";
 import { Input } from "@/components/ui/Input";
 import { Skeleton } from "@/components/ui/Skeleton";
@@ -749,6 +750,12 @@ function UsersSection({ currentUserId }: { currentUserId: string | null }) {
   const [list, setList] = React.useState<UserDto[]>([]);
   const [loading, setLoading] = React.useState(true);
   const [savingId, setSavingId] = React.useState<string | null>(null);
+  // Session 6c.2 — soft-delete dialog state. Holds the user that
+  // was clicked; null when closed. Lives at the section level so
+  // a single dialog instance serves every row.
+  const [deleteTarget, setDeleteTarget] = React.useState<UserDto | null>(
+    null,
+  );
 
   const refresh = React.useCallback(async () => {
     setLoading(true);
@@ -902,12 +909,47 @@ function UsersSection({ currentUserId }: { currentUserId: string | null }) {
                   {isSaving && (
                     <Loader2 className="h-4 w-4 animate-spin text-muted-foreground" />
                   )}
+                  {/* Session 6c.2 — per-row Delete button. Hidden on
+                      the current user's own row (the backend would
+                      403 anyway, but hiding the UI avoids the wrong
+                      affordance). The list itself is already filtered
+                      to the current school by the backend, so school-
+                      ADMIN cross-tenant deletion isn't reachable from
+                      here either. */}
+                  {!isMe && (
+                    <button
+                      type="button"
+                      onClick={() => setDeleteTarget(u)}
+                      disabled={isSaving}
+                      aria-label={`Delete ${u.email}`}
+                      title="Delete user"
+                      className={cn(
+                        "inline-flex h-9 w-9 items-center justify-center rounded-md",
+                        "text-muted-foreground hover:bg-destructive/10 hover:text-destructive",
+                        "transition-colors focus-ring",
+                        "disabled:cursor-not-allowed disabled:opacity-40",
+                      )}
+                    >
+                      <Trash2 className="h-4 w-4" />
+                    </button>
+                  )}
                 </div>
               </li>
             );
           })}
         </ul>
       )}
+
+      <DeleteUserDialog
+        user={deleteTarget}
+        onClose={() => setDeleteTarget(null)}
+        onSuccess={() => {
+          // Wait-and-refresh — the mutation hook already invalidated
+          // the (future) React Query slot; today the list still uses
+          // imperative state, so call refresh() to repopulate.
+          void refresh();
+        }}
+      />
     </section>
   );
 }

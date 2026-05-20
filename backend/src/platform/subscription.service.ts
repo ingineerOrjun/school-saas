@@ -262,8 +262,17 @@ export class SubscriptionService {
     endDate: Date | null;
     previousPlan: SubscriptionPlan | null;
   }): Promise<void> {
+    // Session 6c.1 — skip soft-deleted admins when picking the
+    // notification recipient. If every admin at the school is
+    // soft-deleted we fall through to the no-recipient branch
+    // below; the subscription row is still written, just the
+    // email side-effect is dropped.
     const admin = await this.prisma.user.findFirst({
-      where: { schoolId: input.schoolId, role: Role.ADMIN },
+      where: {
+        schoolId: input.schoolId,
+        role: Role.ADMIN,
+        deletedAt: null,
+      },
       orderBy: { createdAt: 'asc' },
       select: { id: true, email: true },
     });

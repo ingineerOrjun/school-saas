@@ -14,7 +14,7 @@ import {
   attendanceApi,
   type AttendanceTrend,
 } from "@/lib/attendance";
-import { classesApi } from "@/lib/classes";
+import { useClasses } from "@/lib/classes";
 import { downloadCsv, csvFilenameStamp } from "@/lib/csv";
 import { AttendanceTrendChart } from "@/components/charts/AttendanceTrendChart";
 import { LowAttendanceBar } from "@/components/charts/LowAttendanceBar";
@@ -53,6 +53,15 @@ export function AttendanceTab({ filters }: { filters: AnalyticsFilters }) {
   const [loading, setLoading] = React.useState(true);
   const [error, setError] = React.useState<string | null>(null);
 
+  // Classes via the shared React Query hook (10m staleTime). Was an
+  // inline classesApi.list() inside the effect below; switching to
+  // the cached hook closes the /classes dupe flagged by the
+  // request-pressure panel. The effect now depends on the hook's
+  // data so it re-runs when the classes list arrives (and again
+  // on any filter change).
+  const classesQuery = useClasses();
+  const classesData = classesQuery.data;
+
   React.useEffect(() => {
     let cancelled = false;
     setLoading(true);
@@ -78,13 +87,15 @@ export function AttendanceTab({ filters }: { filters: AnalyticsFilters }) {
         if (cancelled) return;
         setTrend(schoolTrend);
 
-        // Then fan out per-class. We fetch the class list separately
-        // and run parallel /trend?classId= queries — each one returns
-        // a `totals` rollup we use for the comparison bars. This is
-        // bounded fan-out (typical school has < 20 classes) so it's
-        // cheap; for very large schools we'd add a backend rollup
-        // endpoint to do it in one round-trip.
-        const classes = await classesApi.list();
+        // Then fan out per-class. Reads from the cached classes list
+        // populated by `useClasses()` above. While the hook is still
+        // loading (`classesData === undefined`), we skip the
+        // per-class fan-out and leave `classRows` empty; the effect
+        // re-runs when classes arrive and populates it. This matches
+        // the previous "await classesApi.list(); then map" sequence
+        // — the wait now happens at the effect level rather than
+        // inline.
+        const classes = classesData ?? [];
         if (cancelled) return;
 
         const perClass = await Promise.all(
@@ -128,7 +139,29 @@ export function AttendanceTab({ filters }: { filters: AnalyticsFilters }) {
     return () => {
       cancelled = true;
     };
-  }, [filters.fromDate, filters.toDate, filters.classId, filters.sectionId]);
+  }, [
+    filters.fromDate,
+    filters.toDate,
+    filters.classId,
+    filters.sectionId,
+    // Re-run when the cached classes list lands (or when the cache
+    // invalidates) so the per-class fan-out gets the fresh list.
+    classesData,
+  ]);
+
+  // Bridge classesQuery.error into the existing error banner — the
+  // previous inline classesApi.list() funneled its failure into
+  // `setError` via the surrounding try/catch; preserve that surface.
+  React.useEffect(() => {
+    if (classesQuery.error) {
+      setError((prev) =>
+        prev ??
+        (classesQuery.error instanceof ApiError
+          ? classesQuery.error.message
+          : "Failed to load classes."),
+      );
+    }
+  }, [classesQuery.error]);
 
   if (error) return <ErrorBanner message={error} />;
 

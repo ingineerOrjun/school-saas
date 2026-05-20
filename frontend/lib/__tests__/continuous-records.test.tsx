@@ -164,6 +164,42 @@ describe("useContinuousRecordsForClassStudents", () => {
     expect(result.current.byStudentId.size).toBe(0);
   });
 
+  it("returns a STABLE result identity across re-renders when underlying data hasn't changed (loop-fix regression)", async () => {
+    // This pins the Session 6a infinite-loop fix at the hook layer.
+    // Before the fix, every render of the hook rebuilt `byStudentId`
+    // as a new Map and returned a new result object. Any consumer
+    // listing `records.byStudentId` in a useEffect dep array would
+    // see a new identity every render → effect re-fires → if it
+    // called setState → infinite loop.
+    //
+    // Strategy: render the hook, wait for queries to settle, then
+    // force a parent re-render and verify the hook returns the SAME
+    // result object reference. If this test fails, the loop is back.
+    mockedApi.mockImplementation(async (url: string) => {
+      if (url.includes("studentId=s-1")) return [sampleRecord];
+      return [];
+    });
+
+    const { result, rerender } = renderHook(
+      () => useContinuousRecordsForClassStudents(["s-1"], "session-1"),
+      { wrapper: createWrapper() },
+    );
+
+    await waitFor(() => expect(result.current.isLoading).toBe(false));
+    const firstResult = result.current;
+    const firstMap = result.current.byStudentId;
+
+    // Force a re-render of the parent component WITHOUT changing
+    // inputs. The hook's memoized result should be returned as the
+    // same reference both times.
+    rerender();
+    rerender();
+    rerender();
+
+    expect(result.current).toBe(firstResult);
+    expect(result.current.byStudentId).toBe(firstMap);
+  });
+
   it("flags partial failure via errorCount but renders successes", async () => {
     const { ApiError } = jest.requireMock("../api") as {
       ApiError: new (s: number, m: string) => Error;

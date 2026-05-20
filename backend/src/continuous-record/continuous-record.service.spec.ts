@@ -2,7 +2,6 @@ import {
   BadRequestException,
   ConflictException,
   ForbiddenException,
-  UnprocessableEntityException,
 } from '@nestjs/common';
 import { Test, TestingModule } from '@nestjs/testing';
 import { ChangeKind, EvalPhase, Role, SubjectCode } from '@prisma/client';
@@ -149,44 +148,88 @@ describe('ContinuousRecordService', () => {
   });
 
   // ---------------------------------------------------------------------------
-  // INVARIANT 1 — AFTER_SUPPORT precondition: REGULAR must exist
+  // INVARIANT 1 — AFTER_SUPPORT is permissive (Deviation 001).
+  //
+  // The two tests below originally asserted the AFTER_SUPPORT
+  // precondition rejected the call when no REGULAR ≤ 2 existed.
+  // Per Deviation 001 (see backend/docs/cdc-compliance-deviations.md)
+  // the precondition was removed; AFTER_SUPPORT is now allowed for
+  // any REGULAR rating (or none). The tests were flipped to assert
+  // the new permissive behavior so the test names still document the
+  // contract — they're the canonical "is the deviation still
+  // active?" guard. If a future commit puts the precondition back,
+  // these tests fail loudly.
   // ---------------------------------------------------------------------------
-  describe('AFTER_SUPPORT precondition', () => {
-    it('rejects with 422 when no REGULAR record exists', async () => {
+  describe('AFTER_SUPPORT — permissive after Deviation 001', () => {
+    // Per Deviation 001 — AFTER_SUPPORT no longer has a precondition.
+    // See backend/docs/cdc-compliance-deviations.md
+    it('allows AFTER_SUPPORT even when no REGULAR record exists (Deviation 001)', async () => {
       sessions.assertSessionUnlocked.mockResolvedValue(undefined);
       prisma.learningOutcome.findUnique.mockResolvedValue(SAMPLE_OUTCOME);
       scope.assertContinuousRecordAccess.mockResolvedValue(undefined);
-      // The REGULAR lookup returns null — the precondition fails.
+      // No REGULAR row exists. Pre-deviation this rejected with 422;
+      // now the call should proceed to the transaction and create
+      // an AFTER_SUPPORT row standalone.
       prisma.continuousRecord.findUnique.mockResolvedValue(null);
+      prisma.student.findFirst.mockResolvedValue({
+        schoolId: MOCK_USER.schoolId,
+      });
+      prisma.continuousRecord.create.mockResolvedValue({
+        id: 'rec-after-1',
+        phase: EvalPhase.AFTER_SUPPORT,
+        rating: SAMPLE_INPUT.rating,
+        notes: null,
+      });
+      prisma.continuousRecordHistory.create.mockResolvedValue({});
 
       await expect(
         service.upsertSingle(
           { ...SAMPLE_INPUT, phase: EvalPhase.AFTER_SUPPORT },
           MOCK_USER,
         ),
-      ).rejects.toThrow(UnprocessableEntityException);
+      ).resolves.toBeDefined();
 
-      // No transaction was opened — the precondition fires BEFORE
-      // we ever reach the write path.
-      expect(prisma.__txOpens).toBe(0);
-      expect(prisma.continuousRecord.create).not.toHaveBeenCalled();
-      expect(prisma.continuousRecord.update).not.toHaveBeenCalled();
+      // Critical: the transaction DID open + a write happened.
+      // Before the deviation neither would have, because the
+      // precondition fired before the tx layer.
+      expect(prisma.__txOpens).toBe(1);
+      expect(prisma.continuousRecord.create).toHaveBeenCalledTimes(1);
+      expect(prisma.__lastTxCommitted).toBe(true);
     });
 
-    it('rejects with 422 when the REGULAR rating is 3 (above the ≤2 threshold)', async () => {
+    // Per Deviation 001 — AFTER_SUPPORT no longer has a precondition.
+    // See backend/docs/cdc-compliance-deviations.md
+    it('allows AFTER_SUPPORT when REGULAR rating is above the original ≤2 threshold (Deviation 001)', async () => {
       sessions.assertSessionUnlocked.mockResolvedValue(undefined);
       prisma.learningOutcome.findUnique.mockResolvedValue(SAMPLE_OUTCOME);
       scope.assertContinuousRecordAccess.mockResolvedValue(undefined);
-      // REGULAR exists with rating 3 — the precondition still fails.
-      prisma.continuousRecord.findUnique.mockResolvedValue({ rating: 3 });
+      // REGULAR exists with rating 3 — above the original CDC ≤2
+      // threshold. Pre-deviation this rejected; now it proceeds.
+      // The findUnique mock's first call (if any) is no longer the
+      // precondition check (which was removed); upsertOne's lookup
+      // inside the transaction is what fires now.
+      prisma.continuousRecord.findUnique.mockResolvedValue(null);
+      prisma.student.findFirst.mockResolvedValue({
+        schoolId: MOCK_USER.schoolId,
+      });
+      prisma.continuousRecord.create.mockResolvedValue({
+        id: 'rec-after-2',
+        phase: EvalPhase.AFTER_SUPPORT,
+        rating: SAMPLE_INPUT.rating,
+        notes: null,
+      });
+      prisma.continuousRecordHistory.create.mockResolvedValue({});
 
       await expect(
         service.upsertSingle(
           { ...SAMPLE_INPUT, phase: EvalPhase.AFTER_SUPPORT },
           MOCK_USER,
         ),
-      ).rejects.toThrow(UnprocessableEntityException);
-      expect(prisma.__txOpens).toBe(0);
+      ).resolves.toBeDefined();
+
+      expect(prisma.__txOpens).toBe(1);
+      expect(prisma.continuousRecord.create).toHaveBeenCalledTimes(1);
+      expect(prisma.__lastTxCommitted).toBe(true);
     });
   });
 
@@ -313,7 +356,14 @@ describe('ContinuousRecordService', () => {
       expect(sessions.assertSessionUnlocked).not.toHaveBeenCalled();
     });
 
-    it('rolls back the entire batch when one row fails the AFTER_SUPPORT precondition', async () => {
+    // Per Deviation 001 — AFTER_SUPPORT in a bulk payload no longer
+    // gets the precondition check. The test below originally asserted
+    // that a no-REGULAR + AFTER_SUPPORT row rejected the whole batch
+    // with 422 during pre-validation. Now the bulk accepts the same
+    // payload and writes both rows. Renamed + flipped to assert the
+    // new permissive contract — the test still pins the behavior so
+    // restoring the precondition trips a fail.
+    it('allows AFTER_SUPPORT rows in a bulk payload without a REGULAR predecessor (Deviation 001)', async () => {
       const inputs: CreateContinuousRecordDto[] = [
         { ...SAMPLE_INPUT, studentId: '00000000-0000-0000-0000-0000000000a1' },
         {
@@ -327,17 +377,25 @@ describe('ContinuousRecordService', () => {
       sessions.assertSessionUnlocked.mockResolvedValue(undefined);
       prisma.learningOutcome.findUnique.mockResolvedValue(SAMPLE_OUTCOME);
       scope.assertContinuousRecordAccess.mockResolvedValue(undefined);
-      // The AFTER_SUPPORT precondition for the SECOND input fires
-      // during pre-validation. Note this REGULAR lookup returns null.
+      // No REGULAR row exists for the second student; previously this
+      // would have failed the precondition. Now it's irrelevant.
       prisma.continuousRecord.findUnique.mockResolvedValue(null);
-
-      await expect(service.upsertBulk(inputs, MOCK_USER)).rejects.toThrow(
-        UnprocessableEntityException,
+      prisma.student.findFirst.mockResolvedValue({
+        schoolId: MOCK_USER.schoolId,
+      });
+      prisma.continuousRecord.create.mockImplementation(({ data }: any) =>
+        Promise.resolve({ id: `rec-${data.studentId}`, ...data }),
       );
-      // The transaction never opens because pre-validation throws first.
-      expect(prisma.__txOpens).toBe(0);
-      expect(prisma.continuousRecord.create).not.toHaveBeenCalled();
-      expect(prisma.continuousRecord.update).not.toHaveBeenCalled();
+      prisma.continuousRecordHistory.create.mockResolvedValue({});
+
+      await expect(
+        service.upsertBulk(inputs, MOCK_USER),
+      ).resolves.toHaveLength(2);
+
+      // Both rows committed in a single transaction.
+      expect(prisma.__txOpens).toBe(1);
+      expect(prisma.__lastTxCommitted).toBe(true);
+      expect(prisma.continuousRecord.create).toHaveBeenCalledTimes(2);
     });
   });
 

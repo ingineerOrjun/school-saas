@@ -129,6 +129,13 @@ enum PlatformAuditAction {
   /// promoted/retained/left totals, `after.toSessionId` the new
   /// session's id. Phase ACADEMIC TRANSITION SAFETY Part 6.
   PROMOTION_EXECUTED
+  /// User soft-deleted (Session 6c.1). The row stays in the DB
+  /// (preserves FK history on ContinuousRecord.recordedById,
+  /// PortfolioItem.createdById, etc.) but the user is hidden from
+  /// every "active workflow" query and cannot log in. `after.deletedAt`
+  /// records the deletion timestamp; the actor is the SUPER_ADMIN or
+  /// school ADMIN who performed the action.
+  USER_DEACTIVATED
 }
 
 /// Subscription plan tiers (Phase 4). Real billing integration is
@@ -506,9 +513,23 @@ model User {
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
 
+  /// Session 6c.1 — soft-delete timestamp. Null means the row is
+  /// active; non-null means the user has been deactivated. The
+  /// deletion is reversible at the DB level (set back to null) but
+  /// no "reactivate" endpoint is exposed yet (deferred to v1.5+).
+  ///
+  /// Filtering discipline: every "active workflow" query against
+  /// User (login, list, picker, count) MUST add `deletedAt: null`
+  /// to its where-clause. Historical-resolution queries that
+  /// surface a "Deleted user" fallback (createdBy on past records,
+  /// audit-log actors) MUST NOT filter — they need to find the row
+  /// to render the fallback name.
+  deletedAt DateTime?
+
   @@unique([schoolId, email])
   @@index([schoolId])
   @@index([schoolId, role])
+  @@index([deletedAt])
   @@map("users")
 }
 

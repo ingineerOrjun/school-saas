@@ -11,7 +11,7 @@ import {
 } from "lucide-react";
 import { toast } from "sonner";
 import { ApiError } from "@/lib/api";
-import { teachersApi, useTeachers, type TeacherDto } from "@/lib/teachers";
+import { useTeachers, type TeacherDto } from "@/lib/teachers";
 import { useClasses, type ClassWithSections } from "@/lib/classes";
 import { useSubjects, type SubjectDto } from "@/lib/subjects";
 import { useQueryClient } from "@tanstack/react-query";
@@ -27,15 +27,16 @@ import { AssignmentsDialog } from "@/components/teachers/AssignmentsDialog";
 import { cn } from "@/lib/utils";
 
 const HIGHLIGHT_MS = 1800;
-const ROW_REMOVE_MS = 180;
-const UNDO_WINDOW_MS = 5000;
 
-interface PendingDeletion {
-  teacher: TeacherDto;
-  animTimeoutId: number;
-  apiTimeoutId: number;
-}
-
+// Session 6c.3 — removed the optimistic-undo machinery (PendingDeletion,
+// ROW_REMOVE_MS, UNDO_WINDOW_MS, pendingDeletesRef, scheduleDelete /
+// undoDelete / restoreTeacher). Teacher deletion now routes through
+// the backend's soft-delete pathway, which can REFUSE (409 on active
+// assignments). Optimistic-remove-with-undo isn't honest when the
+// server can say no after the fact — the row would disappear, then
+// reappear with an error toast 5s later. The new flow waits for the
+// dialog's mutation to settle, then refetches; the row leaves the
+// list once the server actually deactivated the user.
 export default function TeachersPage() {
   const router = useRouter();
   const qc = useQueryClient();
@@ -78,12 +79,6 @@ export default function TeachersPage() {
   );
   const [highlightIds, setHighlightIds] = React.useState<Set<string>>(
     () => new Set(),
-  );
-  const [removingIds, setRemovingIds] = React.useState<Set<string>>(
-    () => new Set(),
-  );
-  const pendingDeletesRef = React.useRef<Map<string, PendingDeletion>>(
-    new Map(),
   );
 
   // Phase γ — refresh now invalidates the shared cache. Other
@@ -132,110 +127,6 @@ export default function TeachersPage() {
         return next;
       });
     }, HIGHLIGHT_MS);
-  }, []);
-
-  const restoreTeacher = React.useCallback(
-    (teacher: TeacherDto) => {
-      setList((prev) => {
-        if (!prev) return [teacher];
-        if (prev.some((t) => t.id === teacher.id)) return prev;
-        return [...prev, teacher].sort(
-          (a, b) =>
-            new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime(),
-        );
-      });
-      setRemovingIds((prev) => {
-        if (!prev.has(teacher.id)) return prev;
-        const next = new Set(prev);
-        next.delete(teacher.id);
-        return next;
-      });
-      markAsNew(teacher.id);
-    },
-    [markAsNew],
-  );
-
-  const scheduleDelete = React.useCallback(
-    (teacher: TeacherDto) => {
-      const id = teacher.id;
-
-      setRemovingIds((prev) => {
-        const next = new Set(prev);
-        next.add(id);
-        return next;
-      });
-
-      const animTimeoutId = window.setTimeout(() => {
-        setList((prev) => (prev ? prev.filter((t) => t.id !== id) : prev));
-        setRemovingIds((prev) => {
-          if (!prev.has(id)) return prev;
-          const next = new Set(prev);
-          next.delete(id);
-          return next;
-        });
-      }, ROW_REMOVE_MS);
-
-      const apiTimeoutId = window.setTimeout(() => {
-        pendingDeletesRef.current.delete(id);
-        teachersApi.remove(id).catch((err) => {
-          if (err instanceof ApiError && err.status === 401) {
-            router.replace("/login");
-            return;
-          }
-          restoreTeacher(teacher);
-          const msg =
-            err instanceof ApiError
-              ? err.message
-              : err instanceof Error
-                ? err.message
-                : "Failed to delete teacher.";
-          toast.error(`${teacher.name} restored — ${msg}`);
-        });
-      }, UNDO_WINDOW_MS);
-
-      pendingDeletesRef.current.set(id, {
-        teacher,
-        animTimeoutId,
-        apiTimeoutId,
-      });
-
-      toast(`${teacher.name} deleted`, {
-        description: "Tap undo to bring them back.",
-        duration: UNDO_WINDOW_MS,
-        action: {
-          label: "Undo",
-          onClick: () => undoDelete(id),
-        },
-      });
-    },
-    [router, restoreTeacher],
-  );
-
-  const undoDelete = React.useCallback(
-    (id: string) => {
-      const pending = pendingDeletesRef.current.get(id);
-      if (!pending) return;
-      clearTimeout(pending.animTimeoutId);
-      clearTimeout(pending.apiTimeoutId);
-      pendingDeletesRef.current.delete(id);
-      restoreTeacher(pending.teacher);
-      toast.success(`${pending.teacher.name} restored`);
-    },
-    [restoreTeacher],
-  );
-
-  React.useEffect(() => {
-    const pending = pendingDeletesRef.current;
-    return () => {
-      pending.forEach(({ teacher, animTimeoutId, apiTimeoutId }) => {
-        clearTimeout(animTimeoutId);
-        clearTimeout(apiTimeoutId);
-        teachersApi.remove(teacher.id).catch(() => {
-          /* fire-and-forget on unmount */
-        });
-      });
-      pending.clear();
-    };
   }, []);
 
   const handleCreated = (t: TeacherDto) => {
@@ -322,7 +213,6 @@ export default function TeachersPage() {
             onDelete={setDeleteTarget}
             onManageAssignments={setAssignmentsTarget}
             highlightIds={highlightIds}
-            removingIds={removingIds}
           />
         )}
 
@@ -356,7 +246,14 @@ export default function TeachersPage() {
       <DeleteTeacherDialog
         teacher={deleteTarget}
         onClose={() => setDeleteTarget(null)}
-        onConfirm={scheduleDelete}
+        onSuccess={() => {
+          // Wait-and-refresh: the mutation hook already invalidated
+          // qk.teachers() + qk.users(); calling refresh() invalidates
+          // the cluster the page was opened with (classes + subjects
+          // too) and triggers a fresh fetch. The row leaves the list
+          // when that fetch returns.
+          void refresh();
+        }}
       />
       <AssignmentsDialog
         teacher={assignmentsTarget}

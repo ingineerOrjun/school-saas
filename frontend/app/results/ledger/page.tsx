@@ -26,7 +26,7 @@ import {
   type ClassLedger,
   type ExamDto,
 } from "@/lib/exams";
-import { classesApi, type ClassWithSections } from "@/lib/classes";
+import { useClasses, type ClassWithSections } from "@/lib/classes";
 import { Button } from "@/components/ui/Button";
 import { Skeleton } from "@/components/ui/Skeleton";
 
@@ -54,27 +54,30 @@ export default function LedgerPage() {
   );
 
   const [exams, setExams] = React.useState<ExamDto[]>([]);
-  const [classes, setClasses] = React.useState<ClassWithSections[]>([]);
+  // Classes via the shared React Query hook (10m staleTime). Was a
+  // Promise.all leg in the old useEffect below; splitting the
+  // classes side off into the cached hook removes a /classes dupe
+  // flagged by the request-pressure panel.
+  const classesQuery = useClasses();
+  const classes: ClassWithSections[] = classesQuery.data ?? [];
   const [examId, setExamId] = React.useState(initialExamId);
   const [classId, setClassId] = React.useState(initialClassId);
   const [ledger, setLedger] = React.useState<ClassLedger | null>(null);
-  const [loadingMeta, setLoadingMeta] = React.useState(true);
+  const [loadingExams, setLoadingExams] = React.useState(true);
+  // Combined "metadata still loading" flag — preserves the previous
+  // gate where both exams AND classes had to be present before the
+  // pickers became interactive.
+  const loadingMeta = loadingExams || classesQuery.isLoading;
   const [loading, setLoading] = React.useState(false);
   const [error, setError] = React.useState<string | null>(null);
 
-  // Load exams + classes once.
+  // Load exams once. Classes are now sourced from useClasses() above.
   React.useEffect(() => {
     let cancelled = false;
     (async () => {
       try {
-        const [e, c] = await Promise.all([
-          examsApi.list(),
-          classesApi.list(),
-        ]);
-        if (!cancelled) {
-          setExams(e);
-          setClasses(c);
-        }
+        const e = await examsApi.list();
+        if (!cancelled) setExams(e);
       } catch (err) {
         if (err instanceof ApiError && err.status === 401) {
           router.replace("/login");
@@ -82,19 +85,30 @@ export default function LedgerPage() {
         }
         if (!cancelled) {
           setError(
-            err instanceof ApiError
-              ? err.message
-              : "Failed to load exams and classes.",
+            err instanceof ApiError ? err.message : "Failed to load exams.",
           );
         }
       } finally {
-        if (!cancelled) setLoadingMeta(false);
+        if (!cancelled) setLoadingExams(false);
       }
     })();
     return () => {
       cancelled = true;
     };
   }, [router]);
+
+  // Bridge classesQuery.error into the local error display — the
+  // old Promise.all catch funneled both failures into `setError`;
+  // preserve that surface so a class-load failure still shows up.
+  React.useEffect(() => {
+    if (classesQuery.error) {
+      const msg =
+        classesQuery.error instanceof ApiError
+          ? classesQuery.error.message
+          : "Failed to load classes.";
+      setError((prev) => prev ?? msg);
+    }
+  }, [classesQuery.error]);
 
   // Fetch ledger whenever both selections are set.
   React.useEffect(() => {

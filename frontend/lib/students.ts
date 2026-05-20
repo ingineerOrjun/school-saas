@@ -237,12 +237,60 @@ export const studentsApi = {
 // localStorage is restored.
 // ---------------------------------------------------------------------------
 
-export function useStudents(filter?: ListStudentsFilter) {
+/**
+ * useStudent — single-student fetch, used by the student-detail page
+ * (Section 6c-detail). The `qk.studentDetail(id)` key has been reserved
+ * since the query-keys taxonomy landed but no hook consumed it; this
+ * is the first.
+ *
+ * Cache config matches `useStudents` (1 min stale, no refetch-on-mount)
+ * — student detail data moves with manual edits, not minute-to-minute.
+ * The hook is auth-gated via `useAuthReady` like its sibling so the
+ * detail page doesn't fire during the bootstrap window.
+ */
+export function useStudent(
+  id: string | undefined,
+  options?: { enabled?: boolean },
+) {
+  const { authReady, isAuthenticated } = useAuthReady();
+  return useQuery({
+    queryKey: qk.studentDetail(id ?? ""),
+    queryFn: () => studentsApi.get(id as string),
+    enabled:
+      (options?.enabled ?? true) &&
+      authReady &&
+      isAuthenticated &&
+      Boolean(id),
+    staleTime: STALE.SEMI_STATIC,
+    refetchOnWindowFocus: false,
+    refetchOnMount: false,
+    retry: (failureCount, error) => {
+      if (isNetworkError(error)) return false;
+      const status = (error as { status?: number } | null)?.status;
+      // 404 is meaningful (route shows "not found"); 401/403 short-
+      // circuit; everything else gets one retry.
+      if (status === 401 || status === 403 || status === 404) return false;
+      return failureCount < 1;
+    },
+  });
+}
+
+export function useStudents(
+  filter?: ListStudentsFilter,
+  options?: { enabled?: boolean },
+) {
   const { authReady, isAuthenticated } = useAuthReady();
   return useQuery({
     queryKey: qk.students(filter),
     queryFn: () => studentsApi.list(filter),
-    enabled: authReady && isAuthenticated,
+    // `options.enabled` lets callers gate the fetch on a dependency
+    // they haven't resolved yet (e.g. the rating screen waiting for
+    // its TeachingAssignment to land — without this gate, `useStudents`
+    // fires once with classId=undefined fetching ALL students, then
+    // again with the real classId, producing a dupe in the request-
+    // pressure panel). Defaults true so existing callers (none of
+    // which pass options today) keep the same behavior.
+    enabled: (options?.enabled ?? true) && authReady && isAuthenticated,
     // 1m staleTime — student data moves with enrolment; the heavy
     // /students endpoint shouldn't refetch on every modal mount.
     staleTime: STALE.SEMI_STATIC,

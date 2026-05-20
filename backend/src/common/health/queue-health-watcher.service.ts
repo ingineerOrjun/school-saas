@@ -185,8 +185,11 @@ export class QueueHealthWatcher {
     // Keep the targeting bounded — we don't email here (that's
     // the operator's reactive call), just surface the alert in the
     // bell badge + Operations Center event stream.
+    // Session 6c.1 — exclude soft-deleted SUPER_ADMINs from the
+    // incident broadcast. They can't log in, so the in-app badge
+    // would never be seen anyway; we just save a notification write.
     const supers = await this.prisma.user.findMany({
-      where: { role: 'SUPER_ADMIN' },
+      where: { role: 'SUPER_ADMIN', deletedAt: null },
       select: { id: true, email: true },
       take: 50,
     });

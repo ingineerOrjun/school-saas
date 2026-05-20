@@ -1045,6 +1045,7 @@ function categoryFor(action: PlatformAuditAction): OpsSecurityEvent['category'] 
     case 'EXAM_RESTORED':
     case 'PROMOTION_PREVIEWED':
     case 'PROMOTION_EXECUTED':
+    case 'USER_DEACTIVATED':
       // School-side data-integrity + lifecycle actions — bucketed
       // under ROLE_CHANGE for now since the Operations Center
       // doesn't yet have a dedicated "data integrity" lane. A
@@ -1121,6 +1122,8 @@ function descriptionFor(r: {
       return `${actor} previewed promotion${target ? ` (${target})` : ''}`;
     case 'PROMOTION_EXECUTED':
       return `${actor} executed promotion${target ? ` (${target})` : ''}`;
+    case 'USER_DEACTIVATED':
+      return `${actor} deactivated user ${target}`;
   }
 }
 

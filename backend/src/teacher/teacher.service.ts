@@ -9,7 +9,7 @@ import { Prisma, Role, type User } from '@prisma/client';
 import { assertNotStaleAndUpdate } from '../common/db/optimistic-update';
 import { HashingService } from '../common/hashing/hashing.service';
 import { PrismaService } from '../database/prisma.service';
-import { CreateTeacherDto } from './dto/create-teacher.dto';
+import { UserService, type UserActor } from '../user/user.service';
 import { CreateTeacherWithUserDto } from './dto/create-teacher-with-user.dto';
 import { UpdateTeacherDto } from './dto/update-teacher.dto';
 
@@ -74,6 +74,12 @@ export class TeacherService {
   constructor(
     private readonly prisma: PrismaService,
     private readonly hashing: HashingService,
+    // Session 6c.3 — teacher deletion routes through the User soft-
+    // delete pathway. UserService owns the authorization, active-
+    // assignment refusal, and audit emit; this service is now just a
+    // tenant-scoped lookup wrapper that hands the userId to the
+    // canonical path.
+    private readonly users: UserService,
   ) {}
 
   /**
@@ -237,21 +243,6 @@ export class TeacherService {
     }
   }
 
-  /**
-   * @deprecated Direct teacher creation is no longer permitted. Every
-   * teacher MUST have a linked User account so the teacher can actually
-   * log in and resolve assignments. Use `createWithUser` instead.
-   */
-  // eslint-disable-next-line @typescript-eslint/no-unused-vars
-  async create(
-    _dto: CreateTeacherDto,
-    _schoolId: string,
-  ): Promise<TeacherWithCounts> {
-    throw new BadRequestException(
-      'Teacher must be created with a user account. Use POST /teachers/create-with-user (email + password required).',
-    );
-  }
-
   async findAll(schoolId: string): Promise<TeacherWithCounts[]> {
     const rows = await this.prisma.teacher.findMany({
       where: { schoolId },
@@ -333,10 +324,38 @@ export class TeacherService {
     }
   }
 
-  async remove(id: string, schoolId: string): Promise<void> {
-    // Resolve the Teacher row + its linked userId in a single read so
-    // we can delete via the User (the User → Teacher FK has cascade
-    // delete, so removing the User also removes the Teacher).
+  /**
+   * Session 6c.3 — soft-delete a teacher by routing through the
+   * canonical User soft-delete pathway.
+   *
+   * Behaviour:
+   *   • Tenant scope: this method performs the school-bound Teacher
+   *     lookup so a teacher id from another school surfaces as 404
+   *     (preserving the prior endpoint's "don't leak cross-tenant
+   *     existence" posture).
+   *   • Delegation: with the userId in hand, we hand off to
+   *     `UserService.softDelete` for everything else. That method
+   *     owns:
+   *       - Authorization (SUPER_ADMIN anywhere, ADMIN same-school,
+   *         self-delete refused).
+   *       - Already-deactivated detection (409).
+   *       - Active-TeachingAssignment refusal (409 with count).
+   *       - Stamping `deletedAt` on the User row.
+   *       - Audit emit (`USER_DEACTIVATED`).
+   *   • The Teacher row is NOT touched. The user's profile stays in
+   *     the DB so historical joins (ContinuousRecord → Teacher →
+   *     User) keep resolving; filtering happens at the User layer
+   *     per Session 6c.1's audit.
+   *
+   * Exceptions from softDelete (NotFound / Conflict / Forbidden)
+   * propagate to the controller and reach the client unchanged —
+   * the HTTP status codes + messages are already user-facing copy.
+   */
+  async remove(
+    id: string,
+    schoolId: string,
+    actor: UserActor,
+  ): Promise<void> {
     const teacher = await this.prisma.teacher.findFirst({
       where: { id, schoolId },
       select: { id: true, userId: true },
@@ -345,24 +364,13 @@ export class TeacherService {
       throw new NotFoundException('Teacher not found.');
     }
 
-    // Delete the User instead of the Teacher.
-    //
-    // Why: when the Teacher row was deleted on its own, the User row
-    // stayed (no reverse cascade), leaving a dead login rattling
-    // around in Settings → Users & roles. The user can't actually
-    // log in (the auth hard-guard rejects TEACHER users with no
-    // assignments), but they still cluttered the list.
-    //
-    // Deleting via the User keeps Teacher + login as a cohesive unit
-    // — "delete this teacher" now means the same thing in every
-    // place an admin sees them. Audit FKs that reference this User
-    // (Subject.createdBy, Exam.updatedBy, Result.createdBy/updatedBy)
-    // are SetNull on User delete, so historical authorship just
-    // becomes anonymous rather than the records disappearing.
     this.logger.log(
-      `[remove] Cascading delete of Teacher.id=${teacher.id} via User.id=${teacher.userId}`,
+      `[remove] Soft-deleting User.id=${teacher.userId} (Teacher.id=${teacher.id}) via UserService.softDelete`,
     );
-    await this.prisma.user.delete({ where: { id: teacher.userId } });
+    // Discard the return value — the endpoint still responds 204
+    // NO_CONTENT, matching the pre-refactor contract. Frontend
+    // doesn't read a body from this route.
+    await this.users.softDelete(teacher.userId, actor);
   }
 
   /**
@@ -385,8 +393,14 @@ export class TeacherService {
     userId: string,
     schoolId: string,
   ): Promise<void> {
+    // Session 6c.1 — soft-deleted users can't be linked to a new
+    // Teacher row. Folding the `deletedAt: null` filter into the
+    // tenant guard keeps the deleted-user-is-404 stance uniform
+    // (the operator hitting "create teacher" with a soft-deleted
+    // userId gets the same "doesn't belong to this school" error
+    // as any other unreachable id).
     const user = await this.prisma.user.findFirst({
-      where: { id: userId, schoolId },
+      where: { id: userId, schoolId, deletedAt: null },
       select: { id: true },
     });
     if (!user) {

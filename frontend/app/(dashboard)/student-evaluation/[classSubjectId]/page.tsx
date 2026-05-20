@@ -15,6 +15,10 @@ import {
   subjectNameToCode,
   type SubjectCode,
 } from "@/lib/subject-aliases";
+import {
+  extractClassLevel,
+  isCdcEligibleClassLevel,
+} from "@/lib/class-level";
 import { SyncStatusBar } from "../_components/SyncStatusBar";
 
 // ============================================================================
@@ -53,17 +57,9 @@ export default function ClassSubjectWorkspacePage() {
   );
 }
 
-/** Extract the first integer 1..12 from a Class.name. Returns null
- *  when the name has no parseable level (e.g. "Class XI" Roman
- *  numerals — out of scope for 6a). */
-function extractClassLevel(name: string | null | undefined): number | null {
-  if (!name) return null;
-  const m = name.match(/\b(\d{1,2})\b/);
-  if (!m) return null;
-  const n = Number.parseInt(m[1], 10);
-  if (!Number.isInteger(n) || n < 1 || n > 12) return null;
-  return n;
-}
+// extractClassLevel + isCdcEligibleClassLevel are imported from
+// @/lib/class-level — the single source of truth across the three
+// student-evaluation pages.
 
 function ClassSubjectWorkspaceView() {
   const params = useParams<{ classSubjectId: string }>();
@@ -95,6 +91,37 @@ function ClassSubjectWorkspaceView() {
     { enabled: Boolean(classLevel && subjectCode) },
   );
 
+  // -------------------------------------------------------------------------
+  // RULES OF HOOKS — every hook MUST be declared BEFORE any early return.
+  // -------------------------------------------------------------------------
+  // The same bug fixed in UnitView lived here too: this `useMemo` for
+  // `unitsMap` originally sat below the `if (assignments.isLoading) return …`
+  // early return, so on the loading → loaded transition the function went
+  // from N hooks to N+1 and tripped React's hook-order invariant. Computing
+  // it here (with `outcomes.data ?? []` as the empty-state fallback) means
+  // the memo is called on EVERY render — its result is just an empty Map
+  // until data lands.
+  // -------------------------------------------------------------------------
+  const unitsMap = React.useMemo(() => {
+    const m = new Map<
+      number,
+      { unitNumber: number; unitTitleEn: string | null; count: number }
+    >();
+    for (const o of outcomes.data ?? []) {
+      const existing = m.get(o.unitNumber);
+      if (existing) {
+        existing.count += 1;
+      } else {
+        m.set(o.unitNumber, {
+          unitNumber: o.unitNumber,
+          unitTitleEn: o.unitTitleEn,
+          count: 1,
+        });
+      }
+    }
+    return m;
+  }, [outcomes.data]);
+
   // Loading guard for the assignment lookup itself. The cache is
   // usually warm (home page just rendered it), but on direct deep-
   // link we need to wait.
@@ -111,6 +138,41 @@ function ClassSubjectWorkspaceView() {
   if (!assignment) {
     // Unknown id (assignment for a different teacher, or stale link).
     notFound();
+  }
+
+  // -------------------------------------------------------------------------
+  // CDC class-level eligibility gate (Deviation 002 — classes 1-5 only).
+  //
+  // Must fire BEFORE the `if (!classLevel || !subjectCode)` guard
+  // below so the message is specific ("not eligible — class 6+ uses
+  // traditional grading") rather than generic ("class isn't ready").
+  // The home screen filter catches this case for normal navigation;
+  // this guard catches bookmarks, shared links, and the same teacher
+  // pasting a URL from another tab.
+  //
+  // Hook-safety: this branch sits AFTER every useState/useMemo/
+  // useEffect in the component (the hook block above ends at the
+  // `unitsMap` useMemo). All early returns live in the early-exit
+  // section; React's hook-order invariant is preserved.
+  // -------------------------------------------------------------------------
+  if (classLevel !== null && !isCdcEligibleClassLevel(classLevel)) {
+    return (
+      <div className="mx-auto w-full max-w-2xl">
+        <SyncStatusBar />
+        <BackLink />
+        <EmptyState
+          icon={<AlertCircle className="h-8 w-8" />}
+          title="This class isn't eligible for CDC evaluation"
+          description="Continuous Evaluation only applies to classes 1-5. This class uses traditional grading."
+          action={{
+            label: "Back to assignments",
+            onClick: () => {
+              window.location.href = "/student-evaluation";
+            },
+          }}
+        />
+      </div>
+    );
   }
 
   if (!classLevel || !subjectCode) {
@@ -134,28 +196,9 @@ function ClassSubjectWorkspaceView() {
     );
   }
 
-  // Group outcomes by unitNumber. Outcomes arrive ordered by
-  // unitNumber then sortOrder, so a Map preserves the right traversal
-  // order automatically.
-  const unitsMap = React.useMemo(() => {
-    const m = new Map<
-      number,
-      { unitNumber: number; unitTitleEn: string | null; count: number }
-    >();
-    for (const o of outcomes.data ?? []) {
-      const existing = m.get(o.unitNumber);
-      if (existing) {
-        existing.count += 1;
-      } else {
-        m.set(o.unitNumber, {
-          unitNumber: o.unitNumber,
-          unitTitleEn: o.unitTitleEn,
-          count: 1,
-        });
-      }
-    }
-    return m;
-  }, [outcomes.data]);
+  // (unitsMap is computed above the early returns — see the
+  // "RULES OF HOOKS" block. The Map is empty while data is loading,
+  // populated once outcomes.data lands.)
 
   return (
     <div className="mx-auto w-full max-w-2xl">

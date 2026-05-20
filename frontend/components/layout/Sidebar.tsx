@@ -9,6 +9,7 @@ import {
   GraduationCap,
   BookOpen,
   CalendarCheck,
+  ClipboardCheck,
   ClipboardList,
   FilePlus2,
   Wallet,
@@ -81,6 +82,34 @@ const primary: NavItem[] = [
     href: "/exams/create",
     icon: FilePlus2,
     requiresRole: ["ADMIN", "STAFF"],
+  },
+  // CDC continuous evaluation. Sits directly below the Exams group
+  // because it's conceptually parallel — both are "what did the
+  // student score?" surfaces — but for the primary-grade CDC
+  // curriculum rather than the traditional exam ledger.
+  //
+  // Role gating: deliberately none here. The home page itself
+  // filters assignments by CDC eligibility (subject + class 1-5),
+  // and the route's FeatureGate + the per-page TeacherScope guards
+  // do the actual authorization. Teachers see only their assigned
+  // CDC classes; ADMIN/STAFF see all classes in their school;
+  // SUPER_ADMIN sees the entry regardless via the feature-flag
+  // bypass below.
+  //
+  // Active state: handled by the existing `isActive` matcher which
+  // returns true for any pathname.startsWith("/student-evaluation/"),
+  // so the entry stays highlighted while the teacher is anywhere
+  // inside the units overview / unit view / rating screen.
+  //
+  // Icon: ClipboardCheck — same "clipboard" family as the Exams
+  // group's ClipboardList (so the visual relationship reads as
+  // "another marking surface"), but with the check accent to
+  // distinguish "outcome achievement" from "exam ledger".
+  {
+    label: "Continuous Evaluation",
+    href: "/student-evaluation",
+    icon: ClipboardCheck,
+    requiresFeature: FeatureKey.ConEvaluation,
   },
   // Fees + receipts are financial — admin-only per the role spec.
   { label: "Fees", href: "/fees", icon: Wallet, requiresRole: ["ADMIN"] },

@@ -619,6 +619,11 @@ export default function StudentsPage() {
             // backend rejects for non-admin users). Teachers see a
             // read-only roster.
             canModify={isAdmin}
+            // Session 6c-detail: row click → /students/[id]. Action
+            // buttons + section picker stop propagation in their own
+            // handlers, so clicking edit/archive/restore still routes
+            // to the dialog, not the detail page.
+            onRowClick={(student) => router.push(`/students/${student.id}`)}
             onEdit={setEditTarget}
             onArchive={setArchiveTarget}
             onRestore={setRestoreTarget}

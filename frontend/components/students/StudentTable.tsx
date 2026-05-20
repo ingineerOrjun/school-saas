@@ -17,6 +17,17 @@ import {
 export interface StudentTableProps {
   students: StudentDto[];
   classes: ClassWithSections[];
+  /**
+   * Fired when the user clicks a row OUTSIDE the action / picker cells.
+   * Used by the students page to navigate to /students/[id]. Optional —
+   * older call sites that don't pass it keep the previous "static row"
+   * behavior. When set, the row's name cell becomes a button-styled
+   * region and the rest of the row gains `cursor-pointer`.
+   *
+   * Action buttons + the inline SectionSelect call `stopPropagation`
+   * on their own onClick so they keep working independently.
+   */
+  onRowClick?: (student: StudentDto) => void;
   onEdit: (student: StudentDto) => void;
   /**
    * Phase DATA LIFECYCLE Part 2: replaces `onDelete`. The trash icon
@@ -52,6 +63,7 @@ export interface StudentTableProps {
 export function StudentTable({
   students,
   classes,
+  onRowClick,
   onEdit,
   onArchive,
   onRestore,
@@ -94,16 +106,24 @@ export function StudentTable({
               const isRemoving = removingIds?.has(student.id);
               const isAssigning = assigningIds?.has(student.id);
 
+              const navigable = Boolean(onRowClick) && !isPending && !isRemoving;
               return (
                 <tr
                   key={student.id}
                   className={cn(
                     "group transition-all duration-150",
                     !isPending && !isRemoving && "hover:bg-primary/5",
+                    navigable && "cursor-pointer",
                     isNew && "animate-highlight-row",
                     isPending && "opacity-70",
                     isRemoving && "animate-row-remove pointer-events-none",
                   )}
+                  // Row click navigates via the consumer's callback.
+                  // Action buttons + the inline section picker stop
+                  // propagation in their own handlers so they don't
+                  // trigger this. Pending / removing rows are not
+                  // navigable.
+                  onClick={navigable ? () => onRowClick?.(student) : undefined}
                 >
                   <Td
                     className={cn(
@@ -153,7 +173,18 @@ export function StudentTable({
                     </div>
                   </Td>
                   <Td className="border-t border-border/50">
-                    <div className="min-w-[220px] space-y-2">
+                    {/* The inline picker is interactive — stop propagation
+                        on the entire cell so dropdown clicks don't
+                        trigger the row-level navigation handler.
+                        The label above the picker is informational only,
+                        so wrapping the whole cell is the simpler shape
+                        (no nested click-region gymnastics). */}
+                    <div
+                      className="min-w-[220px] space-y-2"
+                      onClick={(e) => {
+                        if (canModify) e.stopPropagation();
+                      }}
+                    >
                       <span className="inline-flex items-center gap-1.5 rounded-full bg-muted/70 px-2 py-0.5 text-xs font-medium text-muted-foreground">
                         {isAssigning && <Loader2 className="h-3 w-3 animate-spin" />}
                         {formatStudentAssignment(student)}
@@ -304,7 +335,14 @@ function IconButton({
     <button
       type="button"
       aria-label={label}
-      onClick={onClick}
+      // Stop propagation so clicks on the action icons don't bubble
+      // to the row-level onClick (used by the students list to
+      // navigate to /students/[id]). The action's intent is the
+      // edit/archive/restore dialog, NOT navigation.
+      onClick={(e) => {
+        e.stopPropagation();
+        onClick();
+      }}
       className={cn(
         "inline-flex h-8 w-8 items-center justify-center rounded-md text-muted-foreground",
         "transition-all duration-150 hover:-translate-y-px focus-ring",

@@ -213,8 +213,12 @@ export class SchoolSnapshotService {
       // (gets bumped on profile edits + password changes too, so this
       // is an upper-bound estimate). Phase-future: dedicated
       // lastLoginAt column.
+      // Session 6c.1 — exclude soft-deleted users from the
+      // "active users in 30d" rollup. They aren't active; they're
+      // gone. updatedAt was bumped by the deletion itself, which
+      // would otherwise inflate this metric.
       this.prisma.user.count({
-        where: { schoolId, updatedAt: { gte: day30Ago } },
+        where: { schoolId, updatedAt: { gte: day30Ago }, deletedAt: null },
       }),
     ]);
     return {

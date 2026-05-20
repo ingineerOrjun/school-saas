@@ -1,4 +1,7 @@
-import { api } from "./api";
+import { useQuery } from "@tanstack/react-query";
+import { api, isNetworkError } from "./api";
+import { useAuthReady } from "@/hooks/useAuthReady";
+import { qk } from "./query-keys";
 
 export type FeeFrequency = "MONTHLY" | "ONE_TIME";
 /**
@@ -392,4 +395,48 @@ export const feesApi = {
 export function todayISO(): string {
   const d = new Date();
   return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}`;
+}
+
+/**
+ * useStudentFees — per-student fees report for the student-detail
+ * page (Session 6c-detail). Returns the full StudentFeesReport with
+ * dues, payments, and totals.
+ *
+ * Server-side authorization: `/fees/student/:id` is ADMIN-only (the
+ * controller class-level @Roles(Role.ADMIN)). TEACHER + STAFF callers
+ * will hit 403. The page MUST gate the call via `options.enabled =
+ * isAdmin` so the cache key doesn't fill with 403 entries; the
+ * surrounding section renders a "requires admin role" inline note
+ * for non-admin viewers.
+ *
+ * Cache config: 30s staleTime — fees move on every cashier action;
+ * the detail page should reflect recent collections without burning
+ * RPS on every navigation.
+ */
+export function useStudentFees(
+  studentId: string | undefined,
+  options?: { enabled?: boolean },
+) {
+  const { authReady, isAuthenticated } = useAuthReady();
+  return useQuery({
+    queryKey: qk.studentFees(studentId ?? ""),
+    queryFn: () => feesApi.getStudentFees(studentId as string),
+    enabled:
+      (options?.enabled ?? true) &&
+      authReady &&
+      isAuthenticated &&
+      Boolean(studentId),
+    staleTime: 30_000,
+    refetchOnWindowFocus: false,
+    refetchOnMount: false,
+    retry: (failureCount, error) => {
+      if (isNetworkError(error)) return false;
+      const status = (error as { status?: number } | null)?.status;
+      // 403 = role restriction (TEACHER/STAFF caller); the page
+      // renders a graceful "admin role required" message. Don't
+      // retry into that wall.
+      if (status === 401 || status === 403 || status === 404) return false;
+      return failureCount < 1;
+    },
+  });
 }

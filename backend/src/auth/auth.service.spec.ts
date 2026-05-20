@@ -49,6 +49,12 @@ interface UserRow {
   schoolId: string;
   createdAt: Date;
   updatedAt: Date;
+  /**
+   * Session 6c.1 — soft-delete timestamp. Tests default to `null`
+   * (active). The dedicated "soft-deleted user cannot log in" test
+   * flips this to a Date and asserts the same generic 401.
+   */
+  deletedAt: Date | null;
 }
 
 const DEFAULT_SCHOOL: SchoolRow = {
@@ -197,6 +203,7 @@ const makeUser = (overrides: Partial<UserRow> = {}): UserRow => ({
   schoolId: 's-1',
   createdAt: new Date(),
   updatedAt: new Date(),
+  deletedAt: null,
   ...overrides,
 });
 
@@ -259,6 +266,44 @@ describe('AuthService.login', () => {
       ).rejects.toBeInstanceOf(UnauthorizedException);
       expect(h.loginFailures).toHaveLength(1);
       expect(h.loginFailures[0].reason).toBe('invalid_credentials');
+    });
+
+    it('Session 6c.1: soft-deleted user with the CORRECT password still gets a generic 401', async () => {
+      // Locks in the timing-safe behaviour: the deletedAt check runs
+      // AFTER the password compare so the wall-clock cost matches a
+      // wrong-password attempt. The error message + recorded reason
+      // must match the other invalid-credentials paths so an
+      // attacker can't enumerate which emails are "deactivated".
+      const h = buildHarness();
+      h.users.set(
+        'u-1',
+        makeUser({
+          deletedAt: new Date('2026-05-01T12:00:00Z'),
+        }),
+      );
+      const collect = async (): Promise<string> => {
+        try {
+          await h.service.login(
+            {
+              schoolCode: 'SCH-0001',
+              email: 'alice@example.edu',
+              password: 'correct-pw',
+            },
+            '10.0.0.9',
+          );
+          return '';
+        } catch (e) {
+          return (e as Error).message;
+        }
+      };
+      const softDeletedMsg = await collect();
+      expect(softDeletedMsg).toBe('Invalid credentials.');
+      expect(h.loginFailures).toHaveLength(1);
+      expect(h.loginFailures[0]).toMatchObject({
+        email: 'alice@example.edu',
+        ip: '10.0.0.9',
+        reason: 'invalid_credentials',
+      });
     });
 
     it('uses the SAME error message for unknown school, unknown email, and wrong password', async () => {

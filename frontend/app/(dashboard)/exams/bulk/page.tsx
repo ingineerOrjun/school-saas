@@ -14,14 +14,14 @@ import {
 import { toast } from "sonner";
 import { ApiError } from "@/lib/api";
 import { getStoredUser } from "@/lib/auth";
-import { classesApi, type ClassWithSections } from "@/lib/classes";
+import { useClasses, type ClassWithSections } from "@/lib/classes";
 import {
   examsApi,
   resultsApi,
   type ExamDto,
   type ExamSubjectDto,
 } from "@/lib/exams";
-import { studentsApi, type StudentDto } from "@/lib/students";
+import { useStudents, type StudentDto } from "@/lib/students";
 import {
   useMyTeachingAssignments,
   type TeachingAssignmentDto,
@@ -61,7 +61,11 @@ export default function BulkMarksPage() {
 
   // ----- Reference data -----
   const [exams, setExams] = React.useState<ExamDto[]>([]);
-  const [classes, setClasses] = React.useState<ClassWithSections[]>([]);
+  // Classes via the shared React Query hook (10m staleTime). Was a
+  // Promise.all leg in the old useEffect below; splitting it off
+  // closes the /classes dupe flagged by the request-pressure panel.
+  const classesQuery = useClasses();
+  const classes: ClassWithSections[] = classesQuery.data ?? [];
   // null when the caller is ADMIN — no filter applied. Empty array means
   // "TEACHER with zero assignments". A populated array narrows the
   // class + subject dropdowns. Backed by the shared React Query cache
@@ -90,6 +94,11 @@ export default function BulkMarksPage() {
     // hook settles.
     return rawAssignments ?? [];
   }, [isTeacher, rawAssignments, assignmentsError]);
+  // `loading` here originally tracked the Promise.all of exams +
+  // classes. Now it only tracks the exams fetch; the classes side
+  // is reflected via `classesQuery.isLoading` in the combined
+  // `refLoading` flag downstream (see the existing reference-not-
+  // -ready-yet gate around line 370).
   const [loading, setLoading] = React.useState(true);
   const [refError, setRefError] = React.useState<string | null>(null);
 
@@ -100,26 +109,32 @@ export default function BulkMarksPage() {
   const [examSubjectId, setExamSubjectId] = React.useState("");
 
   // ----- Roster + marks state -----
-  const [students, setStudents] = React.useState<StudentDto[] | null>(null);
-  const [loadingStudents, setLoadingStudents] = React.useState(false);
+  // Students now flow through the shared React Query hook. The
+  // `enabled` gate preserves the previous early-return semantics
+  // (the imperative effect skipped its fetch until all four pickers
+  // were settled) — without it, the first render would fire the
+  // hook with classId="" and we'd see the same dupe in request-
+  // pressure that the rating screen had before Session 6a.
+  const allFourReady = !!classId && sectionId !== "" && !!examSubjectId;
+  const studentsQuery = useStudents(
+    { classId },
+    { enabled: allFourReady },
+  );
   const [marks, setMarks] = React.useState<MarksMap>({});
   const [saving, setSaving] = React.useState(false);
 
-  // ----- Initial load: exams + classes (assignments come from the
-  // hook above, so they're not part of the Promise.all anymore) -----
+  // ----- Initial load: exams only. Classes come from useClasses()
+  // (10m cache) above; assignments come from the
+  // useMyTeachingAssignments hook above. -----
   React.useEffect(() => {
     let cancelled = false;
     (async () => {
       setLoading(true);
       setRefError(null);
       try {
-        const [examList, classList] = await Promise.all([
-          examsApi.list(),
-          classesApi.list(),
-        ]);
+        const examList = await examsApi.list();
         if (cancelled) return;
         setExams(examList);
-        setClasses(classList);
       } catch (err) {
         if (cancelled) return;
         if (err instanceof ApiError && err.status === 401) {
@@ -142,19 +157,38 @@ export default function BulkMarksPage() {
     };
   }, [router]);
 
+  // Bridge classesQuery.error into refError — the previous Promise.all
+  // catch funneled BOTH leg failures into refError; preserve that
+  // single-error-banner surface so a classes-load failure still
+  // shows up here.
+  React.useEffect(() => {
+    if (classesQuery.error) {
+      setRefError((prev) =>
+        prev ??
+        (classesQuery.error instanceof ApiError
+          ? classesQuery.error.message
+          : classesQuery.error instanceof Error
+            ? classesQuery.error.message
+            : "Failed to load classes."),
+      );
+    }
+  }, [classesQuery.error]);
+
   // ----- Cascade resets -----
   // When any "upstream" picker changes, downstream pickers + state
   // reset so we never end up with a stale combination (e.g., section
-  // from the previous class still picked).
+  // from the previous class still picked). The roster derives from
+  // `studentsQuery` below — once the cascade clears sectionId /
+  // examSubjectId, `allFourReady` flips false, the hook is disabled,
+  // and the derived `students` returns to null without any imperative
+  // reset.
   React.useEffect(() => {
     setSectionId("");
     setExamSubjectId("");
-    setStudents(null);
     setMarks({});
   }, [classId]);
   React.useEffect(() => {
     setExamSubjectId("");
-    setStudents(null);
     setMarks({});
   }, [sectionId, examId]);
 
@@ -238,59 +272,62 @@ export default function BulkMarksPage() {
     [visibleExamSubjects, examSubjectId],
   );
 
-  // ----- Roster fetch -----
-  // Triggered once exam + class + section are settled AND a subject is
-  // picked. Re-fetches whenever (classId, sectionId) changes via the
-  // cascade above (which clears students).
+  // ----- Roster derivation -----
+  // The backend `?classId=` query lives in the hook above; section
+  // narrowing stays client-side (matches the bulk-save endpoint's
+  // expected scope: sectionId set → that section; sectionId null →
+  // classId=X AND sectionId IS NULL). The render path distinguishes
+  // null (not ready / first load) from [] (loaded empty / errored).
+  const loadingStudents = allFourReady && studentsQuery.isLoading;
+  const students: StudentDto[] | null = React.useMemo(() => {
+    if (!allFourReady) return null;
+    // On a real load failure the original code toasted and rendered
+    // the "no students" empty state — mirror that here.
+    if (studentsQuery.error) return [];
+    if (!studentsQuery.data) return null;
+
+    const inScope = studentsQuery.data.filter((s) =>
+      effectiveSectionId === null
+        ? s.sectionId === null && s.classId === classId
+        : s.sectionId === effectiveSectionId,
+    );
+    // Stable order — symbolNumber asc when present, else name.
+    inScope.sort((a, b) => {
+      if (a.symbolNumber && b.symbolNumber)
+        return a.symbolNumber.localeCompare(b.symbolNumber);
+      if (a.symbolNumber) return -1;
+      if (b.symbolNumber) return 1;
+      const an = `${a.firstName} ${a.lastName}`;
+      const bn = `${b.firstName} ${b.lastName}`;
+      return an.localeCompare(bn);
+    });
+    return inScope;
+  }, [
+    allFourReady,
+    studentsQuery.data,
+    studentsQuery.error,
+    classId,
+    effectiveSectionId,
+  ]);
+
+  // Bridge studentsQuery.error into the same UX the imperative
+  // try/catch produced: 401 → /login, anything else → toast. Runs
+  // once per error transition (deps include the error reference).
   React.useEffect(() => {
-    if (!classId || sectionId === "" || !examSubjectId) {
-      setStudents(null);
+    if (!studentsQuery.error) return;
+    if (
+      studentsQuery.error instanceof ApiError &&
+      studentsQuery.error.status === 401
+    ) {
+      router.replace("/login");
       return;
     }
-    let cancelled = false;
-    (async () => {
-      setLoadingStudents(true);
-      try {
-        // Backend supports `?classId=` filter. We further narrow by
-        // section client-side (matches the bulk-save endpoint's
-        // expected scope: sectionId set → that section; sectionId
-        // null → classId=X AND sectionId IS NULL).
-        const list = await studentsApi.list({ classId });
-        if (cancelled) return;
-        const inScope = list.filter((s) =>
-          effectiveSectionId === null
-            ? s.sectionId === null && s.classId === classId
-            : s.sectionId === effectiveSectionId,
-        );
-        // Stable order — symbolNumber asc when present, else name.
-        inScope.sort((a, b) => {
-          if (a.symbolNumber && b.symbolNumber)
-            return a.symbolNumber.localeCompare(b.symbolNumber);
-          if (a.symbolNumber) return -1;
-          if (b.symbolNumber) return 1;
-          const an = `${a.firstName} ${a.lastName}`;
-          const bn = `${b.firstName} ${b.lastName}`;
-          return an.localeCompare(bn);
-        });
-        setStudents(inScope);
-      } catch (err) {
-        if (cancelled) return;
-        if (err instanceof ApiError && err.status === 401) {
-          router.replace("/login");
-          return;
-        }
-        toast.error(
-          err instanceof ApiError ? err.message : "Failed to load students.",
-        );
-        setStudents([]);
-      } finally {
-        if (!cancelled) setLoadingStudents(false);
-      }
-    })();
-    return () => {
-      cancelled = true;
-    };
-  }, [classId, sectionId, examSubjectId, effectiveSectionId, router]);
+    toast.error(
+      studentsQuery.error instanceof ApiError
+        ? studentsQuery.error.message
+        : "Failed to load students.",
+    );
+  }, [studentsQuery.error, router]);
 
   // ----- Save -----
   const handleSaveAll = async () => {
@@ -369,7 +406,8 @@ export default function BulkMarksPage() {
   // the React Query hook. Gate the pickers on BOTH so a teacher
   // never momentarily sees the unfiltered admin catalog while the
   // assignments cache is hydrating.
-  const referenceLoading = loading || (isTeacher && assignmentsLoading);
+  const referenceLoading =
+    loading || classesQuery.isLoading || (isTeacher && assignmentsLoading);
   const allSelected =
     !!examId && !!classId && sectionId !== "" && !!examSubjectId;
 

@@ -7,8 +7,6 @@ import { AlertCircle, ArrowLeft } from "lucide-react";
 import { toast } from "sonner";
 import { FeatureGate } from "@/components/platform/FeatureGate";
 import { FeatureKey } from "@/lib/features";
-import { Modal } from "@/components/ui/Modal";
-import { Button } from "@/components/ui/Button";
 import { Skeleton } from "@/components/ui/Skeleton";
 import { EmptyState } from "@/components/ui/EmptyState";
 import { useAcademicSession } from "@/components/academic-session/AcademicSessionProvider";
@@ -19,6 +17,7 @@ import {
 } from "@/lib/learning-outcomes";
 import {
   useContinuousRecordsForClassStudents,
+  useUpsertContinuousRecord,
   type ContinuousRecordDto,
 } from "@/lib/continuous-records";
 import { useStudents } from "@/lib/students";
@@ -27,7 +26,18 @@ import {
   subjectNameToCode,
   type SubjectCode,
 } from "@/lib/subject-aliases";
-import { cn } from "@/lib/utils";
+import {
+  extractClassLevel,
+  isCdcEligibleClassLevel,
+} from "@/lib/class-level";
+import {
+  applyRatingToCells,
+  applySeedToCells,
+  EMPTY_CELL,
+  type CellState,
+  type RatingPhase,
+} from "../../../../../_lib/rating-cell";
+import { StudentRatingRow } from "../../../../../_components/StudentRatingRow";
 
 // ============================================================================
 // /student-evaluation/.../outcomes/[outcomeId] — OUTCOME RATING SCREEN (6a).
@@ -59,25 +69,17 @@ import { cn } from "@/lib/utils";
 //     data: rating ≤ 2 + no AFTER_SUPPORT → amber dot.
 // ============================================================================
 
-const RATING_VALUES: ReadonlyArray<1 | 2 | 3 | 4> = [1, 2, 3, 4];
+// (The RATING_VALUES constant was used by the in-page
+// AfterSupportModal, removed in Deviation 001. The row component
+// owns its own copy.)
 
-interface CellState {
-  /** REGULAR rating — null until the teacher taps something. */
-  rating: 1 | 2 | 3 | 4 | null;
-  /** AFTER_SUPPORT rating — read-only display in 6a. */
-  afterSupportRating: 1 | 2 | 3 | 4 | null;
-  /** Pulse trigger key — bumped on every tap so CSS re-runs. */
-  pulseKey: number;
-}
+// CellState + EMPTY_CELL + applyRatingToCells live in
+// ../../../../_lib/rating-cell so the pure update logic can be
+// unit-tested without dragging in the page's React Query / session-
+// provider tree. See that file's header for the rationale.
 
-function extractClassLevel(name: string | null | undefined): number | null {
-  if (!name) return null;
-  const m = name.match(/\b(\d{1,2})\b/);
-  if (!m) return null;
-  const n = Number.parseInt(m[1], 10);
-  if (!Number.isInteger(n) || n < 1 || n > 12) return null;
-  return n;
-}
+// extractClassLevel is imported from @/lib/class-level — see that
+// file's header for the parser's fragility notes.
 
 export default function OutcomeRatingPage() {
   return (
@@ -135,9 +137,16 @@ function OutcomeRatingView() {
   // group. Section filter would normally be a server-side `?sectionId=`
   // but the existing students endpoint doesn't take it; client filter
   // is cheap (one class is <100 rows).
-  const studentsQuery = useStudents({
-    classId: assignment?.classId,
-  });
+  // Gate the fetch on assignment.classId being resolved. Without
+  // this, the first render fires `useStudents({ classId: undefined })`
+  // which hits `/students` with no filter (fetching the entire
+  // school roster), then a second render fires with the real
+  // classId — request-pressure panel flagged this as a dupe.
+  // `enabled: false` skips the call until we have a real id.
+  const studentsQuery = useStudents(
+    { classId: assignment?.classId },
+    { enabled: Boolean(assignment?.classId) },
+  );
   const students: StudentDto[] = React.useMemo(() => {
     const list = studentsQuery.data ?? [];
     if (!assignment) return list;
@@ -167,41 +176,52 @@ function OutcomeRatingView() {
   const [cells, setCells] = React.useState<Record<string, CellState>>({});
   const seededFor = React.useRef<Set<string>>(new Set());
 
-  // After-support modal target — which student's amber dot was tapped.
-  const [afterSupportStudentId, setAfterSupportStudentId] = React.useState<
-    string | null
-  >(null);
+  // (Deviation 001: the after-support modal flow was removed. The
+  // row's AFTER_SUPPORT button group is now always inline. The
+  // `afterSupportStudentId` modal-target state used to live here.)
 
+  // Seed local cells from the records fan-out whenever new student
+  // data lands. Logic lives in `applySeedToCells` (../_lib/rating-cell)
+  // so it can be unit-tested without standing up this whole page.
+  //
+  // Two invariants the helper preserves that the old inline effect
+  // did not — both fixes for the Session 6a infinite-loop bug:
+  //
+  //   1. Returns `next === prev` (same reference) when there's
+  //      nothing new to seed. React's Object.is bail then skips the
+  //      re-render, even if `records.byStudentId` wobbled identity
+  //      (which the upstream hook now also memos away — defense in
+  //      depth at both layers).
+  //   2. Skips students whose records haven't loaded yet. Previously
+  //      we pre-seeded them with empty cells AND marked them in
+  //      `seededFor`, which locked their real data out once it
+  //      arrived. Now those students simply stay unseeded until
+  //      their data lands.
+  //
+  // The ref mutation (`seededFor.current.add`) is done OUTSIDE the
+  // setCells callback because React StrictMode double-invokes that
+  // callback in dev to check purity; a Set.add inside it would run
+  // twice and look wrong. Computing the plan before calling setState
+  // keeps the callback pure.
   React.useEffect(() => {
     if (!outcome) return;
-    setCells((prev) => {
-      const next: Record<string, CellState> = { ...prev };
-      for (const s of students) {
-        if (seededFor.current.has(s.id)) continue;
-        const studentRecs = records.byStudentId.get(s.id) ?? [];
-        const regular = studentRecs.find(
-          (r) => r.phase === "REGULAR" && r.outcomeId === outcome.id,
-        );
-        const after = studentRecs.find(
-          (r) => r.phase === "AFTER_SUPPORT" && r.outcomeId === outcome.id,
-        );
-        next[s.id] = {
-          rating: (regular?.rating ?? null) as CellState["rating"],
-          afterSupportRating:
-            (after?.rating ?? null) as CellState["afterSupportRating"],
-          pulseKey: 0,
-        };
-        seededFor.current.add(s.id);
-      }
-      return next;
-    });
-  }, [outcome, students, records.byStudentId]);
+    const { next, newlySeeded } = applySeedToCells(
+      cells,
+      students,
+      records.byStudentId,
+      outcome.id,
+      seededFor.current,
+    );
+    if (next === cells) return; // nothing to seed; effect runs are free
+    for (const id of newlySeeded) seededFor.current.add(id);
+    setCells(next);
+  }, [outcome, students, records.byStudentId, cells]);
 
-  // Last-saved memo so the Undo toast can roll back the local tap.
-  const lastChangeRef = React.useRef<{
-    studentId: string;
-    prev: CellState;
-  } | null>(null);
+  // Session 6b: Undo no longer needs a ref — `previousRating` is
+  // captured in the `applyRating` closure and re-applied through the
+  // same code path (matching the spec's decision 3: "Undo snackbar
+  // fires an immediate POST with the previous value"). The old
+  // lastChangeRef cache was removed.
 
   // First-name disambiguation — collision-aware. Carried from
   // Session 5, behavior unchanged.
@@ -236,31 +256,111 @@ function OutcomeRatingView() {
     return out;
   }, [students]);
 
-  function applyRating(student: StudentDto, value: 1 | 2 | 3 | 4) {
-    // Wireframe behavior — Session 6a does NOT persist. Pure local
-    // state, matching Session 5's behavior. Refresh reverts.
-    const prev = cells[student.id];
-    setCells((c) => ({
-      ...c,
-      [student.id]: {
-        ...c[student.id],
+  const upsertMutation = useUpsertContinuousRecord();
+
+  // Phase-parameterized rating handler. Both the REGULAR row buttons
+  // and the AFTER_SUPPORT row buttons route through this — the only
+  // difference is which pair of cell fields (`regular`+`regularSyncStatus`
+  // vs `afterSupport`+`afterSupportSyncStatus`) gets updated, and
+  // which phase is sent on the wire. Collapsing the two old
+  // applyRating / applyAfterSupportRating functions into one keeps
+  // the optimistic UI + rollback + toast logic in one place — the
+  // post-Deviation-001 contract.
+  function applyRating(
+    student: StudentDto,
+    phase: RatingPhase,
+    value: 1 | 2 | 3 | 4,
+  ) {
+    // Belt-and-braces guard against the race the original bug
+    // exposed: the row's button shouldn't be tappable when its
+    // continuous-records query is still in flight (we disable it in
+    // StudentRatingRow). If a synthetic click sneaks through —
+    // keyboard, programmatic dispatch — bail before kicking off a
+    // POST against an unseeded cell.
+    if (records.isLoading && !records.byStudentId.has(student.id)) {
+      return;
+    }
+    if (!outcome || !activeSession || !subjectCode) return; // type narrowing
+
+    // Previous value for THIS phase, captured for the Undo flow.
+    // Each phase has its own previous — undoing a REGULAR tap
+    // restores the previous REGULAR; undoing an AFTER_SUPPORT tap
+    // restores the previous AFTER_SUPPORT.
+    const prev = cells[student.id] ?? EMPTY_CELL;
+    const previousValue = phase === "REGULAR" ? prev.regular : prev.afterSupport;
+
+    // OPTIMISTIC UI: apply the new value with syncStatus 'pending'
+    // immediately. The button fills, the pulse animation runs, the
+    // per-phase clock icon appears — all before the network round-
+    // trip resolves. "WhatsApp delivery semantics" — every tap feels
+    // landed even when the server hasn't confirmed yet.
+    setCells((c) =>
+      applyRatingToCells(c, student.id, phase, value, "pending"),
+    );
+
+    upsertMutation.mutate(
+      {
+        studentId: student.id,
+        outcomeId: outcome.id,
+        sessionId: activeSession.id,
+        phase,
         rating: value,
-        pulseKey: c[student.id].pulseKey + 1,
+        subjectCode,
       },
-    }));
-    lastChangeRef.current = { studentId: student.id, prev };
-    toast("Saved", {
-      duration: 2000,
-      description: "(not persisted yet — Session 6b wires the POST)",
-      action: {
-        label: "Undo",
-        onClick: () => {
-          const last = lastChangeRef.current;
-          if (!last) return;
-          setCells((c) => ({ ...c, [last.studentId]: last.prev }));
+      {
+        onSuccess: () => {
+          // Server confirmed. Transition the cell to 'synced' — the
+          // clock icon disappears (back to "silence is success").
+          setCells((c) =>
+            applyRatingToCells(c, student.id, phase, value, "synced"),
+          );
+          toast(phase === "REGULAR" ? "Saved" : "After-support saved", {
+            duration: 2000,
+            action: {
+              label: "Undo",
+              onClick: () => {
+                if (previousValue === null) {
+                  // No previous value for THIS phase to restore —
+                  // backend has no DELETE endpoint yet (Session 6c+
+                  // may add it). Surface this honestly rather than
+                  // pretending to undo.
+                  toast(
+                    "Cannot undo to unrated — delete endpoint not available yet.",
+                  );
+                  return;
+                }
+                // Undo treats the previous value as a new tap on the
+                // SAME phase. Re-fires the same code path so pending/
+                // synced indicators + history-row parity come along
+                // for free.
+                applyRating(student, phase, previousValue);
+              },
+            },
+          });
+        },
+        onError: (error) => {
+          // WhatsApp-style failure preservation: KEEP the attempted
+          // value visible with the matching phase's sync status set
+          // to 'failed' rather than rolling back. The teacher sees
+          // "you tried to set 4, it didn't land — tap the red icon
+          // to retry." Per-phase failure is independent: a failed
+          // AFTER_SUPPORT POST doesn't disturb a confirmed REGULAR
+          // value on the same row.
+          setCells((c) =>
+            applyRatingToCells(c, student.id, phase, value, "failed"),
+          );
+          // Backend's `message` is operator-friendly when present
+          // (e.g. "This session is locked. Writes are no longer
+          // permitted.") — surface it verbatim.
+          const fallback =
+            phase === "REGULAR"
+              ? "Couldn't save the rating."
+              : "Couldn't save after-support rating.";
+          const message = error.message?.trim() || fallback;
+          toast.error(message, { duration: 5000 });
         },
       },
-    });
+    );
   }
 
   // ----- Early-exit branches -----
@@ -276,6 +376,41 @@ function OutcomeRatingView() {
   if (!assignment || Number.isNaN(unitNumber)) {
     notFound();
   }
+
+  // -------------------------------------------------------------------------
+  // CDC class-level eligibility gate (Deviation 002 — classes 1-5 only).
+  // Same defense-in-depth pattern as the units overview screen:
+  // catch class 6+ assignments before the existing missing-data
+  // guard so the message is specific. Bookmarks and shared URLs are
+  // the dominant entry path here; without this gate a teacher
+  // pasting a /student-evaluation/.../outcomes/... URL for class 7
+  // would see the generic "outcome not found" copy instead of the
+  // accurate "not eligible" copy.
+  //
+  // Hook-safety: all hooks in OutcomeRatingView are above the
+  // assignments.isLoading / outcomes.isLoading early returns at
+  // line ~367. This branch lives in the same early-exit block; no
+  // hooks below it.
+  // -------------------------------------------------------------------------
+  if (classLevel !== null && !isCdcEligibleClassLevel(classLevel)) {
+    return (
+      <div className="mx-auto w-full max-w-2xl">
+        <BackLink assignmentId={assignment.id} unitNumber={unitNumber} />
+        <EmptyState
+          icon={<AlertCircle className="h-8 w-8" />}
+          title="This class isn't eligible for CDC evaluation"
+          description="Continuous Evaluation only applies to classes 1-5. This class uses traditional grading."
+          action={{
+            label: "Back to assignments",
+            onClick: () => {
+              window.location.href = "/student-evaluation";
+            },
+          }}
+        />
+      </div>
+    );
+  }
+
   if (!classLevel || !subjectCode || !outcome) {
     return (
       <div className="mx-auto w-full max-w-2xl">
@@ -300,8 +435,9 @@ function OutcomeRatingView() {
       <BackLink assignmentId={assignment.id} unitNumber={unitNumber} />
 
       {/* Sticky outcome header — teacher always sees what they're
-          rating. Same shape as Session 5; copy now comes from the
-          real LearningOutcome row. */}
+          rating. Added a one-line explainer under the outcome text
+          for Deviation 001 so the two-column layout's intent is
+          self-documenting on the screen, not just in the code. */}
       <div className="sticky top-0 z-20 -mx-4 mb-3 border-b border-border bg-surface/95 px-4 py-3 backdrop-blur supports-[backdrop-filter]:bg-surface/80 sm:-mx-6 sm:px-6">
         <p className="text-xs font-semibold uppercase tracking-wider text-primary">
           Outcome · {skillLabel(outcome.skillArea)}
@@ -309,6 +445,12 @@ function OutcomeRatingView() {
         <h1 className="mt-1 text-base font-medium text-foreground leading-snug">
           “{outcome.descriptionEn}”
         </h1>
+        <p className="mt-2 text-xs text-muted-foreground leading-snug">
+          Tap <span className="font-semibold">Regular</span> for the
+          initial assessment. Tap{" "}
+          <span className="font-semibold">After support</span> to
+          record reassessment (defaults to Regular's value).
+        </p>
       </div>
 
       {!activeSession ? (
@@ -339,28 +481,32 @@ function OutcomeRatingView() {
               key={s.id}
               student={s}
               displayName={displayName[s.id] ?? s.firstName}
-              cell={cells[s.id] ?? { rating: null, afterSupportRating: null, pulseKey: 0 }}
+              cell={cells[s.id] ?? EMPTY_CELL}
               loadingRating={
                 records.isLoading && !records.byStudentId.has(s.id)
               }
-              onRate={(value) => applyRating(s, value)}
-              onAfterSupportClick={() => setAfterSupportStudentId(s.id)}
+              onRate={(phase, value) => applyRating(s, phase, value)}
+              onRetry={(phase) => {
+                // Failed-icon retry — re-fires applyRating with the
+                // currently-displayed value for THIS phase. Same code
+                // path as a fresh tap, including a new optimistic-
+                // pending → synced/failed transition. Per Deviation
+                // 001's per-phase failure independence: REGULAR's
+                // retry button reads cell.regular, AFTER_SUPPORT's
+                // retry button reads cell.afterSupport.
+                const cell = cells[s.id];
+                if (!cell) return;
+                const v =
+                  phase === "REGULAR" ? cell.regular : cell.afterSupport;
+                if (v !== null) applyRating(s, phase, v);
+              }}
             />
           ))}
         </ul>
       )}
 
-      <AfterSupportModalConditional
-        students={students}
-        outcomeText={outcome.descriptionEn ?? ""}
-        afterSupportStudentId={afterSupportStudentId}
-        currentAfterSupport={
-          afterSupportStudentId
-            ? cells[afterSupportStudentId]?.afterSupportRating ?? null
-            : null
-        }
-        onClose={() => setAfterSupportStudentId(null)}
-      />
+      {/* AfterSupportModal removed in Deviation 001 — both phase
+          inputs live inline on the row now. */}
 
       <style jsx>{`
         :global(.cdc-pulse) {
@@ -377,219 +523,10 @@ function OutcomeRatingView() {
 
 }
 
-interface AfterSupportModalConditionalProps {
-  students: StudentDto[];
-  outcomeText: string;
-  afterSupportStudentId: string | null;
-  currentAfterSupport: 1 | 2 | 3 | 4 | null;
-  onClose: () => void;
-}
-
-function AfterSupportModalConditional({
-  students,
-  outcomeText,
-  afterSupportStudentId,
-  currentAfterSupport,
-  onClose,
-}: AfterSupportModalConditionalProps) {
-  const student = afterSupportStudentId
-    ? students.find((s) => s.id === afterSupportStudentId) ?? null
-    : null;
-  return (
-    <AfterSupportModal
-      student={student}
-      outcomeText={outcomeText}
-      currentAfterSupport={currentAfterSupport}
-      onClose={onClose}
-    />
-  );
-}
-
-interface StudentRatingRowProps {
-  student: StudentDto;
-  displayName: string;
-  cell: CellState;
-  loadingRating: boolean;
-  onRate: (value: 1 | 2 | 3 | 4) => void;
-  onAfterSupportClick: () => void;
-}
-
-function StudentRatingRow({
-  student,
-  displayName,
-  cell,
-  loadingRating,
-  onRate,
-  onAfterSupportClick,
-}: StudentRatingRowProps) {
-  const needsFollowUp =
-    cell.rating !== null && cell.rating <= 2 && cell.afterSupportRating === null;
-  const followUpComplete =
-    cell.rating !== null && cell.rating <= 2 && cell.afterSupportRating !== null;
-
-  return (
-    <li className="flex items-center gap-2 border-b border-border/60 py-3 first:border-t">
-      <div className="w-10 shrink-0 text-right tabular-nums text-sm text-muted-foreground">
-        {student.symbolNumber ?? "—"}.
-      </div>
-      <div className="flex-1 min-w-0 text-sm font-medium text-foreground leading-snug break-words">
-        {displayName}
-        {/* While the per-student records query is still loading for
-            THIS row, surface a small spinner-dot so the teacher
-            knows ratings haven't arrived yet — distinct from "this
-            student is genuinely unrated". */}
-        {loadingRating && (
-          <span className="ml-2 inline-block h-2 w-2 animate-pulse rounded-full bg-muted-foreground/40" />
-        )}
-      </div>
-      <div className="flex shrink-0 items-center gap-1">
-        {RATING_VALUES.map((v) => {
-          const selected = cell.rating === v;
-          return (
-            <button
-              key={v}
-              type="button"
-              onClick={() => onRate(v)}
-              aria-label={`Rate ${v}`}
-              aria-pressed={selected}
-              className={cn(
-                "h-11 w-11 rounded-md text-sm font-semibold",
-                "flex items-center justify-center",
-                "transition-colors duration-100",
-                "focus:outline-none focus-visible:ring-2 focus-visible:ring-primary focus-visible:ring-offset-1 focus-visible:ring-offset-background",
-                selected
-                  ? "bg-primary text-primary-foreground shadow-sm"
-                  : "bg-muted text-foreground hover:bg-muted/80",
-                selected && cell.pulseKey > 0 && "cdc-pulse",
-              )}
-              data-pulse={cell.pulseKey}
-            >
-              {v}
-            </button>
-          );
-        })}
-      </div>
-      <div className="flex shrink-0 items-center gap-1 pl-1">
-        {needsFollowUp && (
-          <button
-            type="button"
-            onClick={onAfterSupportClick}
-            aria-label="Record after-support rating"
-            className="flex h-6 w-6 items-center justify-center rounded-full bg-amber-100 text-amber-700 hover:bg-amber-200 focus:outline-none focus-visible:ring-2 focus-visible:ring-amber-400"
-          >
-            <span className="h-2 w-2 rounded-full bg-amber-500" />
-          </button>
-        )}
-        {followUpComplete && (
-          <button
-            type="button"
-            onClick={onAfterSupportClick}
-            aria-label={`After-support rating: ${cell.afterSupportRating}`}
-            className="flex h-6 items-center gap-0.5 rounded-full bg-amber-100 px-1.5 text-xs font-semibold text-amber-800 hover:bg-amber-200 focus:outline-none focus-visible:ring-2 focus-visible:ring-amber-400"
-          >
-            <span className="h-2 w-2 rounded-full bg-amber-500" />
-            <span className="leading-none">{cell.afterSupportRating}</span>
-            <span aria-hidden>✓</span>
-          </button>
-        )}
-      </div>
-    </li>
-  );
-}
-
-interface AfterSupportModalProps {
-  student: StudentDto | null;
-  outcomeText: string;
-  currentAfterSupport: 1 | 2 | 3 | 4 | null;
-  onClose: () => void;
-}
-
-function AfterSupportModal({
-  student,
-  outcomeText,
-  currentAfterSupport,
-  onClose,
-}: AfterSupportModalProps) {
-  const [chosen, setChosen] = React.useState<1 | 2 | 3 | 4 | null>(
-    currentAfterSupport,
-  );
-  React.useEffect(() => {
-    setChosen(currentAfterSupport);
-  }, [currentAfterSupport, student?.id]);
-
-  const todayStr = new Date().toLocaleDateString("en-US", {
-    month: "short",
-    day: "numeric",
-    year: "numeric",
-  });
-
-  return (
-    <Modal
-      open={student !== null}
-      onClose={onClose}
-      title="After-support reassessment"
-      description={
-        student
-          ? `${student.firstName} ${student.lastName}${
-              student.symbolNumber ? ` · Roll ${student.symbolNumber}` : ""
-            }`
-          : undefined
-      }
-      size="sm"
-    >
-      <div className="space-y-4">
-        <div className="rounded-md border border-border bg-muted/40 px-3 py-2 text-xs italic text-muted-foreground">
-          “{outcomeText}”
-        </div>
-        <div>
-          <p className="mb-2 text-sm text-foreground">
-            Re-rate after support given:
-          </p>
-          <div className="flex gap-2">
-            {RATING_VALUES.map((v) => (
-              <button
-                key={v}
-                type="button"
-                onClick={() => setChosen(v)}
-                aria-pressed={chosen === v}
-                className={cn(
-                  "h-12 flex-1 rounded-md text-base font-semibold",
-                  "transition-colors duration-100",
-                  "focus:outline-none focus-visible:ring-2 focus-visible:ring-primary",
-                  chosen === v
-                    ? "bg-primary text-primary-foreground"
-                    : "bg-muted text-foreground hover:bg-muted/80",
-                )}
-              >
-                {v}
-              </button>
-            ))}
-          </div>
-        </div>
-        <p className="text-xs text-muted-foreground">
-          Reassessment date: {todayStr}
-        </p>
-      </div>
-      <div className="mt-5 flex items-center justify-end gap-2">
-        <Button variant="ghost" onClick={onClose}>
-          Cancel
-        </Button>
-        <Button
-          variant="primary"
-          disabled={chosen === null}
-          onClick={() => {
-            toast("After-support recorded (Session 6a — not persisted)", {
-              duration: 2000,
-            });
-            onClose();
-          }}
-        >
-          Save
-        </Button>
-      </div>
-    </Modal>
-  );
-}
+// AfterSupportModal + AfterSupportModalConditional were removed in
+// Deviation 001 (see backend/docs/cdc-compliance-deviations.md). The
+// per-row inline AFTER_SUPPORT button group replaces the modal flow.
+// StudentRatingRow lives in ../../../../../_components/StudentRatingRow.tsx.
 
 function BackLink({
   assignmentId,

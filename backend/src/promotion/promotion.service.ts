@@ -433,8 +433,13 @@ export class PromotionService {
     });
     if (!school) return;
 
+    // Session 6c.1 — skip soft-deleted admins when picking the
+    // promotion-completion email recipient. Email branch drops to
+    // no-recipient if every admin is deactivated; the in-app
+    // broadcast below is unaffected (it's school-wide, not
+    // user-scoped).
     const admin = await this.prisma.user.findFirst({
-      where: { schoolId, role: Role.ADMIN },
+      where: { schoolId, role: Role.ADMIN, deletedAt: null },
       orderBy: { createdAt: 'asc' },
       select: { id: true, email: true },
     });

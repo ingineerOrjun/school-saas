@@ -95,10 +95,14 @@ export class IncidentService {
       where: schoolWhere,
       select: { id: true, name: true },
     });
+    // Session 6c.1 — exclude soft-deleted admins from the
+    // incident broadcast fan-out. They can't log in or receive
+    // in-app notifications meaningfully.
     const admins = await this.prisma.user.findMany({
       where: {
         schoolId: { in: schools.map((s) => s.id) },
         role: 'ADMIN',
+        deletedAt: null,
       },
       select: { id: true, email: true, schoolId: true },
     });
